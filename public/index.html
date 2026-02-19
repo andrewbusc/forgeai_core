@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ForgeAI</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="bg-glow bg-glow-a"></div>
+    <div class="bg-glow bg-glow-b"></div>
+
+    <div class="app-shell">
+      <aside class="sidebar panel">
+        <div class="brand-block">
+          <h1>ForgeAI</h1>
+          <p>AI app builder with auth, organizations, workspaces, and Git versioning.</p>
+        </div>
+
+        <section class="card-block" id="auth-card">
+          <h2>Authentication</h2>
+
+          <div id="auth-guest">
+            <form id="auth-form" class="compact-form">
+              <label>
+                <span>Mode</span>
+                <select id="auth-mode">
+                  <option value="login">Login</option>
+                  <option value="register">Register</option>
+                </select>
+              </label>
+              <label id="auth-name-wrap" class="hidden">
+                <span>Name</span>
+                <input id="auth-name" placeholder="Ada Lovelace" />
+              </label>
+              <label>
+                <span>Email</span>
+                <input id="auth-email" type="email" placeholder="you@company.com" required />
+              </label>
+              <label>
+                <span>Password</span>
+                <input id="auth-password" type="password" placeholder="At least 8 chars" required />
+              </label>
+              <label id="auth-org-wrap" class="hidden">
+                <span>Organization</span>
+                <input id="auth-org-name" placeholder="Acme Labs" />
+              </label>
+              <label id="auth-workspace-wrap" class="hidden">
+                <span>Initial Workspace</span>
+                <input id="auth-workspace-name" placeholder="Product Core" />
+              </label>
+              <button type="submit" id="auth-submit">Continue</button>
+            </form>
+          </div>
+
+          <div id="auth-user" class="hidden">
+            <p id="auth-user-info" class="muted-copy"></p>
+            <button id="logout-btn" type="button" class="ghost-btn">Logout</button>
+          </div>
+        </section>
+
+        <section class="card-block hidden" id="org-card">
+          <h2>Organizations</h2>
+          <form id="org-selection-form" class="compact-form">
+            <label>
+              <span>Organization</span>
+              <select id="org-select"></select>
+            </label>
+            <label>
+              <span>Workspace</span>
+              <select id="workspace-select"></select>
+            </label>
+          </form>
+
+          <form id="create-org-form" class="compact-form inline-form">
+            <input id="new-org-name" placeholder="New org" />
+            <button type="submit">Create Org</button>
+          </form>
+
+          <form id="create-workspace-form" class="compact-form inline-form">
+            <input id="new-workspace-name" placeholder="New workspace" />
+            <button type="submit">Create WS</button>
+          </form>
+
+          <form id="add-member-form" class="compact-form inline-form">
+            <input id="member-email" type="email" placeholder="invite user email" />
+            <select id="member-role">
+              <option value="member">member</option>
+              <option value="admin">admin</option>
+            </select>
+            <button type="submit">Add</button>
+          </form>
+        </section>
+
+        <form id="create-project-form" class="create-form hidden">
+          <h2>New Project</h2>
+          <label>
+            <span>Name</span>
+            <input id="project-name" name="name" placeholder="Revenue Ops Copilot" required minlength="2" />
+          </label>
+          <label>
+            <span>Description</span>
+            <textarea id="project-description" name="description" rows="2" placeholder="Internal dashboard + AI workflow"></textarea>
+          </label>
+          <label>
+            <span>Template</span>
+            <select id="template-select" name="templateId"></select>
+          </label>
+          <button type="submit">Create Project</button>
+        </form>
+
+        <section class="project-list-wrap hidden" id="projects-card">
+          <div class="list-header">
+            <h2>Projects</h2>
+            <button id="refresh-projects" class="ghost-btn" type="button">Refresh</button>
+          </div>
+          <div id="project-list" class="project-list"></div>
+        </section>
+      </aside>
+
+      <main class="workspace">
+        <header class="workspace-header panel">
+          <div>
+            <h2 id="active-project-name">No project selected</h2>
+            <p id="active-project-meta">Authenticate and choose a workspace to begin.</p>
+          </div>
+          <div class="provider-controls">
+            <label>
+              <span>Provider</span>
+              <select id="provider-select"></select>
+            </label>
+            <label>
+              <span>Model</span>
+              <input id="model-input" placeholder="Optional model override" />
+            </label>
+          </div>
+        </header>
+
+        <section class="panel prompt-panel">
+          <div class="prompt-header">
+            <h3>Builder Prompt</h3>
+            <div class="prompt-actions">
+              <button id="generate-btn" type="button">Generate Build</button>
+              <button id="chat-btn" type="button" class="ghost-btn">Refine in Chat</button>
+              <button id="deploy-btn" type="button" class="ghost-btn">Deploy Production</button>
+            </div>
+          </div>
+          <textarea
+            id="prompt-input"
+            rows="5"
+            placeholder="Example: Add role-based auth, analytics dashboard, and event streaming pipeline with tests."
+          ></textarea>
+          <label class="deploy-inline">
+            <span>Custom Domain (optional)</span>
+            <input id="deploy-custom-domain" placeholder="app.example.com" />
+          </label>
+          <div id="status-line" class="status-line"></div>
+        </section>
+
+        <section class="workspace-grid">
+          <section class="panel files-panel">
+            <div class="section-header">
+              <h3>Files</h3>
+              <button id="refresh-files" type="button" class="ghost-btn">Reload</button>
+            </div>
+            <div id="file-tree" class="file-tree"></div>
+          </section>
+
+          <section class="panel editor-panel">
+            <div class="section-header">
+              <h3 id="editor-title">Editor</h3>
+              <button id="save-file" type="button">Save File</button>
+            </div>
+            <textarea id="file-editor" spellcheck="false" placeholder="Select a file to edit"></textarea>
+          </section>
+
+          <section class="panel history-panel">
+            <div class="section-header">
+              <h3>Activity</h3>
+            </div>
+            <div id="history-list" class="history-list"></div>
+
+            <div class="section-header">
+              <h3>Agent Runs</h3>
+              <button id="refresh-runs" type="button" class="ghost-btn">Reload</button>
+            </div>
+            <div id="run-list" class="history-list"></div>
+
+            <div class="section-header">
+              <h3>Run Detail</h3>
+              <div class="prompt-actions">
+                <button id="resume-run" type="button" class="ghost-btn">Resume</button>
+                <button id="validate-run" type="button" class="ghost-btn">Validate Output</button>
+              </div>
+            </div>
+            <pre id="run-detail" class="diff-view"></pre>
+
+            <div class="section-header">
+              <h3>Git History</h3>
+              <button id="refresh-git" type="button" class="ghost-btn">Reload</button>
+            </div>
+
+            <form id="manual-commit-form" class="inline-form">
+              <input id="manual-commit-message" placeholder="Commit message" />
+              <button type="submit">Commit</button>
+            </form>
+
+            <div id="git-list" class="history-list"></div>
+            <pre id="git-diff" class="diff-view"></pre>
+
+            <div class="section-header">
+              <h3>Deployments</h3>
+              <button id="refresh-deployments" type="button" class="ghost-btn">Reload</button>
+            </div>
+            <div id="deployment-list" class="history-list"></div>
+            <pre id="deployment-logs" class="diff-view"></pre>
+          </section>
+        </section>
+      </main>
+    </div>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
