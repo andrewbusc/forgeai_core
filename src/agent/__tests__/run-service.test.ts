@@ -93,7 +93,7 @@ async function destroyHarness(harness: Harness): Promise<void> {
   await rm(harness.tmpRoot, { recursive: true, force: true });
 }
 
-  test("valid transitions: queued -> running -> cancelling -> cancelled", async () => {
+  test("valid transitions: queued -> running -> cancelled", async () => {
     const harness = await createHarness();
 
     try {
@@ -106,9 +106,6 @@ async function destroyHarness(harness: Harness): Promise<void> {
 
       const running = await harness.service.markRunRunning(harness.project.id, run.id, "test-transition");
       assert.equal(running.status, "running");
-
-      const cancelling = await harness.service.markRunCancelling(harness.project.id, run.id, "test-transition");
-      assert.equal(cancelling.status, "cancelling");
 
       const cancelled = await harness.service.markRunCancelled(harness.project.id, run.id, "test-transition");
       assert.equal(cancelled.status, "cancelled");
@@ -175,7 +172,7 @@ async function destroyHarness(harness: Harness): Promise<void> {
     }
   });
 
-  test("cancellation flow: running -> cancelling -> cancelled on worker tick", async () => {
+  test("cancellation flow: running -> cancelled on worker tick", async () => {
     const harness = await createHarness();
 
     try {
@@ -187,7 +184,7 @@ async function destroyHarness(harness: Harness): Promise<void> {
       });
 
       await harness.service.markRunRunning(harness.project.id, run.id, "test-cancel");
-      await harness.service.markRunCancelling(harness.project.id, run.id, "test-cancel");
+      await harness.service.markRunCancelled(harness.project.id, run.id, "test-cancel");
 
       const result = await harness.service.executeNextStep({
         projectId: harness.project.id,
@@ -284,7 +281,7 @@ async function destroyHarness(harness: Harness): Promise<void> {
       });
       assert.equal(step1.outcome, "processed");
       assert.equal(step1.run?.phase, "optimization");
-      assert.equal(step1.run?.status, "running");
+      assert.equal(step1.run?.status, "optimizing");
 
       const step2 = await harness.service.executeNextStep({
         projectId: harness.project.id,

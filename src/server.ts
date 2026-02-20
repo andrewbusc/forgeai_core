@@ -1630,19 +1630,13 @@ app.post("/api/projects/:projectId/agent/state-runs/:runId/cancel", authRequired
 
     let run;
     try {
-      run = await agentRunService.markRunCancelling(project.id, req.params.runId, requestId);
+      run = await agentRunService.markRunCancelled(project.id, req.params.runId, requestId);
     } catch (error) {
       if (error instanceof Error && error.message === "Agent run not found.") {
         throw new HttpError(404, "Agent state run not found.");
       }
       throw error;
     }
-
-    agentRunWorker.enqueue({
-      projectId: project.id,
-      runId: run.id,
-      requestId
-    });
 
     res.json({ run });
   } catch (error) {

@@ -3,6 +3,7 @@ export * from "./contract.js";
 export * from "./path-utils.js";
 export * from "./collect-files.js";
 export * from "./graph-builder.js";
+export * from "./failure-parser.js";
 export * from "./structural-validator.js";
 export * from "./ast-validator.js";
 export * from "./security-validator.js";

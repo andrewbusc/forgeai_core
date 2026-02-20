@@ -1,6 +1,7 @@
 import { logError, logInfo } from "../lib/logging.js";
 import { AppStore } from "../lib/project-store.js";
 import { Project } from "../types.js";
+import { isActiveAgentRunStatus } from "./run-status.js";
 import {
   AgentLifecycleRun,
   AgentLifecycleStep,
@@ -10,9 +11,11 @@ import {
 } from "./run-state-types.js";
 
 const allowedTransitions: Record<AgentRunLifecycleStatus, AgentRunLifecycleStatus[]> = {
-  queued: ["running"],
-  running: ["cancelling", "failed", "complete"],
-  cancelling: ["cancelled"],
+  queued: ["running", "cancelled", "failed"],
+  running: ["correcting", "optimizing", "validating", "failed", "complete", "cancelled"],
+  correcting: ["running", "validating", "failed", "cancelled"],
+  optimizing: ["running", "validating", "failed", "complete", "cancelled"],
+  validating: ["running", "optimizing", "failed", "complete", "cancelled"],
   cancelled: [],
   failed: [],
   complete: []
@@ -207,18 +210,51 @@ export class AgentRunService {
     );
   }
 
-  async markRunCancelling(projectId: string, runId: string, requestId: string): Promise<AgentLifecycleRun> {
+  async markRunCorrecting(projectId: string, runId: string, requestId: string): Promise<AgentLifecycleRun> {
     return this.transitionRunStatus(
       {
         projectId,
         runId,
         requestId
       },
-      "cancelling",
+      "correcting",
       {
-        logEvent: "RUN_CANCELLING"
+        logEvent: "RUN_CORRECTING"
       }
     );
+  }
+
+  async markRunOptimizing(projectId: string, runId: string, requestId: string): Promise<AgentLifecycleRun> {
+    return this.transitionRunStatus(
+      {
+        projectId,
+        runId,
+        requestId
+      },
+      "optimizing",
+      {
+        logEvent: "RUN_OPTIMIZING"
+      }
+    );
+  }
+
+  async markRunValidating(projectId: string, runId: string, requestId: string): Promise<AgentLifecycleRun> {
+    return this.transitionRunStatus(
+      {
+        projectId,
+        runId,
+        requestId
+      },
+      "validating",
+      {
+        logEvent: "RUN_VALIDATING"
+      }
+    );
+  }
+
+  // Backward-compatible alias: cancellation is immediate in the unified state machine.
+  async markRunCancelling(projectId: string, runId: string, requestId: string): Promise<AgentLifecycleRun> {
+    return this.markRunCancelled(projectId, runId, requestId);
   }
 
   async markRunCancelled(projectId: string, runId: string, requestId: string): Promise<AgentLifecycleRun> {
@@ -362,24 +398,6 @@ export class AgentRunService {
           };
         }
 
-        if (run.status === "cancelling") {
-          this.assertTransition(run.status, "cancelled");
-          run = (await this.store.updateLifecycleRun(run.id, { status: "cancelled" }, client)) || run;
-
-          logInfo("RUN_CANCELLED", {
-            requestId: input.requestId,
-            runId: run.id,
-            projectId: run.projectId
-          });
-
-          return {
-            outcome: "skipped",
-            run,
-            shouldReenqueue: false,
-            reason: "Run was cancelling and is now cancelled."
-          };
-        }
-
         if (run.status === "queued") {
           this.assertTransition(run.status, "running");
           run = (await this.store.updateLifecycleRun(run.id, { status: "running" }, client)) || run;
@@ -391,7 +409,19 @@ export class AgentRunService {
           });
         }
 
-        if (run.status !== "running") {
+        if (run.status === "cancelled") {
+          return {
+            outcome: "skipped",
+            run,
+            shouldReenqueue: false,
+            reason: "Run is cancelled."
+          };
+        }
+
+        const runnable =
+          run.status === "running" || run.status === "correcting" || run.status === "optimizing";
+
+        if (!runnable) {
           return {
             outcome: "skipped",
             run,
@@ -404,7 +434,7 @@ export class AgentRunService {
           return {
             outcome: "skipped",
             run,
-            shouldReenqueue: run.status === "running",
+            shouldReenqueue: isActiveAgentRunStatus(run.status),
             reason: `Stale worker payload. Expected step ${input.expectedStepIndex}, found ${run.stepIndex}.`
           };
         }
@@ -514,7 +544,7 @@ export class AgentRunService {
 
         if (run.phase === "goal" && this.goalConditionsSatisfied(run)) {
           const nextPhase: AgentRunPhase = "optimization";
-          run = (await this.store.updateLifecycleRun(run.id, { phase: nextPhase }, client)) || run;
+          run = (await this.store.updateLifecycleRun(run.id, { phase: nextPhase, status: "optimizing" }, client)) || run;
 
           logInfo("RUN_PHASE_SWITCH", {
             requestId: input.requestId,
@@ -548,7 +578,7 @@ export class AgentRunService {
           outcome: "processed",
           run,
           step,
-          shouldReenqueue: run.status === "running"
+          shouldReenqueue: isActiveAgentRunStatus(run.status)
         };
       });
     } catch (error) {
@@ -576,4 +606,3 @@ export class AgentRunService {
     return this.store.listLifecycleRunsByProject(projectId);
   }
 }
-

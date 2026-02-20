@@ -15,6 +15,7 @@ import { runHeavyProjectValidation } from "./validation/heavy-validator.js";
 import { runLightProjectValidation } from "./validation/project-validator.js";
 import { analyzeProjectForMemory } from "./memory.js";
 import { AgentPlanner } from "./planner.js";
+import { isExecutingAgentRunStatus } from "./run-status.js";
 import { createDefaultAgentToolRegistry } from "./tools/index.js";
 import {
   AgentRun,
@@ -24,6 +25,7 @@ import {
   AgentStepRecord,
   ForkAgentRunInput,
   ForkAgentRunOutput,
+  PlannerFailureReport,
   PlannerMemoryContext,
   ResumeAgentRunInput,
   ResumeAgentRunOutput,
@@ -120,23 +122,25 @@ export class AgentKernel {
   }
 
   private resolveMaxRuntimeCorrectionAttempts(): number {
-    const parsed = Number(process.env.AGENT_RUNTIME_MAX_CORRECTIONS || 1);
+    const parsed = Number(process.env.AGENT_GOAL_MAX_CORRECTIONS || process.env.AGENT_RUNTIME_MAX_CORRECTIONS || 5);
 
     if (!Number.isFinite(parsed)) {
-      return 1;
-    }
-
-    return Math.min(2, Math.max(0, Math.floor(parsed)));
-  }
-
-  private resolveMaxHeavyCorrectionAttempts(): number {
-    const parsed = Number(process.env.AGENT_HEAVY_MAX_CORRECTIONS || 2);
-
-    if (!Number.isFinite(parsed)) {
-      return 2;
+      return 5;
     }
 
     return Math.min(5, Math.max(0, Math.floor(parsed)));
+  }
+
+  private resolveMaxHeavyCorrectionAttempts(): number {
+    const parsed = Number(
+      process.env.AGENT_OPTIMIZATION_MAX_CORRECTIONS || process.env.AGENT_HEAVY_MAX_CORRECTIONS || 3
+    );
+
+    if (!Number.isFinite(parsed)) {
+      return 3;
+    }
+
+    return Math.min(3, Math.max(0, Math.floor(parsed)));
   }
 
   private isMutatingStep(step: AgentStep): boolean {
@@ -145,6 +149,10 @@ export class AgentKernel {
 
   private isRuntimeVerifyStep(step: AgentStep): boolean {
     return step.type === "verify" && step.tool === "run_preview_container";
+  }
+
+  private isCorrectionStep(step: AgentStep): boolean {
+    return step.id.startsWith("runtime-correction-") || step.id.startsWith("validation-correction-");
   }
 
   private commitMessageForStep(_runId: string, _stepIndex: number, step: AgentStep, goal: string): string {
@@ -447,10 +455,23 @@ export class AgentKernel {
       attempt: input.attempt
     });
 
+    const correctionReasoning = {
+      phase: "goal",
+      attempt: input.attempt,
+      failedStepId: input.failedStep.id,
+      reason: input.failedStepRecord.errorMessage || "Runtime verification failed.",
+      runtimeLogTail: tailText(input.runtimeLogs || "", 3_000),
+      createdAt: new Date().toISOString()
+    };
+
     const correctionStep: AgentStep = {
       ...correction,
       id: `runtime-correction-${input.attempt}`,
-      type: "modify"
+      type: "modify",
+      input: {
+        ...correction.input,
+        __forgeCorrection: correctionReasoning
+      }
     };
 
     const retryStep: AgentStep = {
@@ -468,12 +489,13 @@ export class AgentKernel {
       projectId: input.run.projectId,
       attempt: input.attempt,
       correctionStepId: correctionStep.id,
-      retryStepId: retryStep.id
+      retryStepId: retryStep.id,
+      reasoning: correctionReasoning
     });
 
     return (
       (await this.store.updateAgentRun(input.run.id, {
-        status: "running",
+        status: "correcting",
         currentStepIndex: input.stepIndex + 1,
         plan: input.run.plan,
         lastStepId: input.failedStepRecord.id,
@@ -489,11 +511,13 @@ export class AgentKernel {
     attempt: number;
     heavyValidationSummary: string;
     heavyValidationLogs: string;
+    heavyFailureReport?: PlannerFailureReport;
     project: StartAgentRunInput["project"] | ResumeAgentRunInput["project"];
     executionRoot: string;
     requestId: string;
     plannerMemory?: PlannerMemoryContext;
   }): Promise<AgentRun> {
+    const failedStepId = `heavy-validation-${input.attempt}`;
     const correction = await this.planner.planRuntimeCorrection({
       goal: input.run.goal,
       providerId: input.run.providerId,
@@ -501,15 +525,30 @@ export class AgentKernel {
       project: input.project,
       projectRoot: input.executionRoot,
       memory: input.plannerMemory,
-      failedStepId: `heavy-validation-${input.attempt}`,
+      failedStepId,
       runtimeLogs: `${input.heavyValidationSummary}\n\n${input.heavyValidationLogs}`.trim(),
-      attempt: input.attempt
+      attempt: input.attempt,
+      failureReport: input.heavyFailureReport
     });
+
+    const correctionReasoning = {
+      phase: "optimization",
+      attempt: input.attempt,
+      failedStepId,
+      summary: input.heavyValidationSummary,
+      failureCount: input.heavyFailureReport?.failures.length || 0,
+      runtimeLogTail: tailText(input.heavyValidationLogs || "", 3_000),
+      createdAt: new Date().toISOString()
+    };
 
     const correctionStep: AgentStep = {
       ...correction,
       id: `validation-correction-${input.attempt}`,
-      type: "modify"
+      type: "modify",
+      input: {
+        ...correction.input,
+        __forgeCorrection: correctionReasoning
+      }
     };
 
     input.run.plan.steps.splice(input.stepIndex + 1, 0, correctionStep);
@@ -520,12 +559,13 @@ export class AgentKernel {
       projectId: input.run.projectId,
       attempt: input.attempt,
       correctionStepId: correctionStep.id,
-      summary: input.heavyValidationSummary
+      summary: input.heavyValidationSummary,
+      reasoning: correctionReasoning
     });
 
     return (
       (await this.store.updateAgentRun(input.run.id, {
-        status: "running",
+        status: "optimizing",
         currentStepIndex: input.stepIndex + 1,
         plan: input.run.plan,
         errorMessage: null,
@@ -574,6 +614,12 @@ export class AgentKernel {
         executionRoot: projectRoot,
         requestId: input.requestId
       });
+      run =
+        (await this.store.updateAgentRun(run.id, {
+          status: "running",
+          errorMessage: null,
+          finishedAt: null
+        })) || run;
       let runtimeCorrectionCount = this.countRuntimeCorrectionSteps(run.plan);
       let heavyCorrectionCount = this.countHeavyCorrectionSteps(run.plan);
       const lightValidationMode = this.resolveLightValidationMode();
@@ -610,6 +656,7 @@ export class AgentKernel {
         let commitHash: string | null = null;
         let runtimeStatus: string | null = null;
         let runtimeLogs = "";
+        let heavyFailureReport: PlannerFailureReport | undefined;
         let queueHeavyCorrectionAttempt: number | null = null;
         let heavyRollbackReason: string | null = null;
 
@@ -618,6 +665,10 @@ export class AgentKernel {
             const proposedChanges = this.extractProposedChanges(output);
 
             if (!proposedChanges.length) {
+              if (this.isCorrectionStep(step)) {
+                throw new Error(`Correction step '${step.id}' produced no proposed changes.`);
+              }
+
               output = {
                 ...output,
                 stagedFileCount: 0,
@@ -657,6 +708,10 @@ export class AgentKernel {
                 stepId: step.id,
                 summary: this.commitMessageForStep(run.id, stepIndex, step, run.goal)
               });
+
+              if (this.isCorrectionStep(step) && !commitHash) {
+                throw new Error(`Correction step '${step.id}' produced no commit. Silent patching is blocked.`);
+              }
 
               run =
                 (await this.store.updateAgentRun(run.id, {
@@ -731,6 +786,13 @@ export class AgentKernel {
         const doneCandidate = stepIndex + 1 >= run.plan.steps.length;
 
         if (status === "completed" && doneCandidate && heavyValidationMode !== "off") {
+          run =
+            (await this.store.updateAgentRun(run.id, {
+              status: "validating",
+              errorMessage: null,
+              finishedAt: null
+            })) || run;
+
           try {
             const validationRef = run.currentCommitHash || (await readCurrentCommitHash(projectRoot));
             const heavyValidation = await runHeavyProjectValidation({
@@ -746,7 +808,8 @@ export class AgentKernel {
                 blockingCount: heavyValidation.blockingCount,
                 warningCount: heavyValidation.warningCount,
                 checks: heavyValidation.checks,
-                summary: heavyValidation.summary
+                summary: heavyValidation.summary,
+                failures: heavyValidation.failures
               }
             };
 
@@ -754,6 +817,21 @@ export class AgentKernel {
               if (heavyCorrectionCount < this.maxHeavyCorrectionAttempts) {
                 queueHeavyCorrectionAttempt = heavyCorrectionCount + 1;
                 runtimeLogs = heavyValidation.logs;
+                if (heavyValidation.failures.length > 0) {
+                  heavyFailureReport = {
+                    summary: heavyValidation.summary,
+                    failures: heavyValidation.failures.slice(0, 25).map((entry) => ({
+                      sourceCheckId: entry.sourceCheckId,
+                      kind: entry.kind,
+                      code: entry.code,
+                      message: entry.message,
+                      file: entry.file,
+                      line: entry.line,
+                      column: entry.column,
+                      excerpt: entry.excerpt
+                    }))
+                  };
+                }
               } else {
                 status = "failed";
                 heavyRollbackReason = `Heavy validation failed after ${heavyCorrectionCount}/${this.maxHeavyCorrectionAttempts} correction attempts.`;
@@ -816,6 +894,7 @@ export class AgentKernel {
               attempt: queueHeavyCorrectionAttempt,
               heavyValidationSummary: heavySummary,
               heavyValidationLogs: runtimeLogs || heavySummary,
+              heavyFailureReport,
               project: input.project,
               executionRoot: projectRoot,
               requestId: input.requestId,
@@ -884,6 +963,7 @@ export class AgentKernel {
         if (status === "failed") {
           if (!heavyRollbackReason && this.isRuntimeVerifyStep(step) && runtimeCorrectionCount >= this.maxRuntimeCorrectionAttempts) {
             heavyRollbackReason = `Runtime correction limit reached (${runtimeCorrectionCount}/${this.maxRuntimeCorrectionAttempts}).`;
+            errorMessage = heavyRollbackReason;
           }
 
           if (heavyRollbackReason) {
@@ -915,7 +995,7 @@ export class AgentKernel {
 
         run =
           (await this.store.updateAgentRun(run.id, {
-            status: done ? "completed" : "running",
+            status: done ? "complete" : "running",
             currentStepIndex: nextStepIndex,
             lastStepId: stepRecord.id,
             errorMessage: null,
@@ -959,7 +1039,7 @@ export class AgentKernel {
       goal: input.goal,
       providerId: input.providerId,
       model: input.model,
-      status: plan.steps.length ? "running" : "completed",
+      status: plan.steps.length ? "queued" : "complete",
       currentStepIndex: 0,
       plan,
       errorMessage: null,
@@ -1008,7 +1088,7 @@ export class AgentKernel {
       throw new Error("Agent run not found.");
     }
 
-    if (existing.status === "completed") {
+    if (existing.status === "complete") {
       const steps = await this.store.listAgentStepsByRun(existing.id);
       return {
         run: attachLastStep(existing, steps),
@@ -1018,7 +1098,7 @@ export class AgentKernel {
 
     const run =
       (await this.store.updateAgentRun(existing.id, {
-        status: "running",
+        status: "queued",
         errorMessage: null,
         finishedAt: null
       })) || existing;
@@ -1084,7 +1164,7 @@ export class AgentKernel {
       goal: sourceRun.goal,
       providerId: sourceRun.providerId,
       model: sourceRun.model,
-      status: hasRemainingSteps ? "planned" : "completed",
+      status: hasRemainingSteps ? "queued" : "complete",
       currentStepIndex: nextStepIndex,
       plan: sourceRun.plan,
       lastStepId: null,
@@ -1121,7 +1201,7 @@ export class AgentKernel {
       throw new Error("Agent run not found.");
     }
 
-    if (run.status === "running") {
+    if (isExecutingAgentRunStatus(run.status)) {
       throw new Error("Cannot validate output while run is still running.");
     }
 

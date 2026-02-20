@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { Project } from "../types.js";
+import { CanonicalAgentRunStatus, canonicalAgentRunStatusSchema } from "./run-status.js";
 
 export const agentStepTypeSchema = z.enum(["analyze", "modify", "verify"]);
 export type AgentStepType = z.infer<typeof agentStepTypeSchema>;
@@ -28,8 +29,8 @@ export const agentPlanSchema = z.object({
 });
 export type AgentPlan = z.infer<typeof agentPlanSchema>;
 
-export const agentRunStatusSchema = z.enum(["planned", "running", "paused", "failed", "completed"]);
-export type AgentRunStatus = z.infer<typeof agentRunStatusSchema>;
+export const agentRunStatusSchema = canonicalAgentRunStatusSchema;
+export type AgentRunStatus = CanonicalAgentRunStatus;
 
 export const agentStepExecutionStatusSchema = z.enum(["completed", "failed"]);
 export type AgentStepExecutionStatus = z.infer<typeof agentStepExecutionStatusSchema>;
@@ -211,8 +212,25 @@ export interface PlannerInput {
   memory?: PlannerMemoryContext;
 }
 
+export interface PlannerFailureDiagnostic {
+  sourceCheckId: string;
+  kind: "typescript" | "test" | "boot" | "migration" | "dependency" | "unknown";
+  code?: string;
+  message: string;
+  file?: string;
+  line?: number;
+  column?: number;
+  excerpt?: string;
+}
+
+export interface PlannerFailureReport {
+  summary: string;
+  failures: PlannerFailureDiagnostic[];
+}
+
 export interface PlannerRuntimeCorrectionInput extends PlannerInput {
   failedStepId: string;
   runtimeLogs: string;
   attempt: number;
+  failureReport?: PlannerFailureReport;
 }

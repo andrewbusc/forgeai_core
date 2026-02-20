@@ -268,8 +268,7 @@ CREATE TABLE IF NOT EXISTS agent_runs (
   provider_id TEXT NOT NULL,
   model TEXT,
   status TEXT NOT NULL CHECK (status IN (
-    'queued', 'running', 'cancelling', 'cancelled', 'failed', 'complete',
-    'planned', 'paused', 'completed'
+    'queued', 'running', 'correcting', 'optimizing', 'validating', 'cancelled', 'failed', 'complete'
   )),
   step_index INTEGER NOT NULL DEFAULT 0,
   corrections_used INTEGER NOT NULL DEFAULT 0,
@@ -714,17 +713,38 @@ function mapDeployment(row: DbDeploymentRow): Deployment {
   };
 }
 
-function mapAgentRun(row: DbAgentRunRow): AgentRun {
-  const rawStatus = row.status as string;
-  const normalizedStatus =
-    rawStatus === "complete"
-      ? "completed"
-      : rawStatus === "queued"
-        ? "planned"
-        : rawStatus === "cancelling" || rawStatus === "cancelled"
-          ? "paused"
-          : rawStatus;
+function normalizeAgentRunStatus(value: unknown): AgentRunStatus {
+  const raw = String(value || "").trim().toLowerCase();
 
+  if (raw === "planned") {
+    return "queued";
+  }
+
+  if (raw === "paused" || raw === "cancelling") {
+    return "cancelled";
+  }
+
+  if (raw === "completed") {
+    return "complete";
+  }
+
+  if (
+    raw === "queued" ||
+    raw === "running" ||
+    raw === "correcting" ||
+    raw === "optimizing" ||
+    raw === "validating" ||
+    raw === "cancelled" ||
+    raw === "failed" ||
+    raw === "complete"
+  ) {
+    return raw;
+  }
+
+  return "failed";
+}
+
+function mapAgentRun(row: DbAgentRunRow): AgentRun {
   return {
     id: row.id,
     projectId: row.project_id,
@@ -734,7 +754,7 @@ function mapAgentRun(row: DbAgentRunRow): AgentRun {
     goal: row.goal,
     providerId: row.provider_id,
     model: row.model || undefined,
-    status: normalizedStatus as AgentRunStatus,
+    status: normalizeAgentRunStatus(row.status),
     currentStepIndex: Number(row.current_step_index) || 0,
     plan:
       row.plan && typeof row.plan === "object" && !Array.isArray(row.plan)
@@ -1498,6 +1518,8 @@ export class AppStore {
          last_valid_commit_hash = COALESCE(last_valid_commit_hash, current_commit_hash, base_commit_hash),
          status = CASE status
            WHEN 'planned' THEN 'queued'
+           WHEN 'paused' THEN 'cancelled'
+           WHEN 'cancelling' THEN 'cancelled'
            WHEN 'completed' THEN 'complete'
            ELSE status
          END`
@@ -1545,7 +1567,7 @@ export class AppStore {
        BEGIN
          ALTER TABLE agent_runs
          ADD CONSTRAINT agent_runs_status_check
-         CHECK (status IN ('queued', 'running', 'cancelling', 'cancelled', 'failed', 'complete'));
+         CHECK (status IN ('queued', 'running', 'correcting', 'optimizing', 'validating', 'cancelled', 'failed', 'complete'));
        EXCEPTION
          WHEN duplicate_object THEN NULL;
        END $$;`
@@ -1888,14 +1910,7 @@ export class AppStore {
   async createAgentRun(input: CreateAgentRunInput): Promise<AgentRun> {
     const runId = input.runId || randomUUID();
     const now = new Date().toISOString();
-    const normalizedStatus =
-      input.status === "completed"
-        ? "complete"
-        : input.status === "planned"
-          ? "queued"
-          : input.status === "paused"
-            ? "cancelling"
-            : input.status;
+    const normalizedStatus = normalizeAgentRunStatus(input.status);
 
     const result = await this.pool.query<DbAgentRunRow>(
       `INSERT INTO agent_runs (
@@ -1983,7 +1998,7 @@ export class AppStore {
          FROM agent_runs
          WHERE project_id = $1
            AND provider_id <> 'state-machine'
-           AND status IN ('queued', 'running', 'cancelling')
+           AND status IN ('queued', 'running', 'correcting', 'optimizing', 'validating')
        ) AS exists`,
       [projectId]
     );
@@ -2008,18 +2023,7 @@ export class AppStore {
     > = {
       status: {
         column: "status",
-        transform: (value) => {
-          if (value === "completed") {
-            return "complete";
-          }
-          if (value === "planned") {
-            return "queued";
-          }
-          if (value === "paused") {
-            return "cancelling";
-          }
-          return value;
-        }
+        transform: (value) => normalizeAgentRunStatus(value)
       },
       currentStepIndex: { column: "current_step_index" },
       plan: {

@@ -3,6 +3,7 @@ import net from "node:net";
 import path from "node:path";
 import { withIsolatedWorktree } from "../../lib/git-versioning.js";
 import { pathExists, readTextFile } from "../../lib/fs-utils.js";
+import { parseCommandFailures, ValidationFailure } from "./failure-parser.js";
 import { runLightProjectValidation } from "./project-validator.js";
 
 type HeavyCheckStatus = "pass" | "fail" | "skip";
@@ -19,6 +20,7 @@ export interface HeavyValidationResult {
   blockingCount: number;
   warningCount: number;
   checks: HeavyValidationCheck[];
+  failures: ValidationFailure[];
   summary: string;
   logs: string;
 }
@@ -243,6 +245,7 @@ export async function runHeavyProjectValidation(input: HeavyValidationInput): Pr
     async (isolatedRoot) => {
       const checks: HeavyValidationCheck[] = [];
       const logs: string[] = [];
+      const failures: ValidationFailure[] = [];
       let blockingCount = 0;
       let warningCount = 0;
 
@@ -291,6 +294,7 @@ export async function runHeavyProjectValidation(input: HeavyValidationInput): Pr
           blockingCount,
           warningCount,
           checks,
+          failures,
           summary,
           logs: logs.join("\n\n")
         };
@@ -328,6 +332,14 @@ export async function runHeavyProjectValidation(input: HeavyValidationInput): Pr
                 stderr: install.stderr || undefined
               }
             });
+            failures.push(
+              ...parseCommandFailures({
+                sourceCheckId: "install",
+                combined: install.combined,
+                stderr: install.stderr,
+                stdout: install.stdout
+              })
+            );
           } else {
             checks.push({
               id: "install",
@@ -341,6 +353,58 @@ export async function runHeavyProjectValidation(input: HeavyValidationInput): Pr
           id: "install",
           status: "skip",
           message: "Dependency installation skipped by configuration."
+        });
+      }
+
+      const prismaSchemaPath = path.join(isolatedRoot, "prisma", "schema.prisma");
+      const hasPrismaSchema = await pathExists(prismaSchemaPath);
+      const migrationScript =
+        (["prisma:migrate", "db:migrate", "migrate:deploy", "migrate"].find(
+          (scriptName) => typeof scripts[scriptName] === "string" && scripts[scriptName]?.trim()
+        ) as string | undefined) || null;
+
+      if (migrationScript || hasPrismaSchema) {
+        const migration = await runCommand({
+          cwd: isolatedRoot,
+          command: npmBin,
+          args: migrationScript ? ["run", migrationScript] : ["exec", "prisma", "migrate", "deploy"],
+          timeoutMs: Number(process.env.AGENT_HEAVY_MIGRATION_TIMEOUT_MS || 180_000),
+          allowFailure: true
+        });
+
+        logs.push(migration.combined);
+        if (!migration.ok) {
+          blockingCount += 1;
+          checks.push({
+            id: "migration",
+            status: "fail",
+            message: "Migration command failed.",
+            details: {
+              command: migrationScript ? `npm run ${migrationScript}` : "npm exec prisma migrate deploy",
+              exitCode: migration.exitCode,
+              stderr: migration.stderr || undefined
+            }
+          });
+          failures.push(
+            ...parseCommandFailures({
+              sourceCheckId: "migration",
+              combined: migration.combined,
+              stderr: migration.stderr,
+              stdout: migration.stdout
+            })
+          );
+        } else {
+          checks.push({
+            id: "migration",
+            status: "pass",
+            message: "Migration command passed."
+          });
+        }
+      } else {
+        checks.push({
+          id: "migration",
+          status: "skip",
+          message: "No prisma schema or migration script; skipping migration check."
         });
       }
 
@@ -365,6 +429,14 @@ export async function runHeavyProjectValidation(input: HeavyValidationInput): Pr
               stderr: typecheck.stderr || undefined
             }
           });
+          failures.push(
+            ...parseCommandFailures({
+              sourceCheckId: "typecheck",
+              combined: typecheck.combined,
+              stderr: typecheck.stderr,
+              stdout: typecheck.stdout
+            })
+          );
         } else {
           checks.push({
             id: "typecheck",
@@ -401,6 +473,14 @@ export async function runHeavyProjectValidation(input: HeavyValidationInput): Pr
               stderr: build.stderr || undefined
             }
           });
+          failures.push(
+            ...parseCommandFailures({
+              sourceCheckId: "build",
+              combined: build.combined,
+              stderr: build.stderr,
+              stdout: build.stdout
+            })
+          );
         } else {
           checks.push({
             id: "build",
@@ -437,6 +517,14 @@ export async function runHeavyProjectValidation(input: HeavyValidationInput): Pr
               stderr: test.stderr || undefined
             }
           });
+          failures.push(
+            ...parseCommandFailures({
+              sourceCheckId: "tests",
+              combined: test.combined,
+              stderr: test.stderr,
+              stdout: test.stdout
+            })
+          );
         } else {
           checks.push({
             id: "tests",
@@ -462,6 +550,16 @@ export async function runHeavyProjectValidation(input: HeavyValidationInput): Pr
         checks.push(boot);
         if (boot.status === "fail") {
           blockingCount += 1;
+          const bootLogs =
+            boot.details && typeof boot.details === "object" && !Array.isArray(boot.details)
+              ? (boot.details as Record<string, unknown>).logs
+              : undefined;
+          failures.push(
+            ...parseCommandFailures({
+              sourceCheckId: "boot",
+              combined: typeof bootLogs === "string" ? bootLogs : boot.message
+            })
+          );
         }
       } else {
         checks.push({
@@ -482,6 +580,7 @@ export async function runHeavyProjectValidation(input: HeavyValidationInput): Pr
         blockingCount,
         warningCount,
         checks,
+        failures,
         summary,
         logs: logs.join("\n\n")
       };

@@ -1,17 +1,11 @@
 import { z } from "zod";
+import { CanonicalAgentRunStatus, canonicalAgentRunStatusSchema } from "./run-status.js";
 
 export const agentRunPhaseSchema = z.enum(["goal", "optimization"]);
 export type AgentRunPhase = z.infer<typeof agentRunPhaseSchema>;
 
-export const agentRunLifecycleStatusSchema = z.enum([
-  "queued",
-  "running",
-  "cancelling",
-  "cancelled",
-  "failed",
-  "complete"
-]);
-export type AgentRunLifecycleStatus = z.infer<typeof agentRunLifecycleStatusSchema>;
+export const agentRunLifecycleStatusSchema = canonicalAgentRunStatusSchema;
+export type AgentRunLifecycleStatus = CanonicalAgentRunStatus;
 
 export const agentRunStepTypeSchema = z.enum(["goal", "correction", "optimization"]);
 export type AgentRunStepType = z.infer<typeof agentRunStepTypeSchema>;
@@ -99,4 +93,3 @@ export interface LifecycleStepPatchInput {
   commitHash?: string | null;
   completedAt?: string | null;
 }
-

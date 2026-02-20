@@ -6,9 +6,18 @@ import test from "node:test";
 import { randomUUID } from "node:crypto";
 import { AppStore } from "../../lib/project-store.js";
 import { Project } from "../../types.js";
+import { AgentExecutor } from "../executor.js";
 import { AgentKernel } from "../kernel.js";
 import { AgentPlanner } from "../planner.js";
-import { AgentPlan, AgentStep, PlannerInput, PlannerRuntimeCorrectionInput } from "../types.js";
+import { createDefaultAgentToolRegistry } from "../tools/index.js";
+import {
+  AgentContext,
+  AgentPlan,
+  AgentStep,
+  AgentStepExecution,
+  PlannerInput,
+  PlannerRuntimeCorrectionInput
+} from "../types.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL || process.env.DATABASE_URL;
 
@@ -74,6 +83,101 @@ class DeterministicPlanner extends AgentPlanner {
       }
     };
   }
+}
+
+class RuntimeCorrectionPlanner extends AgentPlanner {
+  override async plan(input: PlannerInput): Promise<AgentPlan> {
+    return {
+      goal: input.goal,
+      steps: [
+        {
+          id: "step-verify-runtime",
+          type: "verify",
+          tool: "run_preview_container",
+          input: {
+            mode: "healthcheck"
+          }
+        }
+      ]
+    };
+  }
+
+  override async planRuntimeCorrection(_input: PlannerRuntimeCorrectionInput): Promise<AgentStep> {
+    return {
+      id: "runtime-correction-1",
+      type: "modify",
+      tool: "write_file",
+      input: {
+        path: "src/runtime-correction.ts",
+        content: "export const corrected = true;\n"
+      }
+    };
+  }
+}
+
+class HeavyValidationCorrectionPlanner extends AgentPlanner {
+  override async plan(input: PlannerInput): Promise<AgentPlan> {
+    return {
+      goal: input.goal,
+      steps: [
+        {
+          id: "step-seed-heavy-failure",
+          type: "modify",
+          tool: "write_file",
+          input: {
+            path: "src/illegal-layer/seed.ts",
+            content: "export const seedHeavyFailure = true;\n"
+          }
+        }
+      ]
+    };
+  }
+
+  override async planRuntimeCorrection(input: PlannerRuntimeCorrectionInput): Promise<AgentStep> {
+    return {
+      id: `runtime-correction-${input.attempt}`,
+      type: "modify",
+      tool: "write_file",
+      input: {
+        path: `src/illegal-layer/validation-correction-${input.attempt}.ts`,
+        content: `export const heavyValidationCorrectionAttempt = ${input.attempt};\n`
+      }
+    };
+  }
+}
+
+class ScriptedExecutor extends AgentExecutor {
+  constructor(
+    private readonly executeFn: (step: AgentStep) => Promise<AgentStepExecution> | AgentStepExecution
+  ) {
+    super(createDefaultAgentToolRegistry());
+  }
+
+  override async executeStep(step: AgentStep, _context: AgentContext): Promise<AgentStepExecution> {
+    return this.executeFn(step);
+  }
+}
+
+function buildExecution(input: {
+  step: AgentStep;
+  status: AgentStepExecution["status"];
+  output?: Record<string, unknown>;
+  error?: string;
+}): AgentStepExecution {
+  const startedAt = new Date().toISOString();
+  const finishedAt = new Date().toISOString();
+
+  return {
+    stepId: input.step.id,
+    tool: input.step.tool,
+    type: input.step.type,
+    status: input.status,
+    input: input.step.input,
+    output: input.output,
+    error: input.error,
+    startedAt,
+    finishedAt
+  };
 }
 
 async function createHarness(): Promise<Harness> {
@@ -156,7 +260,7 @@ test("fork -> validate -> resume flow", async () => {
       requestId: "kernel-flow-start"
     });
 
-    assert.equal(started.run.status, "completed");
+    assert.equal(started.run.status, "complete");
     const stepOne = started.steps.find((step) => step.stepId === "step-1");
     assert.ok(stepOne);
     assert.ok(stepOne?.commitHash);
@@ -170,7 +274,7 @@ test("fork -> validate -> resume flow", async () => {
     });
 
     assert.equal(forked.run.currentStepIndex, 1);
-    assert.equal(forked.run.status, "planned");
+    assert.equal(forked.run.status, "queued");
 
     const validation = await kernel.validateRunOutput({
       project: harness.project,
@@ -188,7 +292,7 @@ test("fork -> validate -> resume flow", async () => {
       requestId: "kernel-flow-resume"
     });
 
-    assert.equal(resumed.run.status, "completed");
+    assert.equal(resumed.run.status, "complete");
     assert.equal(resumed.run.currentStepIndex, resumed.run.plan.steps.length);
     const resumedStep = resumed.steps.find((step) => step.stepId === "step-2");
     assert.ok(resumedStep);
@@ -210,6 +314,264 @@ test("fork -> validate -> resume flow", async () => {
       delete process.env.AGENT_HEAVY_INSTALL_DEPS;
     } else {
       process.env.AGENT_HEAVY_INSTALL_DEPS = previousHeavyInstall;
+    }
+
+    await destroyHarness(harness);
+  }
+});
+
+test("runtime correction step cannot silently no-op", async () => {
+  const previousLightValidation = process.env.AGENT_LIGHT_VALIDATION_MODE;
+  const previousHeavyValidation = process.env.AGENT_HEAVY_VALIDATION_MODE;
+  const previousHeavyInstall = process.env.AGENT_HEAVY_INSTALL_DEPS;
+  const previousGoalCorrections = process.env.AGENT_GOAL_MAX_CORRECTIONS;
+
+  process.env.AGENT_LIGHT_VALIDATION_MODE = "off";
+  process.env.AGENT_HEAVY_VALIDATION_MODE = "off";
+  process.env.AGENT_HEAVY_INSTALL_DEPS = "false";
+  process.env.AGENT_GOAL_MAX_CORRECTIONS = "1";
+
+  const harness = await createHarness();
+
+  try {
+    const executor = new ScriptedExecutor((step) => {
+      if (step.tool === "run_preview_container") {
+        return buildExecution({
+          step,
+          status: "completed",
+          output: {
+            runtimeStatus: "failed",
+            errorMessage: "runtime unhealthy",
+            logs: "startup error"
+          }
+        });
+      }
+
+      if (step.id.startsWith("runtime-correction-")) {
+        return buildExecution({
+          step,
+          status: "completed",
+          output: {
+            proposedChanges: []
+          }
+        });
+      }
+
+      return buildExecution({
+        step,
+        status: "completed",
+        output: {}
+      });
+    });
+
+    const kernel = new AgentKernel({
+      store: harness.store,
+      planner: new RuntimeCorrectionPlanner(),
+      executor
+    });
+
+    const started = await kernel.startRun({
+      project: harness.project,
+      createdByUserId: harness.userId,
+      goal: "Repair runtime startup",
+      providerId: "mock",
+      requestId: "kernel-runtime-correction-noop"
+    });
+
+    assert.equal(started.run.status, "failed");
+    assert.match(started.run.errorMessage || "", /Correction step 'runtime-correction-1' produced no proposed changes/);
+    const correctionStep = started.steps.find((entry) => entry.stepId === "runtime-correction-1");
+    assert.ok(correctionStep);
+    assert.equal(correctionStep?.status, "failed");
+    assert.equal(correctionStep?.commitHash, null);
+  } finally {
+    if (previousLightValidation === undefined) {
+      delete process.env.AGENT_LIGHT_VALIDATION_MODE;
+    } else {
+      process.env.AGENT_LIGHT_VALIDATION_MODE = previousLightValidation;
+    }
+
+    if (previousHeavyValidation === undefined) {
+      delete process.env.AGENT_HEAVY_VALIDATION_MODE;
+    } else {
+      process.env.AGENT_HEAVY_VALIDATION_MODE = previousHeavyValidation;
+    }
+
+    if (previousHeavyInstall === undefined) {
+      delete process.env.AGENT_HEAVY_INSTALL_DEPS;
+    } else {
+      process.env.AGENT_HEAVY_INSTALL_DEPS = previousHeavyInstall;
+    }
+
+    if (previousGoalCorrections === undefined) {
+      delete process.env.AGENT_GOAL_MAX_CORRECTIONS;
+    } else {
+      process.env.AGENT_GOAL_MAX_CORRECTIONS = previousGoalCorrections;
+    }
+
+    await destroyHarness(harness);
+  }
+});
+
+test("runtime correction loop stops at configured goal-phase limit", async () => {
+  const previousLightValidation = process.env.AGENT_LIGHT_VALIDATION_MODE;
+  const previousHeavyValidation = process.env.AGENT_HEAVY_VALIDATION_MODE;
+  const previousHeavyInstall = process.env.AGENT_HEAVY_INSTALL_DEPS;
+  const previousGoalCorrections = process.env.AGENT_GOAL_MAX_CORRECTIONS;
+
+  process.env.AGENT_LIGHT_VALIDATION_MODE = "off";
+  process.env.AGENT_HEAVY_VALIDATION_MODE = "off";
+  process.env.AGENT_HEAVY_INSTALL_DEPS = "false";
+  process.env.AGENT_GOAL_MAX_CORRECTIONS = "2";
+
+  const harness = await createHarness();
+
+  try {
+    const executor = new ScriptedExecutor((step) => {
+      if (step.id.startsWith("runtime-correction-")) {
+        const suffix = step.id.replace("runtime-correction-", "") || "0";
+        return buildExecution({
+          step,
+          status: "completed",
+          output: {
+            proposedChanges: [
+              {
+                path: `src/runtime-correction-${suffix}.txt`,
+                type: "create",
+                newContent: `runtime correction ${suffix}\n`
+              }
+            ]
+          }
+        });
+      }
+
+      if (step.tool === "run_preview_container") {
+        return buildExecution({
+          step,
+          status: "completed",
+          output: {
+            runtimeStatus: "failed",
+            errorMessage: "runtime unhealthy",
+            logs: "startup error"
+          }
+        });
+      }
+
+      return buildExecution({
+        step,
+        status: "completed",
+        output: {}
+      });
+    });
+
+    const kernel = new AgentKernel({
+      store: harness.store,
+      planner: new RuntimeCorrectionPlanner(),
+      executor
+    });
+
+    const started = await kernel.startRun({
+      project: harness.project,
+      createdByUserId: harness.userId,
+      goal: "Repair runtime startup",
+      providerId: "mock",
+      requestId: "kernel-runtime-correction-limit"
+    });
+
+    assert.equal(started.run.status, "failed");
+    assert.equal(started.run.errorMessage, "Runtime correction limit reached (2/2).");
+    const correctionSteps = started.steps.filter((entry) => entry.stepId.startsWith("runtime-correction-"));
+    assert.equal(correctionSteps.length, 2);
+    for (const step of correctionSteps) {
+      assert.equal(step.status, "completed");
+      assert.ok(step.commitHash);
+    }
+  } finally {
+    if (previousLightValidation === undefined) {
+      delete process.env.AGENT_LIGHT_VALIDATION_MODE;
+    } else {
+      process.env.AGENT_LIGHT_VALIDATION_MODE = previousLightValidation;
+    }
+
+    if (previousHeavyValidation === undefined) {
+      delete process.env.AGENT_HEAVY_VALIDATION_MODE;
+    } else {
+      process.env.AGENT_HEAVY_VALIDATION_MODE = previousHeavyValidation;
+    }
+
+    if (previousHeavyInstall === undefined) {
+      delete process.env.AGENT_HEAVY_INSTALL_DEPS;
+    } else {
+      process.env.AGENT_HEAVY_INSTALL_DEPS = previousHeavyInstall;
+    }
+
+    if (previousGoalCorrections === undefined) {
+      delete process.env.AGENT_GOAL_MAX_CORRECTIONS;
+    } else {
+      process.env.AGENT_GOAL_MAX_CORRECTIONS = previousGoalCorrections;
+    }
+
+    await destroyHarness(harness);
+  }
+});
+
+test("heavy validation correction loop stops at configured optimization-phase limit", async () => {
+  const previousLightValidation = process.env.AGENT_LIGHT_VALIDATION_MODE;
+  const previousHeavyValidation = process.env.AGENT_HEAVY_VALIDATION_MODE;
+  const previousHeavyInstall = process.env.AGENT_HEAVY_INSTALL_DEPS;
+  const previousOptimizationCorrections = process.env.AGENT_OPTIMIZATION_MAX_CORRECTIONS;
+
+  process.env.AGENT_LIGHT_VALIDATION_MODE = "off";
+  process.env.AGENT_HEAVY_VALIDATION_MODE = "enforce";
+  process.env.AGENT_HEAVY_INSTALL_DEPS = "false";
+  process.env.AGENT_OPTIMIZATION_MAX_CORRECTIONS = "3";
+
+  const harness = await createHarness();
+
+  try {
+    const kernel = new AgentKernel({
+      store: harness.store,
+      planner: new HeavyValidationCorrectionPlanner()
+    });
+
+    const started = await kernel.startRun({
+      project: harness.project,
+      createdByUserId: harness.userId,
+      goal: "Exercise heavy validation correction loop",
+      providerId: "mock",
+      requestId: "kernel-heavy-correction-limit"
+    });
+
+    assert.equal(started.run.status, "failed");
+    assert.equal(started.run.errorMessage, "Heavy validation failed after 3/3 correction attempts.");
+
+    const correctionSteps = started.steps.filter((entry) => entry.stepId.startsWith("validation-correction-"));
+    assert.equal(correctionSteps.length, 3);
+    assert.ok(correctionSteps.every((entry) => Boolean(entry.commitHash)));
+    assert.equal(correctionSteps[2]?.status, "failed");
+  } finally {
+    if (previousLightValidation === undefined) {
+      delete process.env.AGENT_LIGHT_VALIDATION_MODE;
+    } else {
+      process.env.AGENT_LIGHT_VALIDATION_MODE = previousLightValidation;
+    }
+
+    if (previousHeavyValidation === undefined) {
+      delete process.env.AGENT_HEAVY_VALIDATION_MODE;
+    } else {
+      process.env.AGENT_HEAVY_VALIDATION_MODE = previousHeavyValidation;
+    }
+
+    if (previousHeavyInstall === undefined) {
+      delete process.env.AGENT_HEAVY_INSTALL_DEPS;
+    } else {
+      process.env.AGENT_HEAVY_INSTALL_DEPS = previousHeavyInstall;
+    }
+
+    if (previousOptimizationCorrections === undefined) {
+      delete process.env.AGENT_OPTIMIZATION_MAX_CORRECTIONS;
+    } else {
+      process.env.AGENT_OPTIMIZATION_MAX_CORRECTIONS = previousOptimizationCorrections;
     }
 
     await destroyHarness(harness);

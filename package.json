@@ -11,7 +11,7 @@
     "check:architecture": "tsx src/agent/validation/check-architecture.ts",
     "check:v1-ready": "tsx src/agent/validation/check-v1-ready.ts",
     "agent:validate-run": "tsx -r dotenv/config src/scripts/agent-validate-run.ts",
-    "test:validation": "tsx --test src/agent/validation/__tests__/ast-validator.test.ts src/agent/validation/__tests__/security-validator.test.ts",
+    "test:validation": "tsx --test src/agent/validation/__tests__/ast-validator.test.ts src/agent/validation/__tests__/security-validator.test.ts src/agent/validation/__tests__/failure-parser.test.ts",
     "test:validation-ast": "tsx --test src/agent/validation/__tests__/ast-validator.test.ts",
     "test:agent-state": "tsx -r dotenv/config --test src/agent/__tests__/run-service.test.ts",
     "test:agent-kernel": "tsx -r dotenv/config --test src/agent/__tests__/kernel-run-flow.test.ts"

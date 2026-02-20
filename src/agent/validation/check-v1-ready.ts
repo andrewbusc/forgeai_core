@@ -184,7 +184,8 @@ async function runHeavyValidationCheck(target: string): Promise<CheckResult> {
         blockingCount: result.blockingCount,
         warningCount: result.warningCount,
         summary: result.summary,
-        checks: result.checks
+        checks: result.checks,
+        failures: result.failures
       }
     };
   }
@@ -198,6 +199,7 @@ async function runHeavyValidationCheck(target: string): Promise<CheckResult> {
       warningCount: result.warningCount,
       summary: result.summary,
       checks: result.checks,
+      failures: result.failures,
       logsTail: truncateOutput(result.logs, 24_000)
     }
   };

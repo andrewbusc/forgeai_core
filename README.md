@@ -10,6 +10,21 @@ It is the enforced architectural specification.
 
 ForgeAI’s “ships v1 ready” claim depends on adherence to these rules.
 
+Run Lifecycle Contract
+
+All ForgeAI run engines use the same canonical status machine:
+
+queued
+running
+correcting
+optimizing
+validating
+complete
+failed
+cancelled
+
+Legacy statuses (planned, paused, completed, cancelling) are migrated to canonical values.
+
 Scope
 
 ForgeAI v1 generates:
@@ -398,6 +413,7 @@ src/agent/validation/contract.ts
 src/agent/validation/path-utils.ts
 src/agent/validation/collect-files.ts
 src/agent/validation/graph-builder.ts
+src/agent/validation/failure-parser.ts
 src/agent/validation/structural-validator.ts
 src/agent/validation/ast-validator.ts
 src/agent/validation/security-validator.ts
@@ -419,6 +435,13 @@ src/agent/tools/apply-patch.ts
 Kernel transaction + light validation before commit:
 src/agent/kernel.ts
 
+Canonical status definitions:
+src/agent/run-status.ts
+
+Correction safety:
+
+Correction steps must produce real staged diffs and a commit; no-op/silent patch corrections are rejected.
+
 Environment knobs:
 
 AGENT_FS_MAX_FILES_PER_STEP
@@ -428,6 +451,9 @@ AGENT_FS_ALLOW_ENV_MUTATION
 AGENT_LIGHT_VALIDATION_MODE (off | warn | enforce)
 AGENT_RUN_LOCK_STALE_SECONDS
 AGENT_HEAVY_VALIDATION_MODE (off | warn | enforce)
+AGENT_GOAL_MAX_CORRECTIONS
+AGENT_OPTIMIZATION_MAX_CORRECTIONS
+AGENT_RUNTIME_MAX_CORRECTIONS (legacy alias for goal max)
 AGENT_HEAVY_MAX_CORRECTIONS
 AGENT_HEAVY_INSTALL_DEPS
 AGENT_HEAVY_BUILD_TIMEOUT_MS

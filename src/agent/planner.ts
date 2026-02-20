@@ -122,6 +122,25 @@ function buildMemoryContextBlock(memory?: PlannerMemoryContext): string {
   }
 }
 
+function buildFailureReportBlock(input: PlannerRuntimeCorrectionInput["failureReport"]): string {
+  if (!input || !Array.isArray(input.failures) || input.failures.length === 0) {
+    return "No structured failure report available.";
+  }
+
+  try {
+    return JSON.stringify(
+      {
+        summary: input.summary,
+        failures: input.failures.slice(0, 20)
+      },
+      null,
+      2
+    );
+  } catch {
+    return "Structured failure report present but could not be serialized.";
+  }
+}
+
 export class AgentPlanner {
   private async requestPlannerJson(input: {
     providerId: string;
@@ -239,16 +258,20 @@ export class AgentPlanner {
       "- Perform the smallest code change likely to fix startup/runtime errors.",
       "- Prefer apply_patch when possible over write_file.",
       "- Use project memory context when choosing fixes.",
+      "- Prefer structured failure diagnostics over raw logs when both are provided.",
       "- Do not emit analyze/verify tools.",
       "If you cannot produce a valid correction step, return {}."
     ].join("\n");
 
     const memoryBlock = buildMemoryContextBlock(input.memory);
+    const failureReportBlock = buildFailureReportBlock(input.failureReport);
     const userPrompt = [
       `Goal: ${input.goal}`,
       `Project: ${input.project.name}`,
       `Correction attempt: ${input.attempt}`,
       `Failed verify step id: ${input.failedStepId}`,
+      "Structured failure report:",
+      failureReportBlock,
       "Recent runtime logs (tail):",
       trimLogPayload(input.runtimeLogs || ""),
       "Project memory:",
