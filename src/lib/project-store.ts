@@ -1541,15 +1541,25 @@ export class AppStore {
     );
 
     await this.pool.query(
-      `ALTER TABLE agent_runs
-       ADD CONSTRAINT agent_runs_status_check
-       CHECK (status IN ('queued', 'running', 'cancelling', 'cancelled', 'failed', 'complete'))`
+      `DO $$
+       BEGIN
+         ALTER TABLE agent_runs
+         ADD CONSTRAINT agent_runs_status_check
+         CHECK (status IN ('queued', 'running', 'cancelling', 'cancelled', 'failed', 'complete'));
+       EXCEPTION
+         WHEN duplicate_object THEN NULL;
+       END $$;`
     );
 
     await this.pool.query(
-      `ALTER TABLE agent_runs
-       ADD CONSTRAINT agent_runs_phase_check
-       CHECK (phase IN ('goal', 'optimization'))`
+      `DO $$
+       BEGIN
+         ALTER TABLE agent_runs
+         ADD CONSTRAINT agent_runs_phase_check
+         CHECK (phase IN ('goal', 'optimization'));
+       EXCEPTION
+         WHEN duplicate_object THEN NULL;
+       END $$;`
     );
 
     await this.pool.query(
@@ -1594,15 +1604,25 @@ export class AppStore {
     );
 
     await this.pool.query(
-      `ALTER TABLE agent_steps
-       ADD CONSTRAINT agent_steps_step_type_check
-       CHECK (step_type IN ('goal', 'correction', 'optimization', 'analyze', 'modify', 'verify'))`
+      `DO $$
+       BEGIN
+         ALTER TABLE agent_steps
+         ADD CONSTRAINT agent_steps_step_type_check
+         CHECK (step_type IN ('goal', 'correction', 'optimization', 'analyze', 'modify', 'verify'));
+       EXCEPTION
+         WHEN duplicate_object THEN NULL;
+       END $$;`
     );
 
     await this.pool.query(
-      `ALTER TABLE agent_steps
-       ADD CONSTRAINT agent_steps_status_check
-       CHECK (status IN ('pending', 'running', 'complete', 'failed', 'completed'))`
+      `DO $$
+       BEGIN
+         ALTER TABLE agent_steps
+         ADD CONSTRAINT agent_steps_status_check
+         CHECK (status IN ('pending', 'running', 'complete', 'failed', 'completed'));
+       EXCEPTION
+         WHEN duplicate_object THEN NULL;
+       END $$;`
     );
   }
 
