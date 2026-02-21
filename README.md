@@ -585,17 +585,38 @@ This is the direct measurement for:
 
 V1 Readiness Workflow
 
-Manual GitHub Actions gate: `.github/workflows/v1-ready.yml`
+GitHub Actions gate: `.github/workflows/v1-ready.yml`
 
-Run from Actions with optional `target_path` input. It executes:
+Triggers:
 
-npm run check:v1-ready -- <target_path>
+- `pull_request`
+- `push` to `main`
+- manual dispatch (`workflow_dispatch`)
 
-Local equivalent for current repo root:
+Behavior:
+
+- If `target_path` is provided, validates that path.
+- If `target_path` is empty, scaffolds a deterministic `canonical-backend` target at `.deeprun/v1-ready-target`.
+- Executes `npm run check:v1-ready -- <target_path>`.
+- Uploads `.deeprun/v1-ready-report.json` as a workflow artifact.
+
+Manual dispatch inputs:
+
+- `target_path` (optional)
+- `template_id` (used only when `target_path` is empty; defaults to `canonical-backend`)
+
+Local equivalent (matches CI default behavior):
 
 npm run test:v1-ready
 
-Note: this repository can fail v1 readiness by design if it is not shaped like the canonical generated backend contract.
+Manual local commands:
+
+npm run prepare:v1-ready-target -- --output .deeprun/v1-ready-target
+npm run check:v1-ready -- .deeprun/v1-ready-target
+
+Direct path validation:
+
+npm run check:v1-ready -- <target_path>
 
 CLI Commands (deeprun)
 

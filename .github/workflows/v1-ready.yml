@@ -1,16 +1,28 @@
 name: V1 Ready Gate
 
 on:
+  pull_request:
+  push:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       target_path:
         description: "Project path to validate"
         required: false
-        default: "."
+        default: ""
+      template_id:
+        description: "Template id used when target_path is empty"
+        required: false
+        default: "canonical-backend"
+
+permissions:
+  contents: read
 
 jobs:
   v1_ready:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
 
     services:
       postgres:
@@ -33,6 +45,8 @@ jobs:
       NODE_ENV: test
       V1_DOCKER_BIN: docker
       V1_DOCKER_RUN_MIGRATION: "true"
+      V1_TARGET_INPUT: ${{ github.event.inputs.target_path }}
+      V1_TEMPLATE_INPUT: ${{ github.event.inputs.template_id }}
 
     steps:
       - name: Checkout
@@ -47,5 +61,34 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Resolve v1 readiness target
+        id: target
+        run: |
+          mkdir -p .deeprun
+          target_input="${V1_TARGET_INPUT:-}"
+          template_input="${V1_TEMPLATE_INPUT:-canonical-backend}"
+
+          if [ -n "${target_input}" ]; then
+            target_path="${target_input}"
+            echo "Using provided target path: ${target_path}"
+          else
+            target_path="$(npm run --silent prepare:v1-ready-target -- --output .deeprun/v1-ready-target --template "${template_input}")"
+            echo "Scaffolded '${template_input}' target at: ${target_path}"
+          fi
+
+          echo "target_path=${target_path}" >> "${GITHUB_OUTPUT}"
+
       - name: Run v1 readiness gate
-        run: npm run check:v1-ready -- "${{ github.event.inputs.target_path || '.' }}"
+        run: |
+          mkdir -p .deeprun
+          set -o pipefail
+          npm run check:v1-ready -- "${{ steps.target.outputs.target_path }}" | tee .deeprun/v1-ready-report.json
+
+      - name: Upload v1 readiness artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v1-ready-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: warn
+          path: |
+            .deeprun/v1-ready-report.json
