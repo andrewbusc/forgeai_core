@@ -652,6 +652,7 @@ npm run deeprun -- fork <stepId>
 npm run deeprun -- validate
 npm run deeprun -- validate --strict-v1-ready
 npm run deeprun -- promote
+npm run deeprun -- promote --strict-v1-ready
 
 Notes:
 
@@ -666,6 +667,7 @@ Notes:
 - Run `deeprun validate --project <projectId> --run <runId>` and confirm `VALIDATION_OK=true` before `deeprun promote`.
 - `validate --strict-v1-ready` also runs full v1-ready checks (heavy + Docker) and emits `V1_READY_*` keys.
 - Set `DEEPRUN_PROMOTE_REQUIRE_V1_READY=true` to require latest `V1_READY_OK=true` before `promote`.
+- `promote --strict-v1-ready` runs a strict preflight (`validate --strict-v1-ready`) before deployment and exits non-zero when preflight fails.
 
 CLI integration test:
 

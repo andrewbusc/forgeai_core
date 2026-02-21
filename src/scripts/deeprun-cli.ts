@@ -472,13 +472,55 @@ function commandUsage(): string {
     "  validate [--project <projectId>] [--run <runId>] [--strict-v1-ready]",
     "  branch [--project <projectId>] [--run <runId>]",
     "  fork <stepId> [--project <projectId>] [--run <runId>]",
-    "  promote [--project <projectId>] [--custom-domain <domain>] [--container-port <port>]",
+    "  promote [--project <projectId>] [--run <runId>] [--custom-domain <domain>] [--container-port <port>] [--strict-v1-ready]",
     "",
     "Notes:",
     "  - Session state is persisted in .deeprun/cli.json (or DEEPRUN_CLI_CONFIG).",
     "  - If --provider is omitted, server-side default provider selection is used.",
     "  - Use --verbose to include request tracing and expanded step output."
   ].join("\n");
+}
+
+interface KernelRunValidationResult {
+  run: { id: string };
+  targetPath: string;
+  validation: {
+    ok: boolean;
+    blockingCount: number;
+    warningCount: number;
+    summary: string;
+    checks: Array<{
+      id: string;
+      status: "pass" | "fail" | "skip";
+      message: string;
+    }>;
+  };
+  v1Ready?: {
+    target: string;
+    verdict: "YES" | "NO";
+    ok: boolean;
+    generatedAt: string;
+    checks: Array<{
+      id: string;
+      status: "pass" | "fail" | "skip";
+      message: string;
+    }>;
+  };
+}
+
+async function runKernelValidation(input: {
+  client: ApiClient;
+  projectId: string;
+  runId: string;
+  strictV1Ready: boolean;
+}): Promise<KernelRunValidationResult> {
+  return input.client.requestOk<KernelRunValidationResult>(
+    "POST",
+    `/api/projects/${input.projectId}/agent/runs/${input.runId}/validate`,
+    {
+      strictV1Ready: input.strictV1Ready
+    }
+  );
 }
 
 function ensureConfig(config: CliConfig | undefined): CliConfig {
@@ -1210,33 +1252,10 @@ async function handleValidate(input: {
 
   const jar = new CookieJar(input.config.cookies);
   const client = new ApiClient(input.config.apiBaseUrl, jar, input.verbose);
-
-  const result = await client.requestOk<{
-    run: { id: string };
-    targetPath: string;
-    validation: {
-      ok: boolean;
-      blockingCount: number;
-      warningCount: number;
-      summary: string;
-      checks: Array<{
-        id: string;
-        status: "pass" | "fail" | "skip";
-        message: string;
-      }>;
-    };
-    v1Ready?: {
-      target: string;
-      verdict: "YES" | "NO";
-      ok: boolean;
-      generatedAt: string;
-      checks: Array<{
-        id: string;
-        status: "pass" | "fail" | "skip";
-        message: string;
-      }>;
-    };
-  }>("POST", `/api/projects/${projectId}/agent/runs/${runId}/validate`, {
+  const result = await runKernelValidation({
+    client,
+    projectId,
+    runId,
     strictV1Ready
   });
 
@@ -1368,9 +1387,51 @@ async function handlePromote(input: {
 
   const customDomain = optionString(input.options, "custom-domain");
   const containerPort = optionInt(input.options, "container-port");
+  const strictV1Ready = optionFlag(input.options, "strict-v1-ready");
+  const runId = optionString(input.options, "run") || input.config.lastKernelRunId;
 
   const jar = new CookieJar(input.config.cookies);
   const client = new ApiClient(input.config.apiBaseUrl, jar, input.verbose);
+
+  if (strictV1Ready) {
+    if (!runId) {
+      throw new Error("promote --strict-v1-ready requires --run <runId> or a previously used kernel run.");
+    }
+
+    const validation = await runKernelValidation({
+      client,
+      projectId,
+      runId,
+      strictV1Ready: true
+    });
+
+    process.stdout.write(`PROMOTE_PREFLIGHT_PROJECT_ID=${projectId}\n`);
+    process.stdout.write(`PROMOTE_PREFLIGHT_RUN_ID=${runId}\n`);
+    process.stdout.write(`PROMOTE_PREFLIGHT_VALIDATION_OK=${String(validation.validation.ok)}\n`);
+    process.stdout.write(`PROMOTE_PREFLIGHT_BLOCKING_COUNT=${validation.validation.blockingCount}\n`);
+    process.stdout.write(`PROMOTE_PREFLIGHT_WARNING_COUNT=${validation.validation.warningCount}\n`);
+    process.stdout.write(`PROMOTE_PREFLIGHT_VALIDATION_SUMMARY=${validation.validation.summary}\n`);
+    process.stdout.write(`PROMOTE_PREFLIGHT_V1_READY_OK=${String(validation.v1Ready?.ok || false)}\n`);
+    process.stdout.write(`PROMOTE_PREFLIGHT_V1_READY_VERDICT=${validation.v1Ready?.verdict || "NO"}\n`);
+
+    if (input.verbose) {
+      for (const check of validation.validation.checks) {
+        process.stdout.write(`preflight check id=${check.id} status=${check.status} message=${check.message}\n`);
+      }
+      if (validation.v1Ready) {
+        for (const check of validation.v1Ready.checks) {
+          process.stdout.write(`preflight v1-ready check id=${check.id} status=${check.status} message=${check.message}\n`);
+        }
+      }
+    }
+
+    if (!validation.validation.ok || !validation.v1Ready?.ok) {
+      process.stderr.write(
+        `strict v1-ready preflight failed. Run 'deeprun validate --project ${projectId} --run ${runId} --strict-v1-ready' and resolve blockers before promote.\n`
+      );
+      return 1;
+    }
+  }
 
   const result = await client.requestOk<{
     deployment: {
@@ -1388,7 +1449,8 @@ async function handlePromote(input: {
   await writeConfig(input.configPath, {
     ...input.config,
     cookies: jar.toObject(),
-    lastProjectId: projectId
+    lastProjectId: projectId,
+    ...(runId ? { lastKernelRunId: runId } : {})
   });
 
   process.stdout.write(`PROJECT_ID=${projectId}\n`);

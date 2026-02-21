@@ -455,6 +455,83 @@ test("deeprun CLI promote is blocked until validation passes", async () => {
   }
 });
 
+test("deeprun CLI promote --strict-v1-ready runs preflight and blocks deployment on v1 failure", async () => {
+  const server = await startServer();
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "deeprun-cli-promote-strict-v1-"));
+  const configPath = path.join(tmpDir, "cli.json");
+  const suffix = randomUUID().slice(0, 8);
+  const email = `cli-promote-v1-${suffix}@example.com`;
+
+  try {
+    const initResult = await runCli(
+      [
+        "init",
+        "--api",
+        server.baseUrl,
+        "--email",
+        email,
+        "--password",
+        "Password123!",
+        "--name",
+        `CLI Promote V1 Tester ${suffix}`,
+        "--org",
+        `CLI Promote V1 Org ${suffix}`,
+        "--workspace",
+        `CLI Promote V1 Workspace ${suffix}`
+      ],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl
+      }
+    );
+
+    assert.equal(initResult.code, 0, `init failed: ${initResult.stderr}`);
+
+    const runResult = await runCli(
+      [
+        "run",
+        `Build kernel run for strict promote ${suffix}`,
+        "--engine",
+        "kernel",
+        "--provider",
+        "mock",
+        "--project-name",
+        `CLI Promote V1 Project ${suffix}`
+      ],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl
+      }
+    );
+
+    assert.equal(runResult.code, 0, `run failed: ${runResult.stderr}\n${runResult.stdout}`);
+    const runKv = parseKeyValueLines(runResult.stdout);
+    assert.ok(runKv.PROJECT_ID, `run output missing PROJECT_ID: ${runResult.stdout}`);
+    assert.ok(runKv.RUN_ID, `run output missing RUN_ID: ${runResult.stdout}`);
+
+    const promoteResult = await runCli(
+      ["promote", "--project", runKv.PROJECT_ID, "--run", runKv.RUN_ID, "--strict-v1-ready"],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl,
+        V1_DOCKER_BIN: "__missing_docker_binary__"
+      }
+    );
+
+    assert.equal(promoteResult.code, 1, `strict promote should fail preflight: ${promoteResult.stdout}`);
+    assert.match(promoteResult.stderr, /strict v1-ready preflight failed/i);
+
+    const promoteKv = parseKeyValueLines(promoteResult.stdout);
+    assert.equal(promoteKv.PROMOTE_PREFLIGHT_PROJECT_ID, runKv.PROJECT_ID);
+    assert.equal(promoteKv.PROMOTE_PREFLIGHT_RUN_ID, runKv.RUN_ID);
+    assert.ok(promoteKv.PROMOTE_PREFLIGHT_VALIDATION_OK !== undefined, `missing preflight validation output: ${promoteResult.stdout}`);
+    assert.equal(promoteKv.PROMOTE_PREFLIGHT_V1_READY_OK, "false");
+  } finally {
+    await server.stop();
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test("deeprun CLI validate --strict-v1-ready emits v1-ready summary keys", async () => {
   const server = await startServer();
   const tmpDir = await mkdtemp(path.join(os.tmpdir(), "deeprun-cli-validate-v1-ready-"));
