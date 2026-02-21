@@ -471,6 +471,7 @@ AGENT_HEAVY_MAX_CORRECTIONS
 AGENT_CORRECTION_CONVERGENCE_MODE (off | warn | enforce)
 AGENT_HEAVY_INSTALL_DEPS
 AGENT_HEAVY_BUILD_TIMEOUT_MS
+DEEPRUN_PROMOTE_REQUIRE_V1_READY
 
 V1 readiness gate knobs:
 
@@ -649,6 +650,7 @@ npm run deeprun -- continue
 npm run deeprun -- branch --engine kernel
 npm run deeprun -- fork <stepId>
 npm run deeprun -- validate
+npm run deeprun -- validate --strict-v1-ready
 npm run deeprun -- promote
 
 Notes:
@@ -662,6 +664,8 @@ Notes:
 - Kernel `logs` includes correction-policy totals and per-step policy verdict lines when present.
 - `promote` is validation-gated: deployment is blocked unless the latest project validation record has `ok=true`.
 - Run `deeprun validate --project <projectId> --run <runId>` and confirm `VALIDATION_OK=true` before `deeprun promote`.
+- `validate --strict-v1-ready` also runs full v1-ready checks (heavy + Docker) and emits `V1_READY_*` keys.
+- Set `DEEPRUN_PROMOTE_REQUIRE_V1_READY=true` to require latest `V1_READY_OK=true` before `promote`.
 
 CLI integration test:
 

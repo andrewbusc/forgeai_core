@@ -469,7 +469,7 @@ function commandUsage(): string {
     "  status [--engine state|kernel] [--project <projectId>] [--run <runId>] [--watch] [--timeout-ms <ms>] [--verbose]",
     "  logs [--engine state|kernel] [--project <projectId>] [--run <runId>] [--verbose]",
     "  continue [--engine state|kernel] [--project <projectId>] [--run <runId>]",
-    "  validate [--project <projectId>] [--run <runId>]",
+    "  validate [--project <projectId>] [--run <runId>] [--strict-v1-ready]",
     "  branch [--project <projectId>] [--run <runId>]",
     "  fork <stepId> [--project <projectId>] [--run <runId>]",
     "  promote [--project <projectId>] [--custom-domain <domain>] [--container-port <port>]",
@@ -1201,6 +1201,7 @@ async function handleValidate(input: {
   options: Record<string, string | boolean>;
   verbose: boolean;
 }): Promise<number> {
+  const strictV1Ready = optionFlag(input.options, "strict-v1-ready");
   const { projectId, runId } = resolveProjectAndRunId({
     config: input.config,
     options: input.options,
@@ -1224,7 +1225,20 @@ async function handleValidate(input: {
         message: string;
       }>;
     };
-  }>("POST", `/api/projects/${projectId}/agent/runs/${runId}/validate`);
+    v1Ready?: {
+      target: string;
+      verdict: "YES" | "NO";
+      ok: boolean;
+      generatedAt: string;
+      checks: Array<{
+        id: string;
+        status: "pass" | "fail" | "skip";
+        message: string;
+      }>;
+    };
+  }>("POST", `/api/projects/${projectId}/agent/runs/${runId}/validate`, {
+    strictV1Ready
+  });
 
   await writeConfig(input.configPath, {
     ...input.config,
@@ -1239,14 +1253,33 @@ async function handleValidate(input: {
   process.stdout.write(`BLOCKING_COUNT=${result.validation.blockingCount}\n`);
   process.stdout.write(`WARNING_COUNT=${result.validation.warningCount}\n`);
   process.stdout.write(`VALIDATION_SUMMARY=${result.validation.summary}\n`);
+  if (result.v1Ready) {
+    process.stdout.write(`V1_READY_OK=${String(result.v1Ready.ok)}\n`);
+    process.stdout.write(`V1_READY_VERDICT=${result.v1Ready.verdict}\n`);
+    process.stdout.write(`V1_READY_TARGET=${result.v1Ready.target}\n`);
+    process.stdout.write(`V1_READY_GENERATED_AT=${result.v1Ready.generatedAt}\n`);
+  }
 
   if (input.verbose) {
     for (const check of result.validation.checks) {
       process.stdout.write(`check id=${check.id} status=${check.status} message=${check.message}\n`);
     }
+    if (result.v1Ready) {
+      for (const check of result.v1Ready.checks) {
+        process.stdout.write(`v1-ready check id=${check.id} status=${check.status} message=${check.message}\n`);
+      }
+    }
   }
 
-  return result.validation.ok ? 0 : 1;
+  if (!result.validation.ok) {
+    return 1;
+  }
+
+  if (strictV1Ready) {
+    return result.v1Ready?.ok ? 0 : 1;
+  }
+
+  return 0;
 }
 
 async function handleBranch(input: {

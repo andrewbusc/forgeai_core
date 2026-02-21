@@ -455,6 +455,81 @@ test("deeprun CLI promote is blocked until validation passes", async () => {
   }
 });
 
+test("deeprun CLI validate --strict-v1-ready emits v1-ready summary keys", async () => {
+  const server = await startServer();
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "deeprun-cli-validate-v1-ready-"));
+  const configPath = path.join(tmpDir, "cli.json");
+  const suffix = randomUUID().slice(0, 8);
+  const email = `cli-validate-v1-${suffix}@example.com`;
+
+  try {
+    const initResult = await runCli(
+      [
+        "init",
+        "--api",
+        server.baseUrl,
+        "--email",
+        email,
+        "--password",
+        "Password123!",
+        "--name",
+        `CLI Validate V1 Tester ${suffix}`,
+        "--org",
+        `CLI Validate V1 Org ${suffix}`,
+        "--workspace",
+        `CLI Validate V1 Workspace ${suffix}`
+      ],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl
+      }
+    );
+
+    assert.equal(initResult.code, 0, `init failed: ${initResult.stderr}`);
+
+    const runResult = await runCli(
+      [
+        "run",
+        `Build kernel run for strict v1 validate ${suffix}`,
+        "--engine",
+        "kernel",
+        "--provider",
+        "mock",
+        "--project-name",
+        `CLI Validate V1 Project ${suffix}`
+      ],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl
+      }
+    );
+
+    assert.equal(runResult.code, 0, `run failed: ${runResult.stderr}\n${runResult.stdout}`);
+    const runKv = parseKeyValueLines(runResult.stdout);
+    assert.ok(runKv.PROJECT_ID, `run output missing PROJECT_ID: ${runResult.stdout}`);
+    assert.ok(runKv.RUN_ID, `run output missing RUN_ID: ${runResult.stdout}`);
+
+    const validateResult = await runCli(
+      ["validate", "--project", runKv.PROJECT_ID, "--run", runKv.RUN_ID, "--strict-v1-ready"],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl,
+        V1_DOCKER_BIN: "__missing_docker_binary__"
+      }
+    );
+
+    assert.equal(validateResult.code, 1, `strict v1 validate should fail when docker checks fail: ${validateResult.stdout}`);
+    const validateKv = parseKeyValueLines(validateResult.stdout);
+    assert.ok(validateKv.V1_READY_OK !== undefined, `missing V1_READY_OK: ${validateResult.stdout}`);
+    assert.ok(validateKv.V1_READY_VERDICT !== undefined, `missing V1_READY_VERDICT: ${validateResult.stdout}`);
+    assert.ok(validateKv.V1_READY_TARGET !== undefined, `missing V1_READY_TARGET: ${validateResult.stdout}`);
+    assert.ok(validateKv.V1_READY_GENERATED_AT !== undefined, `missing V1_READY_GENERATED_AT: ${validateResult.stdout}`);
+  } finally {
+    await server.stop();
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test("deeprun CLI status --watch streams progress and --verbose enables http trace", async () => {
   const server = await startServer();
   const tmpDir = await mkdtemp(path.join(os.tmpdir(), "deeprun-cli-status-watch-"));

@@ -758,6 +758,111 @@ test("deployment route requires passing validation before promotion", async () =
   }
 });
 
+test("deployment route requires v1-ready report when strict promote gate is enabled", async () => {
+  const server = await startServer({
+    DEEPRUN_PROMOTE_REQUIRE_V1_READY: "true"
+  });
+  const jar = new CookieJar();
+  const suffix = randomUUID().slice(0, 8);
+  const store = new AppStore(process.cwd());
+  await store.initialize();
+
+  try {
+    const identity = await registerUser({
+      baseUrl: server.baseUrl,
+      jar,
+      suffix
+    });
+
+    const project = await createProject({
+      baseUrl: server.baseUrl,
+      jar,
+      workspaceId: identity.workspaceId,
+      suffix
+    });
+
+    const latestProject = await store.getProject(project.id);
+    assert.ok(latestProject);
+
+    const validatedAt = new Date().toISOString();
+    latestProject!.updatedAt = validatedAt;
+    latestProject!.history.unshift({
+      id: randomUUID(),
+      kind: "generate",
+      prompt: `Validation report for run strict-${suffix}`,
+      summary: "Validation passed: all checks passed.",
+      provider: "system",
+      model: "validation",
+      filesChanged: [],
+      commands: ["POST /api/projects/:projectId/agent/runs/:runId/validate"],
+      metadata: {
+        source: "agent_validate",
+        runId: `strict-${suffix}`,
+        targetPath: store.getProjectWorkspacePath(latestProject!),
+        validatedAt,
+        validation: {
+          ok: true,
+          blockingCount: 0,
+          warningCount: 0,
+          summary: "all checks passed",
+          checks: [],
+          violations: []
+        }
+      },
+      createdAt: validatedAt
+    });
+    latestProject!.history = latestProject!.history.slice(0, 80);
+    await store.updateProject(latestProject!);
+
+    const blocked = await requestJson<{ error?: string }>({
+      baseUrl: server.baseUrl,
+      jar,
+      method: "POST",
+      path: `/api/projects/${project.id}/deployments`,
+      body: {}
+    });
+
+    assert.equal(blocked.status, 409);
+    assert.match(blocked.body.error || "", /v1-ready/i);
+
+    const refreshedProject = await store.getProject(project.id);
+    assert.ok(refreshedProject);
+    const latestHistory = refreshedProject!.history[0];
+    assert.ok(latestHistory);
+    const metadata = (latestHistory.metadata || {}) as Record<string, unknown>;
+    metadata.v1Ready = {
+      ok: true,
+      verdict: "YES",
+      generatedAt: new Date().toISOString(),
+      checks: []
+    };
+    latestHistory.metadata = metadata;
+    refreshedProject!.history[0] = latestHistory;
+    refreshedProject!.updatedAt = new Date().toISOString();
+    await store.updateProject(refreshedProject!);
+
+    const allowed = await requestJson<{
+      deployment: {
+        id: string;
+        projectId: string;
+        status: string;
+      };
+    }>({
+      baseUrl: server.baseUrl,
+      jar,
+      method: "POST",
+      path: `/api/projects/${project.id}/deployments`,
+      body: {}
+    });
+
+    assert.equal(allowed.status, 202);
+    assert.ok(allowed.body.deployment.id);
+    assert.equal(allowed.body.deployment.projectId, project.id);
+  } finally {
+    await server.stop();
+  }
+});
+
 test("fork endpoint works from committed step and branch lock blocks project mutations", async () => {
   const server = await startServer();
   const jar = new CookieJar();

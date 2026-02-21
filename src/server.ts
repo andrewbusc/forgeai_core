@@ -16,6 +16,7 @@ import { ProviderRegistry } from "./lib/providers.js";
 import { AgentKernel } from "./agent/kernel.js";
 import { AgentRunService } from "./agent/run-service.js";
 import { AgentRunWorker } from "./agent/run-worker.js";
+import { runV1ReadinessCheck, V1ReadinessReport } from "./agent/validation/check-v1-ready.js";
 import { getTemplate, listTemplates } from "./templates/catalog.js";
 import { hashPassword, verifyPassword } from "./lib/auth.js";
 import { slugify } from "./lib/strings.js";
@@ -89,6 +90,10 @@ const createAgentRunSchema = z.object({
   goal: z.string().min(4).max(24_000),
   provider: z.string().optional(),
   model: z.string().max(100).optional()
+});
+
+const validateAgentRunSchema = z.object({
+  strictV1Ready: z.boolean().default(false)
 });
 
 const createAgentStateRunSchema = z.object({
@@ -252,6 +257,11 @@ interface ProjectValidationSnapshot {
   targetPath: string | null;
   validatedAt: string;
   validation: ValidationSummaryLike;
+  v1Ready: {
+    ok: boolean;
+    verdict: "YES" | "NO";
+    generatedAt: string;
+  } | null;
 }
 
 class HttpError extends Error {
@@ -761,6 +771,16 @@ function extractLatestProjectValidation(project: Project): ProjectValidationSnap
     const source = typeof metadata.source === "string" && metadata.source.trim() ? metadata.source.trim() : "unknown";
     const runId = typeof metadata.runId === "string" && metadata.runId.trim() ? metadata.runId.trim() : null;
     const targetPath = typeof metadata.targetPath === "string" && metadata.targetPath.trim() ? metadata.targetPath : null;
+    const v1ReadyRaw =
+      metadata.v1Ready && typeof metadata.v1Ready === "object" && !Array.isArray(metadata.v1Ready)
+        ? (metadata.v1Ready as Record<string, unknown>)
+        : null;
+    const v1ReadyOk = typeof v1ReadyRaw?.ok === "boolean" ? v1ReadyRaw.ok : null;
+    const v1ReadyVerdict = typeof v1ReadyRaw?.verdict === "string" ? v1ReadyRaw.verdict.trim().toUpperCase() : "";
+    const v1ReadyGeneratedAt =
+      typeof v1ReadyRaw?.generatedAt === "string" && v1ReadyRaw.generatedAt.trim()
+        ? v1ReadyRaw.generatedAt
+        : validatedAt;
 
     return {
       source,
@@ -773,7 +793,15 @@ function extractLatestProjectValidation(project: Project): ProjectValidationSnap
         warningCount: Number.isFinite(warningCount) && warningCount >= 0 ? Math.floor(warningCount) : 0,
         summary,
         checks
-      }
+      },
+      v1Ready:
+        v1ReadyOk === null
+          ? null
+          : {
+              ok: v1ReadyOk,
+              verdict: v1ReadyVerdict === "YES" ? "YES" : "NO",
+              generatedAt: v1ReadyGeneratedAt
+            }
     };
   }
 
@@ -787,6 +815,7 @@ async function persistValidationHistoryEntry(input: {
   targetPath: string;
   validatedAt: string;
   validation: ValidationSummaryLike;
+  v1Ready?: V1ReadinessReport | null;
   runCommitHash: string | null | undefined;
 }): Promise<Project> {
   const latestProject = (await store.getProject(input.project.id)) || input.project;
@@ -816,7 +845,17 @@ async function persistValidationHistoryEntry(input: {
         summary: input.validation.summary,
         checks: input.validation.checks,
         violations
-      }
+      },
+      ...(input.v1Ready
+        ? {
+            v1Ready: {
+              ok: input.v1Ready.ok,
+              verdict: input.v1Ready.verdict,
+              generatedAt: input.v1Ready.generatedAt,
+              checks: input.v1Ready.checks
+            }
+          }
+        : {})
     },
     createdAt: input.validatedAt
   });
@@ -2152,6 +2191,7 @@ app.post("/api/projects/:projectId/agent/runs/:runId/validate", authRequired, as
     const auth = getAuth(req);
     const requestId = getRequestId(req);
     const project = await requireProjectAccess(auth.user.id, req.params.projectId);
+    const parsed = validateAgentRunSchema.parse(req.body ?? {});
 
     const result = await agentKernel.validateRunOutput({
       project,
@@ -2160,6 +2200,28 @@ app.post("/api/projects/:projectId/agent/runs/:runId/validate", authRequired, as
     });
 
     const validatedAt = new Date().toISOString();
+    let v1Ready: V1ReadinessReport | null = null;
+
+    if (parsed.strictV1Ready) {
+      try {
+        v1Ready = await runV1ReadinessCheck(result.targetPath);
+      } catch (error) {
+        v1Ready = {
+          target: result.targetPath,
+          verdict: "NO",
+          ok: false,
+          checks: [
+            {
+              id: "v1_ready_execution",
+              status: "fail",
+              message: error instanceof Error ? error.message : String(error)
+            }
+          ],
+          generatedAt: new Date().toISOString()
+        };
+      }
+    }
+
     void persistValidationHistoryEntry({
       project,
       runId: result.run.id,
@@ -2167,6 +2229,7 @@ app.post("/api/projects/:projectId/agent/runs/:runId/validate", authRequired, as
       targetPath: result.targetPath,
       validatedAt,
       validation: result.validation,
+      v1Ready,
       runCommitHash: result.run.currentCommitHash || result.run.baseCommitHash || null
     }).catch((error) => {
       logWarn("agent.validate.history_persist_failed", {
@@ -2177,7 +2240,10 @@ app.post("/api/projects/:projectId/agent/runs/:runId/validate", authRequired, as
       });
     });
 
-    res.json(result);
+    res.json({
+      ...result,
+      ...(v1Ready ? { v1Ready } : {})
+    });
   } catch (error) {
     if (error instanceof Error && error.message === "Agent run not found.") {
       next(new HttpError(404, "Agent run not found."));
@@ -2335,6 +2401,7 @@ app.post("/api/projects/:projectId/deployments", authRequired, async (req, res, 
     const containerPort = getContainerPort(parsed.containerPort);
     const latestProject = (await store.getProject(project.id)) || project;
     const latestValidation = extractLatestProjectValidation(latestProject);
+    const requireV1ReadyForPromote = process.env.DEEPRUN_PROMOTE_REQUIRE_V1_READY === "true";
 
     if (!latestValidation?.validation.ok) {
       const summary = latestValidation?.validation.summary || "No passing validation record exists for this project.";
@@ -2342,6 +2409,17 @@ app.post("/api/projects/:projectId/deployments", authRequired, async (req, res, 
       throw new HttpError(
         409,
         `Project promotion blocked: ${summary} Run 'deeprun validate --project ${project.id}${runHint}' and retry promote after VALIDATION_OK=true.`
+      );
+    }
+
+    if (requireV1ReadyForPromote && latestValidation.v1Ready?.ok !== true) {
+      const runHint = latestValidation.runId ? ` --run ${latestValidation.runId}` : "";
+      const v1Summary = latestValidation.v1Ready
+        ? `Latest v1-ready verdict is ${latestValidation.v1Ready.verdict}.`
+        : "No v1-ready report exists in project history.";
+      throw new HttpError(
+        409,
+        `Project promotion blocked: ${v1Summary} Run 'deeprun validate --project ${project.id}${runHint} --strict-v1-ready' and retry promote after V1_READY_OK=true.`
       );
     }
 
