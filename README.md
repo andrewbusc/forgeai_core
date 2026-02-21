@@ -515,6 +515,7 @@ then Docker image build + optional containerized migration dry run + container `
 
 Server Integration Test Commands
 
+npm run test:providers
 npm run test:server-routes
 npm run test:server-agent-state
 npm run test:server-agent-kernel
@@ -540,6 +541,47 @@ npm run test:ci
 Local equivalent:
 
 npm run test:ci
+
+Reliability CI Gate
+
+GitHub Actions workflow: `.github/workflows/reliability.yml`
+
+Triggers:
+
+- `pull_request`: reliability PR gate
+- nightly schedule (`0 6 * * *` UTC)
+- manual dispatch (`workflow_dispatch`)
+
+Behavior:
+
+- Starts deeprun API against PostgreSQL service.
+- Runs `npm run benchmark:reliability`.
+- Uploads `.deeprun/reliability-report.json` and server logs as workflow artifacts.
+- PR mode uses strict thresholds:
+  - `iterations=3`
+  - `min_pass_rate=1.0`
+- Nightly/manual defaults:
+  - `iterations=10`
+  - `min_pass_rate=0.95`
+
+Reliability Benchmark (North Star Metric)
+
+Run repeated canonical bootstrap generations and calculate pass rate:
+
+npm run benchmark:reliability -- --email you@example.com --password 'Password123!' --iterations 10 --strict-v1-ready=true --min-pass-rate 0.95 --output .deeprun/reliability-report.json
+
+What this does:
+
+- Authenticates (register-or-login).
+- Runs `POST /api/projects/bootstrap/backend` for each sample.
+- Uses bootstrap certification as the base pass/fail gate.
+- Optionally runs full `check:v1-ready` per sample when `--strict-v1-ready=true`.
+- Emits structured JSON with `passRate`, `passCount`, `failCount`, and per-run diagnostics.
+- Heavy validation uses an isolated PostgreSQL schema per run by default (or `AGENT_HEAVY_DATABASE_URL` if provided) to avoid control-plane table collisions.
+
+This is the direct measurement for:
+
+`% of generated backends that deploy and boot in a clean environment without human edits`
 
 V1 Readiness Workflow
 
@@ -580,6 +622,7 @@ Notes:
 - Session/config persists at `.deeprun/cli.json` (override with `DEEPRUN_CLI_CONFIG`).
 - `bootstrap` always creates a new `canonical-backend` project and starts a kernel run in one call.
 - `bootstrap` is strict: it exits non-zero if post-bootstrap certification reports `CERTIFICATION_OK=false`.
+- If `--provider` is omitted, deeprun uses server-side default provider selection (`DEEPRUN_DEFAULT_PROVIDER` override, otherwise first configured real provider, else `mock`).
 - Default output is concise; add `--verbose` for expanded request and step details.
 
 CLI integration test:

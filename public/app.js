@@ -5,6 +5,7 @@ const state = {
   activeWorkspaceId: "",
   templates: [],
   providers: [],
+  defaultProviderId: "",
   projects: [],
   activeProject: null,
   tree: [],
@@ -210,6 +211,7 @@ function clearSession(resetStatus = true) {
   state.activeOrgId = "";
   state.activeWorkspaceId = "";
   state.projects = [];
+  state.defaultProviderId = "";
   state.activeProject = null;
   state.tree = [];
   state.activeFilePath = "";
@@ -374,13 +376,23 @@ function renderTemplateOptions() {
 }
 
 function renderProviderOptions() {
+  if (!state.providers.length) {
+    el.providerSelect.innerHTML = "";
+    el.modelInput.placeholder = "Optional model override";
+    return;
+  }
+
   el.providerSelect.innerHTML = state.providers
     .map((provider) => `<option value="${provider.id}">${provider.name}</option>`)
     .join("");
 
-  const selected = state.providers.find((provider) => provider.id === el.providerSelect.value) || state.providers[0];
+  const selected =
+    state.providers.find((provider) => provider.id === el.providerSelect.value) ||
+    state.providers.find((provider) => provider.id === state.defaultProviderId) ||
+    state.providers[0];
 
   if (selected) {
+    el.providerSelect.value = selected.id;
     el.modelInput.placeholder = selected.defaultModel;
   }
 }
@@ -760,7 +772,8 @@ async function loadTemplates() {
 
 async function loadProviders() {
   const payload = await api("/api/providers");
-  state.providers = payload.providers;
+  state.providers = Array.isArray(payload.providers) ? payload.providers : [];
+  state.defaultProviderId = typeof payload.defaultProviderId === "string" ? payload.defaultProviderId : "";
   renderProviderOptions();
 }
 
@@ -1293,7 +1306,7 @@ async function runBuilder(mode) {
     return;
   }
 
-  const provider = el.providerSelect.value || "mock";
+  const provider = el.providerSelect.value || state.defaultProviderId || "";
   const model = el.modelInput.value.trim();
   const endpoint = mode === "chat" ? "chat" : "generate";
 
@@ -1306,8 +1319,8 @@ async function runBuilder(mode) {
       body: JSON.stringify({
         prompt,
         message: prompt,
-        provider,
-        model: model || undefined
+        ...(provider ? { provider } : {}),
+        ...(model ? { model } : {})
       })
     });
 
@@ -1555,7 +1568,7 @@ async function bootstrap() {
   try {
     setStatus("Restoring session...");
     await bootstrapAuthenticated();
-    setStatus("ForgeAI ready.", "success");
+    setStatus("deeprun ready.", "success");
   } catch {
     clearSession(false);
     setStatus("Sign in or register to start building.");

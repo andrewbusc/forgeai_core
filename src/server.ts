@@ -75,19 +75,19 @@ const bootstrapBackendSchema = z.object({
   name: z.string().min(2).max(100).optional(),
   description: z.string().max(500).optional(),
   goal: z.string().min(4).max(24_000),
-  provider: z.string().default("mock"),
+  provider: z.string().optional(),
   model: z.string().max(100).optional()
 });
 
 const generateSchema = z.object({
   prompt: z.string().min(4).max(24_000),
-  provider: z.string().default("mock"),
+  provider: z.string().optional(),
   model: z.string().max(100).optional()
 });
 
 const createAgentRunSchema = z.object({
   goal: z.string().min(4).max(24_000),
-  provider: z.string().default("mock"),
+  provider: z.string().optional(),
   model: z.string().max(100).optional()
 });
 
@@ -1508,7 +1508,10 @@ app.post("/api/auth/logout", authRequired, async (req, res, next) => {
 });
 
 app.get("/api/providers", authRequired, (_req, res) => {
-  res.json({ providers: providers.list() });
+  res.json({
+    providers: providers.list(),
+    defaultProviderId: providers.getDefaultProviderId()
+  });
 });
 
 app.get("/api/templates", authRequired, (_req, res) => {
@@ -1682,6 +1685,7 @@ app.post("/api/projects/bootstrap/backend", authRequired, async (req, res, next)
     const auth = getAuth(req);
     const requestId = getRequestId(req);
     const parsed = bootstrapBackendSchema.parse(req.body ?? {});
+    const providerId = providers.resolveProviderId(parsed.provider);
     const { workspace } = await requireWorkspaceAccess(auth.user.id, parsed.workspaceId);
 
     await enforceRateLimit(req, res, {
@@ -1705,7 +1709,7 @@ app.post("/api/projects/bootstrap/backend", authRequired, async (req, res, next)
       project,
       createdByUserId: auth.user.id,
       goal: parsed.goal,
-      providerId: parsed.provider,
+      providerId,
       model: parsed.model,
       requestId
     });
@@ -1878,6 +1882,7 @@ app.post("/api/projects/:projectId/agent/runs", authRequired, async (req, res, n
     const project = await requireProjectAccess(auth.user.id, req.params.projectId);
     await assertNoActiveAgentRunMutation(project.id);
     const parsed = createAgentRunSchema.parse(req.body ?? {});
+    const providerId = providers.resolveProviderId(parsed.provider);
 
     await enforceRateLimit(req, res, {
       key: `generate:${auth.user.id}`,
@@ -1890,7 +1895,7 @@ app.post("/api/projects/:projectId/agent/runs", authRequired, async (req, res, n
       project,
       createdByUserId: auth.user.id,
       goal: parsed.goal,
-      providerId: parsed.provider,
+      providerId,
       model: parsed.model,
       requestId
     });
@@ -2282,13 +2287,14 @@ app.post("/api/projects/:projectId/generate", authRequired, async (req, res, nex
     });
 
     const parsed = generateSchema.parse(req.body ?? {});
+    const providerId = providers.resolveProviderId(parsed.provider);
 
     logInfo("generation.started", {
       requestId,
       userId: auth.user.id,
       projectId: project.id,
       mode: "generate",
-      provider: parsed.provider,
+      provider: providerId,
       model: parsed.model || null
     });
 
@@ -2299,7 +2305,7 @@ app.post("/api/projects/:projectId/generate", authRequired, async (req, res, nex
       registry: providers,
       project,
       prompt: parsed.prompt,
-      providerId: parsed.provider,
+      providerId,
       model: parsed.model,
       kind: "generate"
     });
@@ -2309,7 +2315,7 @@ app.post("/api/projects/:projectId/generate", authRequired, async (req, res, nex
       userId: auth.user.id,
       projectId: project.id,
       mode: "generate",
-      provider: parsed.provider,
+      provider: providerId,
       model: parsed.model || null,
       filesChangedCount: result.filesChanged.length,
       durationMs: Date.now() - startedAt,
@@ -2342,13 +2348,14 @@ app.post("/api/projects/:projectId/chat", authRequired, async (req, res, next) =
       ...req.body,
       prompt: req.body?.message ?? req.body?.prompt
     });
+    const providerId = providers.resolveProviderId(parsed.provider);
 
     logInfo("generation.started", {
       requestId,
       userId: auth.user.id,
       projectId: project.id,
       mode: "chat",
-      provider: parsed.provider,
+      provider: providerId,
       model: parsed.model || null
     });
 
@@ -2359,7 +2366,7 @@ app.post("/api/projects/:projectId/chat", authRequired, async (req, res, next) =
       registry: providers,
       project,
       prompt: parsed.prompt,
-      providerId: parsed.provider,
+      providerId,
       model: parsed.model,
       kind: "chat"
     });
@@ -2369,7 +2376,7 @@ app.post("/api/projects/:projectId/chat", authRequired, async (req, res, next) =
       userId: auth.user.id,
       projectId: project.id,
       mode: "chat",
-      provider: parsed.provider,
+      provider: providerId,
       model: parsed.model || null,
       filesChangedCount: result.filesChanged.length,
       durationMs: Date.now() - startedAt,

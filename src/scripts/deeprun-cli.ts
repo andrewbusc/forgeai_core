@@ -406,6 +406,7 @@ function commandUsage(): string {
     "",
     "Notes:",
     "  - Session state is persisted in .deeprun/cli.json (or DEEPRUN_CLI_CONFIG).",
+    "  - If --provider is omitted, server-side default provider selection is used.",
     "  - Use --verbose to include request tracing and expanded step output."
   ].join("\n");
 }
@@ -699,7 +700,7 @@ async function handleBootstrap(input: {
 
   const projectName = optionString(input.options, "project-name") || suggestProjectName(goal);
   const description = optionString(input.options, "description") || `Created by deeprun CLI for goal: ${goal}`;
-  const provider = optionString(input.options, "provider") || "mock";
+  const provider = optionString(input.options, "provider");
   const model = optionString(input.options, "model");
 
   const jar = new CookieJar(input.config.cookies);
@@ -714,8 +715,8 @@ async function handleBootstrap(input: {
     name: projectName,
     description,
     goal,
-    provider,
-    model
+    ...(provider ? { provider } : {}),
+    ...(model ? { model } : {})
   });
 
   await writeConfig(input.configPath, {
@@ -767,7 +768,7 @@ async function handleRun(input: {
   const engine = resolveEngine(input.options, "state");
   const jar = new CookieJar(input.config.cookies);
   const client = new ApiClient(input.config.apiBaseUrl, jar, input.verbose);
-  const provider = optionString(input.options, "provider") || "mock";
+  const provider = optionString(input.options, "provider");
   const model = optionString(input.options, "model");
 
   const projectContext = await createProjectIfNeeded({
@@ -820,8 +821,8 @@ async function handleRun(input: {
 
   const started = await client.requestOk<KernelRunDetail>("POST", `/api/projects/${projectContext.projectId}/agent/runs`, {
     goal,
-    provider,
-    model
+    ...(provider ? { provider } : {}),
+    ...(model ? { model } : {})
   });
 
   nextConfig.lastKernelRunId = started.run.id;

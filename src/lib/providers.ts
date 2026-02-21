@@ -159,6 +159,7 @@ function parseJsonPayload(input: unknown): unknown {
 
 export class ProviderRegistry {
   private readonly providers = new Map<string, AiProvider>();
+  private readonly defaultProviderId: string;
 
   constructor() {
     this.providers.set("mock", new MockProvider());
@@ -198,14 +199,55 @@ export class ProviderRegistry {
         )
       );
     }
+
+    this.defaultProviderId = this.resolveDefaultProviderId();
+  }
+
+  private resolveDefaultProviderId(): string {
+    const configuredDefault = String(process.env.DEEPRUN_DEFAULT_PROVIDER || "").trim();
+    if (configuredDefault) {
+      if (!this.providers.has(configuredDefault)) {
+        throw new Error(
+          `DEEPRUN_DEFAULT_PROVIDER is set to '${configuredDefault}', but that provider is not configured.`
+        );
+      }
+      return configuredDefault;
+    }
+
+    const firstConfiguredRealProvider = Array.from(this.providers.values())
+      .map((provider) => provider.descriptor)
+      .find((descriptor) => descriptor.id !== "mock" && descriptor.configured);
+
+    return firstConfiguredRealProvider?.id || "mock";
   }
 
   list(): ProviderDescriptor[] {
-    return Array.from(this.providers.values()).map((provider) => provider.descriptor);
+    return Array.from(this.providers.values())
+      .sort((left, right) => {
+        const leftDefault = left.descriptor.id === this.defaultProviderId ? 0 : 1;
+        const rightDefault = right.descriptor.id === this.defaultProviderId ? 0 : 1;
+        if (leftDefault !== rightDefault) {
+          return leftDefault - rightDefault;
+        }
+        return left.descriptor.id.localeCompare(right.descriptor.id);
+      })
+      .map((provider) => provider.descriptor);
+  }
+
+  getDefaultProviderId(): string {
+    return this.defaultProviderId;
+  }
+
+  resolveProviderId(providerId: string | undefined | null): string {
+    const resolved = typeof providerId === "string" && providerId.trim().length > 0 ? providerId.trim() : this.defaultProviderId;
+    if (!this.providers.has(resolved)) {
+      throw new Error(`Unknown provider: ${resolved}`);
+    }
+    return resolved;
   }
 
   get(providerId: string): AiProvider {
-    const provider = this.providers.get(providerId);
+    const provider = this.providers.get(this.resolveProviderId(providerId));
     if (!provider) {
       throw new Error(`Unknown provider: ${providerId}`);
     }

@@ -20,8 +20,11 @@
     "test:server-agent-kernel": "tsx -r dotenv/config --test src/__tests__/agent-kernel-routes.test.ts",
     "test:server-all": "npm run test:server-routes && npm run test:server-agent-state && npm run test:server-agent-kernel",
     "test:bootstrap": "npm run test:server-agent-kernel && npm run test:cli",
-    "test:ci": "npm run check && npm run test:validation && npm run test:agent-state && npm run test:agent-kernel && npm run test:server-routes && npm run test:server-agent-state && npm run test:bootstrap",
+    "test:providers": "tsx --test src/lib/__tests__/providers.test.ts",
+    "test:benchmark": "tsx --test src/scripts/__tests__/reliability-benchmark.test.ts",
+    "test:ci": "npm run check && npm run test:providers && npm run test:benchmark && npm run test:validation && npm run test:agent-state && npm run test:agent-kernel && npm run test:server-routes && npm run test:server-agent-state && npm run test:bootstrap",
     "test:v1-ready": "npm run check:v1-ready -- .",
+    "benchmark:reliability": "tsx -r dotenv/config src/scripts/reliability-benchmark.ts",
     "deeprun": "tsx -r dotenv/config src/scripts/deeprun-cli.ts",
     "test:cli": "tsx -r dotenv/config --test src/__tests__/deeprun-cli.test.ts"
   },

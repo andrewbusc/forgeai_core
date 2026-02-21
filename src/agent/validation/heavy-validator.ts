@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import http from "node:http";
 import net from "node:net";
 import path from "node:path";
@@ -48,6 +49,43 @@ function truncateOutput(value: string, maxChars = 120_000): string {
 
 function shellSafeCommand(command: string, args: string[]): string {
   return [command, ...args.map((arg) => (/[^A-Za-z0-9_./:-]/.test(arg) ? JSON.stringify(arg) : arg))].join(" ");
+}
+
+function normalizeSchemaScope(value: string): string {
+  const normalized = value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 24);
+
+  return normalized || "validation";
+}
+
+function buildScopedValidationDatabaseUrl(databaseUrl: string | undefined, scope: string): string | undefined {
+  const raw = String(databaseUrl || "").trim();
+  if (!raw) {
+    return undefined;
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return raw;
+  }
+
+  if (!/^postgres(ql)?:$/i.test(parsed.protocol)) {
+    return raw;
+  }
+
+  const existingSchema = parsed.searchParams.get("schema");
+  if (existingSchema && existingSchema.trim().length > 0) {
+    return raw;
+  }
+
+  const scopedSchema = `deeprun_hv_${normalizeSchemaScope(scope)}_${randomBytes(4).toString("hex")}`.slice(0, 63);
+  parsed.searchParams.set("schema", scopedSchema);
+  return parsed.toString();
 }
 
 async function runCommand(input: {
@@ -189,12 +227,14 @@ async function runBootCheck(input: {
   npmBin: string;
   timeoutMs: number;
   healthPath: string;
+  env?: NodeJS.ProcessEnv;
 }): Promise<HeavyValidationCheck> {
   const port = await acquireFreePort();
   const child = spawn(input.npmBin, ["run", "start"], {
     cwd: input.cwd,
     env: {
       ...process.env,
+      ...(input.env || {}),
       NODE_ENV: "production",
       PORT: String(port)
     },
@@ -459,6 +499,11 @@ export async function runHeavyProjectValidation(input: HeavyValidationInput): Pr
       }
 
       const npmBin = process.env.AGENT_VALIDATION_NPM_BIN || "npm";
+      const validationDatabaseUrl = buildScopedValidationDatabaseUrl(
+        process.env.AGENT_HEAVY_DATABASE_URL || process.env.DATABASE_URL,
+        path.basename(isolatedRoot)
+      );
+      const validationCommandEnv = validationDatabaseUrl ? { DATABASE_URL: validationDatabaseUrl } : undefined;
       const packageRaw = await readTextFile(packageJsonPath);
       const packageJson = JSON.parse(packageRaw) as {
         scripts?: Record<string, string | undefined>;
@@ -536,7 +581,8 @@ export async function runHeavyProjectValidation(input: HeavyValidationInput): Pr
           command: npmBin,
           args: ["run", migrationScript],
           timeoutMs: Number(process.env.AGENT_HEAVY_MIGRATION_TIMEOUT_MS || 180_000),
-          allowFailure: true
+          allowFailure: true,
+          env: validationCommandEnv
         });
 
         logs.push(migration.combined);
@@ -591,7 +637,8 @@ export async function runHeavyProjectValidation(input: HeavyValidationInput): Pr
           command: npmBin,
           args: ["run", seedScript],
           timeoutMs: Number(process.env.AGENT_HEAVY_SEED_TIMEOUT_MS || 180_000),
-          allowFailure: true
+          allowFailure: true,
+          env: validationCommandEnv
         });
 
         logs.push(seed.combined);
@@ -724,7 +771,8 @@ export async function runHeavyProjectValidation(input: HeavyValidationInput): Pr
           command: npmBin,
           args: ["test"],
           timeoutMs: Number(process.env.AGENT_HEAVY_TEST_TIMEOUT_MS || 180_000),
-          allowFailure: true
+          allowFailure: true,
+          env: validationCommandEnv
         });
 
         logs.push(test.combined);
@@ -767,7 +815,8 @@ export async function runHeavyProjectValidation(input: HeavyValidationInput): Pr
           cwd: isolatedRoot,
           npmBin,
           timeoutMs: Number(process.env.AGENT_HEAVY_BOOT_TIMEOUT_MS || 25_000),
-          healthPath: process.env.AGENT_HEAVY_HEALTH_PATH || "/health"
+          healthPath: process.env.AGENT_HEAVY_HEALTH_PATH || "/health",
+          env: validationCommandEnv
         });
 
         checks.push(boot);
