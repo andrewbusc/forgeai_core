@@ -660,6 +660,8 @@ Notes:
 - Default output is concise; add `--verbose` for expanded request and step details.
 - Kernel `status` reports correction-policy counters (`CORRECTION_POLICY_*`) and last-policy summary keys.
 - Kernel `logs` includes correction-policy totals and per-step policy verdict lines when present.
+- `promote` is validation-gated: deployment is blocked unless the latest project validation record has `ok=true`.
+- Run `deeprun validate --project <projectId> --run <runId>` and confirm `VALIDATION_OK=true` before `deeprun promote`.
 
 CLI integration test:
 

@@ -385,6 +385,76 @@ test("deeprun CLI supports backend bootstrap command", async () => {
   }
 });
 
+test("deeprun CLI promote is blocked until validation passes", async () => {
+  const server = await startServer();
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "deeprun-cli-promote-gate-"));
+  const configPath = path.join(tmpDir, "cli.json");
+  const suffix = randomUUID().slice(0, 8);
+  const email = `cli-promote-${suffix}@example.com`;
+
+  try {
+    const initResult = await runCli(
+      [
+        "init",
+        "--api",
+        server.baseUrl,
+        "--email",
+        email,
+        "--password",
+        "Password123!",
+        "--name",
+        `CLI Promote Tester ${suffix}`,
+        "--org",
+        `CLI Promote Org ${suffix}`,
+        "--workspace",
+        `CLI Promote Workspace ${suffix}`
+      ],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl
+      }
+    );
+
+    assert.equal(initResult.code, 0, `init failed: ${initResult.stderr}`);
+
+    const runResult = await runCli(
+      [
+        "run",
+        `Build kernel run for promote ${suffix}`,
+        "--engine",
+        "kernel",
+        "--provider",
+        "mock",
+        "--project-name",
+        `CLI Promote Project ${suffix}`
+      ],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl
+      }
+    );
+
+    assert.equal(runResult.code, 0, `run failed: ${runResult.stderr}\n${runResult.stdout}`);
+    const runKv = parseKeyValueLines(runResult.stdout);
+    assert.ok(runKv.PROJECT_ID, `run output missing PROJECT_ID: ${runResult.stdout}`);
+
+    const promoteResult = await runCli(
+      ["promote", "--project", runKv.PROJECT_ID],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl
+      }
+    );
+
+    assert.equal(promoteResult.code, 1, `promote should fail without validation: ${promoteResult.stdout}`);
+    assert.match(promoteResult.stderr, /promotion blocked/i);
+    assert.match(promoteResult.stderr, /validate/i);
+  } finally {
+    await server.stop();
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test("deeprun CLI status --watch streams progress and --verbose enables http trace", async () => {
   const server = await startServer();
   const tmpDir = await mkdtemp(path.join(os.tmpdir(), "deeprun-cli-status-watch-"));

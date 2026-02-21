@@ -670,6 +670,94 @@ test("backend bootstrap endpoint creates canonical project and starts kernel run
   }
 });
 
+test("deployment route requires passing validation before promotion", async () => {
+  const server = await startServer();
+  const jar = new CookieJar();
+  const suffix = randomUUID().slice(0, 8);
+  const store = new AppStore(process.cwd());
+  await store.initialize();
+
+  try {
+    const identity = await registerUser({
+      baseUrl: server.baseUrl,
+      jar,
+      suffix
+    });
+
+    const project = await createProject({
+      baseUrl: server.baseUrl,
+      jar,
+      workspaceId: identity.workspaceId,
+      suffix
+    });
+
+    const blocked = await requestJson<{ error?: string }>({
+      baseUrl: server.baseUrl,
+      jar,
+      method: "POST",
+      path: `/api/projects/${project.id}/deployments`,
+      body: {}
+    });
+
+    assert.equal(blocked.status, 409);
+    assert.match(blocked.body.error || "", /promotion blocked/i);
+    assert.match(blocked.body.error || "", /validate/i);
+
+    const latestProject = await store.getProject(project.id);
+    assert.ok(latestProject);
+
+    const validatedAt = new Date().toISOString();
+    latestProject!.updatedAt = validatedAt;
+    latestProject!.history.unshift({
+      id: randomUUID(),
+      kind: "generate",
+      prompt: `Validation report for run seeded-${suffix}`,
+      summary: "Validation passed: all checks passed.",
+      provider: "system",
+      model: "validation",
+      filesChanged: [],
+      commands: ["POST /api/projects/:projectId/agent/runs/:runId/validate"],
+      metadata: {
+        source: "agent_validate",
+        runId: `seeded-${suffix}`,
+        targetPath: store.getProjectWorkspacePath(latestProject!),
+        validatedAt,
+        validation: {
+          ok: true,
+          blockingCount: 0,
+          warningCount: 0,
+          summary: "all checks passed",
+          checks: [],
+          violations: []
+        }
+      },
+      createdAt: validatedAt
+    });
+    latestProject!.history = latestProject!.history.slice(0, 80);
+    await store.updateProject(latestProject!);
+
+    const allowed = await requestJson<{
+      deployment: {
+        id: string;
+        projectId: string;
+        status: string;
+      };
+    }>({
+      baseUrl: server.baseUrl,
+      jar,
+      method: "POST",
+      path: `/api/projects/${project.id}/deployments`,
+      body: {}
+    });
+
+    assert.equal(allowed.status, 202);
+    assert.ok(allowed.body.deployment.id);
+    assert.equal(allowed.body.deployment.projectId, project.id);
+  } finally {
+    await server.stop();
+  }
+});
+
 test("fork endpoint works from committed step and branch lock blocks project mutations", async () => {
   const server = await startServer();
   const jar = new CookieJar();
