@@ -394,6 +394,189 @@ test("kernel run endpoints support start/list/detail/resume/validate", async () 
   }
 });
 
+test("kernel run detail exposes correction policy telemetry contract", async () => {
+  const server = await startServer();
+  const jar = new CookieJar();
+  const suffix = randomUUID().slice(0, 8);
+  const store = new AppStore(process.cwd());
+  await store.initialize();
+
+  try {
+    const identity = await registerUser({
+      baseUrl: server.baseUrl,
+      jar,
+      suffix
+    });
+
+    const project = await createProject({
+      baseUrl: server.baseUrl,
+      jar,
+      workspaceId: identity.workspaceId,
+      suffix
+    });
+
+    const now = new Date().toISOString();
+    const run = await store.createAgentRun({
+      projectId: project.id,
+      orgId: project.orgId,
+      workspaceId: project.workspaceId,
+      createdByUserId: identity.userId,
+      goal: "Synthetic correction policy telemetry run",
+      providerId: "mock",
+      status: "failed",
+      currentStepIndex: 1,
+      plan: {
+        goal: "Synthetic correction policy telemetry run",
+        steps: [
+          {
+            id: "runtime-correction-1",
+            type: "modify",
+            tool: "write_file",
+            input: {
+              _deepCorrection: {
+                phase: "goal",
+                attempt: 1,
+                failedStepId: "step-verify-runtime",
+                classification: {
+                  intent: "runtime_boot",
+                  failedChecks: [],
+                  failureKinds: ["runtime"],
+                  rationale: "synthetic test fixture"
+                },
+                constraint: {
+                  intent: "runtime_boot",
+                  maxFiles: 6,
+                  maxTotalDiffBytes: 120000,
+                  allowedPathPrefixes: ["src/"],
+                  guidance: ["Fix startup only"]
+                },
+                createdAt: now
+              }
+            }
+          }
+        ]
+      },
+      errorMessage: "Correction policy violation: synthetic fixture",
+      finishedAt: now
+    });
+
+    await store.createAgentStep({
+      runId: run.id,
+      projectId: project.id,
+      stepIndex: 0,
+      stepId: "runtime-correction-1",
+      type: "modify",
+      tool: "write_file",
+      inputPayload: {
+        path: "src/server.ts",
+        content: "// synthetic correction\n",
+        _deepCorrection: {
+          phase: "goal",
+          attempt: 1,
+          failedStepId: "step-verify-runtime",
+          classification: {
+            intent: "runtime_boot",
+            failedChecks: [],
+            failureKinds: ["runtime"],
+            rationale: "synthetic test fixture"
+          },
+          constraint: {
+            intent: "runtime_boot",
+            maxFiles: 6,
+            maxTotalDiffBytes: 120000,
+            allowedPathPrefixes: ["src/"],
+            guidance: ["Fix startup only"]
+          },
+          createdAt: now
+        }
+      },
+      outputPayload: {
+        proposedChanges: [
+          {
+            path: "src/server.ts",
+            type: "update"
+          }
+        ],
+        correctionPolicy: {
+          ok: false,
+          mode: "enforce",
+          blockingCount: 1,
+          warningCount: 0,
+          summary: "failed rules: correction_attempt_suffix_match; blocking=1; warnings=0",
+          violations: [
+            {
+              ruleId: "correction_attempt_suffix_match",
+              severity: "error",
+              message: "attempt mismatch"
+            }
+          ]
+        }
+      },
+      status: "failed",
+      errorMessage: "Correction policy violation: synthetic fixture",
+      commitHash: null,
+      runtimeStatus: "failed",
+      startedAt: now,
+      finishedAt: now
+    });
+
+    const detail = await requestJson<{
+      run: { id: string };
+      steps: Array<{
+        stepId: string;
+        correctionPolicy?: {
+          ok: boolean;
+          mode?: string;
+          blockingCount: number;
+          warningCount: number;
+          summary: string;
+          violations: Array<{ ruleId: string; severity: string; message: string }>;
+        };
+      }>;
+      telemetry: {
+        corrections: Array<{
+          stepId: string;
+          correctionPolicy?: {
+            ok: boolean;
+            summary: string;
+          };
+        }>;
+        correctionPolicies: Array<{
+          stepId: string;
+          policy: {
+            ok: boolean;
+            mode?: string;
+            blockingCount: number;
+            warningCount: number;
+            summary: string;
+          };
+        }>;
+      };
+    }>({
+      baseUrl: server.baseUrl,
+      jar,
+      method: "GET",
+      path: `/api/projects/${project.id}/agent/runs/${run.id}`
+    });
+
+    assert.equal(detail.status, 200);
+    assert.equal(detail.body.run.id, run.id);
+    assert.equal(detail.body.steps.length, 1);
+    assert.equal(detail.body.steps[0]?.stepId, "runtime-correction-1");
+    assert.equal(detail.body.steps[0]?.correctionPolicy?.ok, false);
+    assert.equal(detail.body.steps[0]?.correctionPolicy?.mode, "enforce");
+    assert.equal(detail.body.steps[0]?.correctionPolicy?.blockingCount, 1);
+    assert.equal(detail.body.steps[0]?.correctionPolicy?.violations[0]?.ruleId, "correction_attempt_suffix_match");
+    assert.equal(Array.isArray(detail.body.telemetry.correctionPolicies), true);
+    assert.equal(detail.body.telemetry.correctionPolicies.length, 1);
+    assert.equal(detail.body.telemetry.correctionPolicies[0]?.stepId, "runtime-correction-1");
+    assert.equal(detail.body.telemetry.correctionPolicies[0]?.policy.ok, false);
+    assert.equal(detail.body.telemetry.corrections[0]?.correctionPolicy?.ok, false);
+  } finally {
+    await server.stop();
+  }
+});
+
 test("backend bootstrap endpoint creates canonical project and starts kernel run", async () => {
   const server = await startServer();
   const jar = new CookieJar();

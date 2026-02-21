@@ -20,8 +20,10 @@ import { AgentPlanner } from "./planner.js";
 import { isExecutingAgentRunStatus } from "./run-status.js";
 import { createDefaultAgentToolRegistry } from "./tools/index.js";
 import {
+  AgentCorrectionPolicyTelemetry,
   AgentCorrectionTelemetry,
   AgentRun,
+  AgentRunCorrectionPolicyTelemetryEntry,
   AgentRunCorrectionTelemetryEntry,
   AgentRunDetail,
   AgentStep,
@@ -373,29 +375,123 @@ export class AgentKernel {
     };
   }
 
+  private parseCorrectionPolicyMode(value: unknown): "off" | "warn" | "enforce" | undefined {
+    if (typeof value !== "string") {
+      return undefined;
+    }
+
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "off" || normalized === "warn" || normalized === "enforce") {
+      return normalized;
+    }
+
+    return undefined;
+  }
+
+  private extractCorrectionPolicyForStep(step: AgentStepRecord): AgentCorrectionPolicyTelemetry | null {
+    const outputPayload = this.toRecord(step.outputPayload);
+    const raw = this.toRecord(outputPayload?.correctionPolicy);
+    if (!raw || typeof raw.ok !== "boolean") {
+      return null;
+    }
+
+    const violations: AgentCorrectionPolicyTelemetry["violations"] = [];
+    const rawViolations = Array.isArray(raw.violations) ? raw.violations : [];
+
+    for (const entry of rawViolations) {
+      const record = this.toRecord(entry);
+      if (!record) {
+        continue;
+      }
+
+      const ruleId = typeof record.ruleId === "string" ? record.ruleId.trim() : "";
+      const message = typeof record.message === "string" ? record.message.trim() : "";
+      const severityRaw = typeof record.severity === "string" ? record.severity.trim().toLowerCase() : "";
+      const severity = severityRaw === "warning" ? "warning" : severityRaw === "error" ? "error" : null;
+
+      if (!ruleId || !message || !severity) {
+        continue;
+      }
+
+      const details = this.toRecord(record.details) || undefined;
+      violations.push({
+        ruleId,
+        severity,
+        message,
+        ...(details ? { details } : {})
+      });
+    }
+
+    const blockingFromViolations = violations.filter((entry) => entry.severity === "error").length;
+    const warningFromViolations = violations.length - blockingFromViolations;
+    const blockingCount = Number(raw.blockingCount);
+    const warningCount = Number(raw.warningCount);
+    const resolvedBlockingCount =
+      Number.isFinite(blockingCount) && blockingCount >= 0 ? Math.floor(blockingCount) : blockingFromViolations;
+    const resolvedWarningCount =
+      Number.isFinite(warningCount) && warningCount >= 0 ? Math.floor(warningCount) : warningFromViolations;
+
+    const summary =
+      typeof raw.summary === "string" && raw.summary.trim()
+        ? raw.summary.trim()
+        : resolvedBlockingCount === 0
+          ? `correction policy passed; warnings=${resolvedWarningCount}`
+          : `failed rules; blocking=${resolvedBlockingCount}; warnings=${resolvedWarningCount}`;
+
+    return {
+      ok: raw.ok,
+      mode: this.parseCorrectionPolicyMode(raw.mode),
+      blockingCount: resolvedBlockingCount,
+      warningCount: resolvedWarningCount,
+      summary,
+      violations
+    };
+  }
+
   private buildRunDetail(run: AgentRun, steps: AgentStepRecord[]): AgentRunDetail {
     const corrections: AgentRunCorrectionTelemetryEntry[] = [];
+    const correctionPolicies: AgentRunCorrectionPolicyTelemetryEntry[] = [];
     const enrichedSteps = steps.map((step) => {
       const correctionTelemetry = this.extractCorrectionTelemetryForStep(step);
-      if (!correctionTelemetry) {
+      const correctionPolicy = this.extractCorrectionPolicyForStep(step);
+
+      if (correctionPolicy) {
+        correctionPolicies.push({
+          stepRecordId: step.id,
+          stepId: step.stepId,
+          stepIndex: step.stepIndex,
+          stepAttempt: step.attempt,
+          status: step.status,
+          errorMessage: step.errorMessage,
+          commitHash: step.commitHash,
+          createdAt: step.createdAt,
+          policy: correctionPolicy
+        });
+      }
+
+      if (correctionTelemetry) {
+        corrections.push({
+          stepRecordId: step.id,
+          stepId: step.stepId,
+          stepIndex: step.stepIndex,
+          stepAttempt: step.attempt,
+          status: step.status,
+          errorMessage: step.errorMessage,
+          commitHash: step.commitHash,
+          createdAt: step.createdAt,
+          telemetry: correctionTelemetry,
+          correctionPolicy
+        });
+      }
+
+      if (!correctionTelemetry && !correctionPolicy) {
         return step;
       }
 
-      corrections.push({
-        stepRecordId: step.id,
-        stepId: step.stepId,
-        stepIndex: step.stepIndex,
-        stepAttempt: step.attempt,
-        status: step.status,
-        errorMessage: step.errorMessage,
-        commitHash: step.commitHash,
-        createdAt: step.createdAt,
-        telemetry: correctionTelemetry
-      });
-
       return {
         ...step,
-        correctionTelemetry
+        ...(correctionTelemetry ? { correctionTelemetry } : {}),
+        ...(correctionPolicy ? { correctionPolicy } : {})
       };
     });
 
@@ -403,7 +499,8 @@ export class AgentKernel {
       run: attachLastStep(run, enrichedSteps),
       steps: enrichedSteps,
       telemetry: {
-        corrections
+        corrections,
+        correctionPolicies
       }
     };
   }

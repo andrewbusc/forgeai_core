@@ -502,7 +502,9 @@ Run detail telemetry:
 
 `GET /api/projects/:projectId/agent/runs/:runId` includes:
 - `telemetry.corrections[]` timeline entries
+- `telemetry.correctionPolicies[]` policy verdict timeline entries
 - step-level `correctionTelemetry` on correction steps
+- step-level `correctionPolicy` verdicts on correction steps
 
 Backend bootstrap endpoint (canonical template + immediate kernel run):
 
@@ -656,6 +658,8 @@ Notes:
 - `bootstrap` is strict: it exits non-zero if post-bootstrap certification reports `CERTIFICATION_OK=false`.
 - If `--provider` is omitted, deeprun uses server-side default provider selection (`DEEPRUN_DEFAULT_PROVIDER` override, otherwise first configured real provider, else `mock`).
 - Default output is concise; add `--verbose` for expanded request and step details.
+- Kernel `status` reports correction-policy counters (`CORRECTION_POLICY_*`) and last-policy summary keys.
+- Kernel `logs` includes correction-policy totals and per-step policy verdict lines when present.
 
 CLI integration test:
 

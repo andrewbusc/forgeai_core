@@ -72,6 +72,7 @@ export interface AgentStepRecord {
   finishedAt: string;
   createdAt: string;
   correctionTelemetry?: AgentCorrectionTelemetry | null;
+  correctionPolicy?: AgentCorrectionPolicyTelemetry | null;
 }
 
 export interface AgentRun {
@@ -172,6 +173,22 @@ export interface AgentCorrectionTelemetry {
   createdAt: string;
 }
 
+export interface AgentCorrectionPolicyViolation {
+  ruleId: string;
+  severity: "error" | "warning";
+  message: string;
+  details?: Record<string, unknown>;
+}
+
+export interface AgentCorrectionPolicyTelemetry {
+  ok: boolean;
+  mode?: "off" | "warn" | "enforce";
+  blockingCount: number;
+  warningCount: number;
+  summary: string;
+  violations: AgentCorrectionPolicyViolation[];
+}
+
 export interface AgentRunCorrectionTelemetryEntry {
   stepRecordId: string;
   stepId: string;
@@ -182,10 +199,24 @@ export interface AgentRunCorrectionTelemetryEntry {
   commitHash: string | null;
   createdAt: string;
   telemetry: AgentCorrectionTelemetry;
+  correctionPolicy?: AgentCorrectionPolicyTelemetry | null;
+}
+
+export interface AgentRunCorrectionPolicyTelemetryEntry {
+  stepRecordId: string;
+  stepId: string;
+  stepIndex: number;
+  stepAttempt: number;
+  status: AgentStepExecutionStatus;
+  errorMessage: string | null;
+  commitHash: string | null;
+  createdAt: string;
+  policy: AgentCorrectionPolicyTelemetry;
 }
 
 export interface AgentRunTelemetry {
   corrections: AgentRunCorrectionTelemetryEntry[];
+  correctionPolicies: AgentRunCorrectionPolicyTelemetryEntry[];
 }
 
 export interface StartAgentRunOutput extends AgentRunDetail {

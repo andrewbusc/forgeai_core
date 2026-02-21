@@ -96,6 +96,22 @@ interface KernelCorrectionTelemetry {
   createdAt: string;
 }
 
+interface KernelCorrectionPolicyViolation {
+  ruleId: string;
+  severity: "error" | "warning";
+  message: string;
+  details?: Record<string, unknown>;
+}
+
+interface KernelCorrectionPolicyTelemetry {
+  ok: boolean;
+  mode?: "off" | "warn" | "enforce";
+  blockingCount: number;
+  warningCount: number;
+  summary: string;
+  violations: KernelCorrectionPolicyViolation[];
+}
+
 interface KernelRunDetail {
   run: {
     id: string;
@@ -122,6 +138,7 @@ interface KernelRunDetail {
     finishedAt: string;
     outputPayload: Record<string, unknown>;
     correctionTelemetry?: KernelCorrectionTelemetry | null;
+    correctionPolicy?: KernelCorrectionPolicyTelemetry | null;
   }>;
   telemetry?: {
     corrections: Array<{
@@ -134,6 +151,18 @@ interface KernelRunDetail {
       commitHash: string | null;
       createdAt: string;
       telemetry: KernelCorrectionTelemetry;
+      correctionPolicy?: KernelCorrectionPolicyTelemetry | null;
+    }>;
+    correctionPolicies: Array<{
+      stepRecordId: string;
+      stepId: string;
+      stepIndex: number;
+      stepAttempt: number;
+      status: string;
+      errorMessage: string | null;
+      commitHash: string | null;
+      createdAt: string;
+      policy: KernelCorrectionPolicyTelemetry;
     }>;
   };
 }
@@ -974,16 +1003,28 @@ async function handleStatus(input: {
   process.stdout.write(`STEP_INDEX=${detail.run.currentStepIndex}\n`);
   process.stdout.write(`STEP_COUNT=${detail.steps.length}\n`);
   const corrections = detail.telemetry?.corrections || [];
+  const correctionPolicies = detail.telemetry?.correctionPolicies || [];
   const completedCorrections = corrections.filter((entry) => entry.status === "completed").length;
   const failedCorrections = corrections.filter((entry) => entry.status === "failed").length;
+  const passedCorrectionPolicies = correctionPolicies.filter((entry) => entry.policy.ok).length;
+  const failedCorrectionPolicies = correctionPolicies.length - passedCorrectionPolicies;
   process.stdout.write(`CORRECTION_ATTEMPTS=${corrections.length}\n`);
   process.stdout.write(`CORRECTION_COMPLETED=${completedCorrections}\n`);
   process.stdout.write(`CORRECTION_FAILED=${failedCorrections}\n`);
+  process.stdout.write(`CORRECTION_POLICY_ATTEMPTS=${correctionPolicies.length}\n`);
+  process.stdout.write(`CORRECTION_POLICY_PASSED=${passedCorrectionPolicies}\n`);
+  process.stdout.write(`CORRECTION_POLICY_FAILED=${failedCorrectionPolicies}\n`);
   if (corrections.length > 0) {
     const last = corrections[corrections.length - 1];
     process.stdout.write(`LAST_CORRECTION_STEP_ID=${last.stepId}\n`);
     process.stdout.write(`LAST_CORRECTION_PHASE=${last.telemetry.phase}\n`);
     process.stdout.write(`LAST_CORRECTION_INTENT=${last.telemetry.classification.intent}\n`);
+  }
+  if (correctionPolicies.length > 0) {
+    const lastPolicy = correctionPolicies[correctionPolicies.length - 1];
+    process.stdout.write(`LAST_CORRECTION_POLICY_STEP_ID=${lastPolicy.stepId}\n`);
+    process.stdout.write(`LAST_CORRECTION_POLICY_OK=${String(lastPolicy.policy.ok)}\n`);
+    process.stdout.write(`LAST_CORRECTION_POLICY_SUMMARY=${lastPolicy.policy.summary}\n`);
   }
 
   if (detail.run.errorMessage) {
@@ -1040,7 +1081,10 @@ async function handleLogs(input: {
   const detail = await client.requestOk<KernelRunDetail>("GET", `/api/projects/${projectId}/agent/runs/${runId}`);
 
   const corrections = detail.telemetry?.corrections || [];
-  process.stdout.write(`KERNEL_RUN_LOGS run=${runId} status=${detail.run.status} corrections=${corrections.length}\n`);
+  const correctionPolicies = detail.telemetry?.correctionPolicies || [];
+  process.stdout.write(
+    `KERNEL_RUN_LOGS run=${runId} status=${detail.run.status} corrections=${corrections.length} correctionPolicies=${correctionPolicies.length}\n`
+  );
 
   for (const step of detail.steps) {
     const line =
@@ -1057,9 +1101,19 @@ async function handleLogs(input: {
       );
     }
 
+    if (step.correctionPolicy) {
+      process.stdout.write(
+        `  correction-policy ok=${String(step.correctionPolicy.ok)} blocking=${step.correctionPolicy.blockingCount}` +
+          ` warning=${step.correctionPolicy.warningCount} summary=${step.correctionPolicy.summary}\n`
+      );
+    }
+
     if (input.verbose) {
       if (step.correctionTelemetry) {
         process.stdout.write(`${JSON.stringify(step.correctionTelemetry, null, 2)}\n`);
+      }
+      if (step.correctionPolicy) {
+        process.stdout.write(`${JSON.stringify(step.correctionPolicy, null, 2)}\n`);
       }
       process.stdout.write(`${JSON.stringify(step.outputPayload || {}, null, 2)}\n`);
     }

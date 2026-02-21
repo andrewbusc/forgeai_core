@@ -795,6 +795,7 @@ test("correction policy engine blocks malformed correction metadata in enforce m
     const correctionStep = started.steps.find((entry) => entry.stepId === "runtime-correction-1");
     assert.ok(correctionStep);
     assert.equal(correctionStep?.status, "failed");
+    assert.equal(correctionStep?.correctionPolicy?.ok, false);
     assert.equal(
       (correctionStep?.outputPayload.correctionPolicy as { ok?: boolean } | undefined)?.ok,
       false
@@ -803,6 +804,9 @@ test("correction policy engine blocks malformed correction metadata in enforce m
       (correctionStep?.outputPayload.correctionPolicy as { summary?: string } | undefined)?.summary || "",
       /correction_attempt_suffix_match/
     );
+    assert.ok((started.telemetry?.correctionPolicies.length || 0) >= 1);
+    assert.equal(started.telemetry?.correctionPolicies[0]?.policy.ok, false);
+    assert.match(started.telemetry?.correctionPolicies[0]?.policy.summary || "", /correction_attempt_suffix_match/);
   } finally {
     if (previousLightValidation === undefined) {
       delete process.env.AGENT_LIGHT_VALIDATION_MODE;

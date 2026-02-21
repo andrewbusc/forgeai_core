@@ -261,6 +261,21 @@ test("deeprun CLI supports init -> run(kernel) -> status -> validate", async () 
     assert.equal(statusKv.ENGINE, "kernel");
     assert.ok(statusKv.RUN_STATUS);
     assert.ok(statusKv.CORRECTION_ATTEMPTS !== undefined);
+    assert.ok(statusKv.CORRECTION_POLICY_ATTEMPTS !== undefined);
+    assert.ok(statusKv.CORRECTION_POLICY_PASSED !== undefined);
+    assert.ok(statusKv.CORRECTION_POLICY_FAILED !== undefined);
+
+    const logsResult = await runCli(
+      ["logs", "--engine", "kernel", "--project", runKv.PROJECT_ID, "--run", runKv.RUN_ID],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl
+      }
+    );
+
+    assert.equal(logsResult.code, 0, `logs failed: ${logsResult.stderr}\n${logsResult.stdout}`);
+    assert.match(logsResult.stdout, /KERNEL_RUN_LOGS run=/);
+    assert.match(logsResult.stdout, /correctionPolicies=/);
 
     const validateResult = await runCli(
       ["validate", "--project", runKv.PROJECT_ID, "--run", runKv.RUN_ID],
