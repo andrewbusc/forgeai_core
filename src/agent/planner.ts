@@ -202,7 +202,7 @@ export class AgentPlanner {
       : "Project has no readable files yet.";
 
     const systemPrompt = [
-      "You are ForgeAI Planner.",
+      "You are deeprun Planner.",
       "Return STRICT JSON only. No markdown. No explanation.",
       "Output must match this exact schema:",
       planResponseSchemaLiteral,
@@ -248,7 +248,7 @@ export class AgentPlanner {
       : "Project has no readable files yet.";
 
     const systemPrompt = [
-      "You are ForgeAI Runtime Fix Planner.",
+      "You are deeprun Runtime Fix Planner.",
       "Return STRICT JSON only. No markdown. No explanation.",
       "Return exactly one step object matching this schema:",
       correctionResponseSchemaLiteral,

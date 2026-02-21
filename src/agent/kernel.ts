@@ -470,7 +470,7 @@ export class AgentKernel {
       type: "modify",
       input: {
         ...correction.input,
-        __forgeCorrection: correctionReasoning
+        _deepCorrection: correctionReasoning
       }
     };
 
@@ -547,7 +547,7 @@ export class AgentKernel {
       type: "modify",
       input: {
         ...correction.input,
-        __forgeCorrection: correctionReasoning
+        _deepCorrection: correctionReasoning
       }
     };
 
@@ -813,7 +813,7 @@ export class AgentKernel {
               }
             };
 
-            if (!heavyValidation.ok && heavyValidationMode === "enforce") {
+            if (!heavyValidation.ok) {
               if (heavyCorrectionCount < this.maxHeavyCorrectionAttempts) {
                 queueHeavyCorrectionAttempt = heavyCorrectionCount + 1;
                 runtimeLogs = heavyValidation.logs;
@@ -866,13 +866,8 @@ export class AgentKernel {
           finishedAt: executed.finishedAt
         });
 
-        const existingStepIndex = steps.findIndex((entry) => entry.stepIndex === stepRecord.stepIndex);
-        if (existingStepIndex >= 0) {
-          steps[existingStepIndex] = stepRecord;
-        } else {
-          steps.push(stepRecord);
-        }
-        steps.sort((a, b) => a.stepIndex - b.stepIndex);
+        steps.push(stepRecord);
+        steps.sort((a, b) => a.stepIndex - b.stepIndex || a.attempt - b.attempt || a.createdAt.localeCompare(b.createdAt));
 
         if (queueHeavyCorrectionAttempt !== null) {
           try {
@@ -1135,7 +1130,9 @@ export class AgentKernel {
     }
 
     const sourceSteps = await this.store.listAgentStepsByRun(sourceRun.id);
-    const sourceStep = sourceSteps.find((step) => step.stepId === input.stepId || step.id === input.stepId);
+    const sourceStep = [...sourceSteps]
+      .sort((a, b) => b.stepIndex - a.stepIndex || b.attempt - a.attempt || b.createdAt.localeCompare(a.createdAt))
+      .find((step) => step.stepId === input.stepId || step.id === input.stepId);
 
     if (!sourceStep) {
       throw new Error("Agent step not found.");

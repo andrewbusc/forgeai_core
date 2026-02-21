@@ -34,6 +34,7 @@ export interface ArchitectureContract {
   };
   rules: {
     unknownLayer: RuleDefinition;
+    pathAliasConfig: RuleDefinition;
     nonRelativeImport: RuleDefinition;
     missingImportTarget: RuleDefinition;
     cycleDependency: RuleDefinition;
@@ -69,6 +70,11 @@ export const architectureContractV1: ArchitectureContract = {
   rules: {
     unknownLayer: {
       id: "ARCH.UNKNOWN_LAYER",
+      enabled: true,
+      severity: "error"
+    },
+    pathAliasConfig: {
+      id: "IMPORT.PATH_ALIAS_CONFIG",
       enabled: true,
       severity: "error"
     },

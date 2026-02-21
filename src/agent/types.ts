@@ -58,6 +58,7 @@ export interface AgentStepRecord {
   runId: string;
   projectId: string;
   stepIndex: number;
+  attempt: number;
   stepId: string;
   type: AgentStepType;
   tool: AgentToolName;

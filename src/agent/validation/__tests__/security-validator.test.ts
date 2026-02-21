@@ -6,7 +6,7 @@ import test from "node:test";
 import { runSecurityBaselineValidation } from "../security-validator.js";
 
 async function createProject(files: Record<string, string>): Promise<string> {
-  const root = await mkdtemp(path.join(os.tmpdir(), "forgeai-security-validation-"));
+  const root = await mkdtemp(path.join(os.tmpdir(), "deeprun-security-validation-"));
 
   for (const [relativePath, content] of Object.entries(files)) {
     const absolute = path.join(root, relativePath);

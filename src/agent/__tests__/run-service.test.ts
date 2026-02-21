@@ -12,7 +12,7 @@ const databaseUrl = process.env.TEST_DATABASE_URL || process.env.DATABASE_URL;
 
 if (!databaseUrl) {
   throw new Error(
-    "Agent state tests require DATABASE_URL or TEST_DATABASE_URL. Example: postgres://postgres:postgres@localhost:5432/forgeai_test"
+    "Agent state tests require DATABASE_URL or TEST_DATABASE_URL. Example: postgres://postgres:postgres@localhost:5432/deeprun_test"
   );
 }
 const requiredDatabaseUrl: string = databaseUrl;
@@ -40,7 +40,7 @@ async function createHarness(): Promise<Harness> {
   if (!process.env.DATABASE_SSL && !isLocalDatabaseUrl(requiredDatabaseUrl)) {
     process.env.DATABASE_SSL = "require";
   }
-  const tmpRoot = await mkdtemp(path.join(os.tmpdir(), "forgeai-agent-state-"));
+  const tmpRoot = await mkdtemp(path.join(os.tmpdir(), "deeprun-agent-state-"));
   const store = new AppStore(tmpRoot);
   await store.initialize();
 

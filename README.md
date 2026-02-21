@@ -1,18 +1,18 @@
-ForgeAI Canonical Backend – v1 Architecture Contract
+deeprun Canonical Backend – v1 Architecture Contract
 Purpose
 
-This repository defines the canonical backend architecture used by ForgeAI v1.
+This repository defines the canonical backend architecture used by deeprun v1.
 
 All generated backends must conform to this contract.
 
 This document is not optional guidance.
 It is the enforced architectural specification.
 
-ForgeAI’s “ships v1 ready” claim depends on adherence to these rules.
+deeprun’s “ships v1 ready” claim depends on adherence to these rules.
 
 Run Lifecycle Contract
 
-All ForgeAI run engines use the same canonical status machine:
+All deeprun run engines use the same canonical status machine:
 
 queued
 running
@@ -27,7 +27,7 @@ Legacy statuses (planned, paused, completed, cancelling) are migrated to canonic
 
 Scope
 
-ForgeAI v1 generates:
+deeprun v1 generates:
 
 Single-tenant API backends
 
@@ -393,7 +393,7 @@ Hidden runtime configuration
 
 Definition of Done
 
-ForgeAI v1 must generate backends that:
+deeprun v1 must generate backends that:
 
 Require zero manual edits to boot
 
@@ -405,7 +405,7 @@ Are production deployable
 
 Anything less does not meet the v1 standard.
 
-Runtime Enforcement Anchors (ForgeAI Engine)
+Runtime Enforcement Anchors (deeprun Engine)
 
 Contract and graph validation are implemented in:
 
@@ -426,6 +426,9 @@ src/agent/fs/diff-engine.ts
 src/agent/fs/validator.ts
 src/agent/fs/file-session.ts
 
+Non-agent project mutation routes also use this boundary:
+`POST /api/projects` (scaffold), `PUT /api/projects/:projectId/file`, and generation/chat flows via `src/lib/generator.ts`.
+
 Agent runtime integration points:
 
 Mutating tools propose changes (no direct writes):
@@ -437,6 +440,12 @@ src/agent/kernel.ts
 
 Canonical status definitions:
 src/agent/run-status.ts
+
+Step log discipline:
+
+Agent step records are append-only.
+Retries/replays at the same `step_index` are recorded as incrementing `attempt` entries.
+No existing step record is overwritten.
 
 Correction safety:
 
@@ -466,11 +475,15 @@ V1_DOCKER_BOOT_TIMEOUT_MS
 V1_DOCKER_CONTAINER_PORT
 V1_DOCKER_HEALTH_PATH
 V1_DOCKER_KEEP_IMAGE
+V1_DOCKER_RUN_MIGRATION
+V1_DOCKER_MIGRATION_SCRIPT
+V1_DOCKER_MIGRATION_DATABASE_URL
+V1_DOCKER_MIGRATION_TIMEOUT_MS
 
 Run execution isolation:
 
 Each run is executed in `run/<runId>` branch worktree under:
-`<projectRoot>/.forgeai/worktrees/<runId>`
+`<projectRoot>/.deeprun/worktrees/<runId>`
 
 Fork endpoint (step commit-based):
 
@@ -479,6 +492,10 @@ Fork endpoint (step commit-based):
 Validate run output endpoint (isolated heavy validation):
 
 `POST /api/projects/:projectId/agent/runs/:runId/validate`
+
+Backend bootstrap endpoint (canonical template + immediate kernel run):
+
+`POST /api/projects/bootstrap/backend`
 
 CLI wrapper:
 
@@ -493,5 +510,78 @@ Binary YES/NO readiness gate:
 npm run check:v1-ready -- /path/to/project
 
 `check:v1-ready` runs:
-heavy validation (architecture + install + typecheck + build + tests + boot),
-then Docker image build + container `/health` boot check.
+heavy validation (architecture + production config checks + install + typecheck + build + tests + boot),
+then Docker image build + optional containerized migration dry run + container `/health` boot check.
+
+Server Integration Test Commands
+
+npm run test:server-routes
+npm run test:server-agent-state
+npm run test:server-agent-kernel
+npm run test:server-all
+npm run test:bootstrap
+
+`test:server-all` runs all server route integration suites as a single regression gate.
+`test:bootstrap` runs the backend bootstrap API + CLI integration suites.
+
+CI Gate
+
+GitHub Actions workflow: `.github/workflows/ci.yml`
+
+It runs on push to `main` and pull requests with a PostgreSQL service, then executes:
+
+npm run test:ci
+
+`test:ci` includes bootstrap coverage through:
+
+- `src/__tests__/agent-kernel-routes.test.ts` (`/api/projects/bootstrap/backend`)
+- `src/__tests__/deeprun-cli.test.ts` (`deeprun bootstrap`)
+
+Local equivalent:
+
+npm run test:ci
+
+V1 Readiness Workflow
+
+Manual GitHub Actions gate: `.github/workflows/v1-ready.yml`
+
+Run from Actions with optional `target_path` input. It executes:
+
+npm run check:v1-ready -- <target_path>
+
+Local equivalent for current repo root:
+
+npm run test:v1-ready
+
+Note: this repository can fail v1 readiness by design if it is not shaped like the canonical generated backend contract.
+
+CLI Commands (deeprun)
+
+Run via npm script:
+
+npm run deeprun -- <command> [args]
+
+Core commands:
+
+npm run deeprun -- init --api http://127.0.0.1:3000 --email you@example.com --password 'Password123!'
+npm run deeprun -- bootstrap "Build SaaS backend with auth"
+npm run deeprun -- run "Build SaaS backend with auth"
+npm run deeprun -- status
+npm run deeprun -- status --watch --verbose
+npm run deeprun -- logs
+npm run deeprun -- continue
+npm run deeprun -- branch --engine kernel
+npm run deeprun -- fork <stepId>
+npm run deeprun -- validate
+npm run deeprun -- promote
+
+Notes:
+
+- Session/config persists at `.deeprun/cli.json` (override with `DEEPRUN_CLI_CONFIG`).
+- `bootstrap` always creates a new `canonical-backend` project and starts a kernel run in one call.
+- `bootstrap` is strict: it exits non-zero if post-bootstrap certification reports `CERTIFICATION_OK=false`.
+- Default output is concise; add `--verbose` for expanded request and step details.
+
+CLI integration test:
+
+npm run test:cli

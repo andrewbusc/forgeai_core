@@ -301,6 +301,7 @@ CREATE TABLE IF NOT EXISTS agent_steps (
   run_id UUID NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
   project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   step_index INTEGER NOT NULL,
+  attempt INTEGER NOT NULL DEFAULT 1,
   step_id TEXT NOT NULL,
   step_type TEXT NOT NULL CHECK (step_type IN (
     'goal', 'correction', 'optimization',
@@ -365,7 +366,7 @@ error_message, created_at, updated_at, finished_at
 `;
 
 const agentStepSelectColumns = `
-id, run_id, project_id, step_index, step_id, step_type, tool,
+id, run_id, project_id, step_index, attempt, step_id, step_type, tool,
 input_payload, output_payload, status, error_message, commit_hash,
 runtime_status, started_at, finished_at, created_at
 `;
@@ -516,6 +517,7 @@ interface DbAgentStepRow {
   run_id: string;
   project_id: string;
   step_index: number;
+  attempt: number;
   step_id: string;
   step_type: AgentStepType;
   tool: string;
@@ -781,6 +783,7 @@ function mapAgentStep(row: DbAgentStepRow): AgentStepRecord {
     runId: row.run_id,
     projectId: row.project_id,
     stepIndex: Number(row.step_index) || 0,
+    attempt: Math.max(1, Number(row.attempt) || 1),
     stepId: row.step_id,
     type: row.step_type,
     tool: row.tool as AgentStepRecord["tool"],
@@ -1586,6 +1589,7 @@ export class AppStore {
 
     await this.pool.query(
       `ALTER TABLE agent_steps
+       ADD COLUMN IF NOT EXISTS attempt INTEGER,
        ADD COLUMN IF NOT EXISTS summary TEXT,
        ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ`
     );
@@ -1593,6 +1597,7 @@ export class AppStore {
     await this.pool.query(
       `UPDATE agent_steps
        SET
+         attempt = COALESCE(attempt, 1),
          summary = COALESCE(summary, ''),
          status = CASE status
            WHEN 'completed' THEN 'complete'
@@ -1602,6 +1607,8 @@ export class AppStore {
 
     await this.pool.query(
       `ALTER TABLE agent_steps
+       ALTER COLUMN attempt SET DEFAULT 1,
+       ALTER COLUMN attempt SET NOT NULL,
        ALTER COLUMN summary SET DEFAULT '',
        ALTER COLUMN summary SET NOT NULL`
     );
@@ -1645,6 +1652,25 @@ export class AppStore {
        EXCEPTION
          WHEN duplicate_object THEN NULL;
        END $$;`
+    );
+
+    await this.pool.query(
+      `DO $$
+       BEGIN
+         ALTER TABLE agent_steps
+         ADD CONSTRAINT agent_steps_attempt_positive_check
+         CHECK (attempt >= 1);
+       EXCEPTION
+         WHEN duplicate_object THEN NULL;
+       END $$;`
+    );
+
+    await this.pool.query(`DROP INDEX IF EXISTS idx_agent_steps_run_step_index;`);
+    await this.pool.query(
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_steps_run_step_attempt_unique ON agent_steps (run_id, step_index, attempt);`
+    );
+    await this.pool.query(
+      `CREATE INDEX IF NOT EXISTS idx_agent_steps_run_step_index ON agent_steps (run_id, step_index);`
     );
   }
 
@@ -2133,29 +2159,21 @@ export class AppStore {
     const createdAt = new Date().toISOString();
 
     const result = await this.pool.query<DbAgentStepRow>(
-      `INSERT INTO agent_steps (
-         id, run_id, project_id, step_index, step_id, step_type, tool,
+      `WITH next_attempt AS (
+         SELECT COALESCE(MAX(attempt), 0) + 1 AS value
+         FROM agent_steps
+         WHERE run_id = $2 AND step_index = $4
+       )
+       INSERT INTO agent_steps (
+         id, run_id, project_id, step_index, attempt, step_id, step_type, tool,
          input_payload, output_payload, status, error_message, commit_hash,
          runtime_status, started_at, finished_at, created_at
        )
        VALUES (
-         $1, $2, $3, $4, $5, $6, $7,
+         $1, $2, $3, $4, (SELECT value FROM next_attempt), $5, $6, $7,
          $8::jsonb, $9::jsonb, $10, $11, $12,
          $13, $14::timestamptz, $15::timestamptz, $16::timestamptz
        )
-       ON CONFLICT (run_id, step_index) DO UPDATE
-       SET
-         step_id = EXCLUDED.step_id,
-         step_type = EXCLUDED.step_type,
-         tool = EXCLUDED.tool,
-         input_payload = EXCLUDED.input_payload,
-         output_payload = EXCLUDED.output_payload,
-         status = EXCLUDED.status,
-         error_message = EXCLUDED.error_message,
-         commit_hash = EXCLUDED.commit_hash,
-         runtime_status = EXCLUDED.runtime_status,
-         started_at = EXCLUDED.started_at,
-         finished_at = EXCLUDED.finished_at
        RETURNING ${agentStepSelectColumns}`,
       [
         stepId,
@@ -2185,7 +2203,7 @@ export class AppStore {
       `SELECT ${agentStepSelectColumns}
        FROM agent_steps
        WHERE run_id = $1
-       ORDER BY step_index ASC, created_at ASC`,
+       ORDER BY step_index ASC, attempt ASC, created_at ASC`,
       [runId]
     );
 

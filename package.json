@@ -1,5 +1,5 @@
 {
-  "name": "forgeai",
+  "name": "deeprun",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -11,10 +11,19 @@
     "check:architecture": "tsx src/agent/validation/check-architecture.ts",
     "check:v1-ready": "tsx src/agent/validation/check-v1-ready.ts",
     "agent:validate-run": "tsx -r dotenv/config src/scripts/agent-validate-run.ts",
-    "test:validation": "tsx --test src/agent/validation/__tests__/ast-validator.test.ts src/agent/validation/__tests__/security-validator.test.ts src/agent/validation/__tests__/failure-parser.test.ts",
+    "test:validation": "tsx --test src/agent/validation/__tests__/ast-validator.test.ts src/agent/validation/__tests__/security-validator.test.ts src/agent/validation/__tests__/failure-parser.test.ts src/agent/validation/__tests__/graph-builder.test.ts src/agent/validation/__tests__/project-validator.test.ts src/agent/validation/__tests__/structural-validator.test.ts src/agent/validation/__tests__/test-contract-validator.test.ts src/agent/validation/__tests__/heavy-validator.test.ts src/agent/validation/__tests__/canonical-backend-fixture.test.ts src/agent/validation/__tests__/check-architecture.test.ts src/agent/validation/__tests__/check-v1-ready.test.ts",
     "test:validation-ast": "tsx --test src/agent/validation/__tests__/ast-validator.test.ts",
     "test:agent-state": "tsx -r dotenv/config --test src/agent/__tests__/run-service.test.ts",
-    "test:agent-kernel": "tsx -r dotenv/config --test src/agent/__tests__/kernel-run-flow.test.ts"
+    "test:agent-kernel": "tsx -r dotenv/config --test src/agent/__tests__/kernel-run-flow.test.ts",
+    "test:server-routes": "tsx -r dotenv/config --test src/__tests__/project-mutation-routes.test.ts",
+    "test:server-agent-state": "tsx -r dotenv/config --test src/__tests__/agent-state-routes.test.ts",
+    "test:server-agent-kernel": "tsx -r dotenv/config --test src/__tests__/agent-kernel-routes.test.ts",
+    "test:server-all": "npm run test:server-routes && npm run test:server-agent-state && npm run test:server-agent-kernel",
+    "test:bootstrap": "npm run test:server-agent-kernel && npm run test:cli",
+    "test:ci": "npm run check && npm run test:validation && npm run test:agent-state && npm run test:agent-kernel && npm run test:server-routes && npm run test:server-agent-state && npm run test:bootstrap",
+    "test:v1-ready": "npm run check:v1-ready -- .",
+    "deeprun": "tsx -r dotenv/config src/scripts/deeprun-cli.ts",
+    "test:cli": "tsx -r dotenv/config --test src/__tests__/deeprun-cli.test.ts"
   },
   "dependencies": {
     "cors": "^2.8.5",

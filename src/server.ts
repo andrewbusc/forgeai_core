@@ -8,8 +8,9 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { ZodError, z } from "zod";
+import { FileSession } from "./agent/fs/file-session.js";
 import { runGeneration } from "./lib/generator.js";
-import { buildTree, ensureDir, pathExists, readTextFile, safeResolvePath, writeTextFile } from "./lib/fs-utils.js";
+import { buildTree, ensureDir, pathExists, readTextFile, safeResolvePath } from "./lib/fs-utils.js";
 import { AppStore } from "./lib/project-store.js";
 import { ProviderRegistry } from "./lib/providers.js";
 import { AgentKernel } from "./agent/kernel.js";
@@ -19,7 +20,7 @@ import { getTemplate, listTemplates } from "./templates/catalog.js";
 import { hashPassword, verifyPassword } from "./lib/auth.js";
 import { slugify } from "./lib/strings.js";
 import { createAutoCommit, listCommits, readDiff } from "./lib/git-versioning.js";
-import { Deployment, MembershipRole, Project, PublicUser } from "./types.js";
+import { Deployment, MembershipRole, Project, ProjectTemplateId, PublicUser } from "./types.js";
 import {
   createAccessToken,
   createRefreshToken,
@@ -31,7 +32,7 @@ import {
 import { parseCookies, serializeCookie } from "./lib/http-cookies.js";
 import { logError, logInfo, logWarn, serializeError } from "./lib/logging.js";
 
-const templateIdSchema = z.enum(["saas-web-app", "agent-workflow", "chatbot"]);
+const templateIdSchema = z.enum(["canonical-backend", "saas-web-app", "agent-workflow", "chatbot"]);
 
 const registerSchema = z.object({
   name: z.string().min(2).max(100),
@@ -66,7 +67,16 @@ const createProjectSchema = z.object({
   workspaceId: z.string().uuid(),
   name: z.string().min(2).max(100),
   description: z.string().max(500).optional(),
-  templateId: templateIdSchema.default("saas-web-app")
+  templateId: templateIdSchema.default("canonical-backend")
+});
+
+const bootstrapBackendSchema = z.object({
+  workspaceId: z.string().uuid(),
+  name: z.string().min(2).max(100).optional(),
+  description: z.string().max(500).optional(),
+  goal: z.string().min(4).max(24_000),
+  provider: z.string().default("mock"),
+  model: z.string().max(100).optional()
 });
 
 const generateSchema = z.object({
@@ -142,8 +152,8 @@ if (cookieSameSite === "None" && !cookieSecure) {
   throw new Error("COOKIE_SAMESITE=None requires COOKIE_SECURE=true.");
 }
 
-const ACCESS_COOKIE_NAME = "forgeai_at";
-const REFRESH_COOKIE_NAME = "forgeai_rt";
+const ACCESS_COOKIE_NAME = "deeprun_at";
+const REFRESH_COOKIE_NAME = "deeprun_rt";
 
 const rateLimitConfig = {
   loginMax: Number(process.env.RATE_LIMIT_LOGIN_MAX || 8),
@@ -155,7 +165,7 @@ const rateLimitConfig = {
 const deploymentConfig = {
   dockerBin: process.env.DEPLOY_DOCKER_BIN || "docker",
   registryHost: (process.env.DEPLOY_REGISTRY || "").trim(),
-  baseDomain: (process.env.DEPLOY_BASE_DOMAIN || "forgeai.app").trim().toLowerCase(),
+  baseDomain: (process.env.DEPLOY_BASE_DOMAIN || "deeprun.app").trim().toLowerCase(),
   publicUrlTemplate: (process.env.DEPLOY_PUBLIC_URL_TEMPLATE || "").trim(),
   dockerNetwork: (process.env.DEPLOY_DOCKER_NETWORK || "").trim(),
   containerPortDefault: Number(process.env.DEPLOY_CONTAINER_PORT || 3000),
@@ -202,6 +212,24 @@ type AppRequest = express.Request & {
   auth?: AuthState;
   requestId?: string;
 };
+
+interface BootstrapCertificationSummary {
+  runId: string;
+  stepId: string | null;
+  targetPath: string;
+  validatedAt: string;
+  ok: boolean;
+  blockingCount: number;
+  warningCount: number;
+  summary: string;
+  checks: Array<{
+    id: string;
+    status: "pass" | "fail" | "skip";
+    message: string;
+    details?: Record<string, unknown>;
+  }>;
+  violations: Array<Record<string, unknown>>;
+}
 
 class HttpError extends Error {
   readonly status: number;
@@ -394,12 +422,6 @@ function isOrgManager(role: MembershipRole): boolean {
   return role === "owner" || role === "admin";
 }
 
-function commitMessageForPrompt(kind: "generate" | "chat", prompt: string): string {
-  const prefix = kind === "generate" ? "AI generate:" : "AI chat:";
-  const trimmed = prompt.replace(/\s+/g, " ").trim().slice(0, 68);
-  return `${prefix} ${trimmed}`;
-}
-
 async function createOrganizationWithUniqueSlug(name: string) {
   const baseSlug = slugify(name);
   let counter = 1;
@@ -461,6 +483,373 @@ async function assertNoActiveAgentRunMutation(projectId: string): Promise<void> 
       "Project branch mutation is blocked while an agent run is active. Complete, cancel, or fail the active run first."
     );
   }
+}
+
+function suggestProjectNameFromGoal(goal: string): string {
+  const slug = goal
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40);
+
+  return slug ? `deeprun-${slug}` : `deeprun-${randomUUID().slice(0, 8)}`;
+}
+
+async function scaffoldProjectTemplate(input: {
+  project: Project;
+  templateId: ProjectTemplateId;
+}): Promise<{ commitHash: string | null; filesChanged: string[] }> {
+  const template = getTemplate(input.templateId);
+  const projectPath = store.getProjectWorkspacePath(input.project);
+  const fileSession = await FileSession.create({
+    projectId: input.project.id,
+    projectRoot: projectPath,
+    options: {
+      maxFilesPerStep: Math.max(15, Object.keys(template.starterFiles).length),
+      maxTotalDiffBytes: Number(process.env.AGENT_FS_MAX_TOTAL_DIFF_BYTES || 400_000),
+      maxFileBytes: Number(process.env.AGENT_FS_MAX_FILE_BYTES || 1_500_000),
+      allowEnvMutation: true
+    }
+  });
+
+  const proposedChanges: Array<{
+    path: string;
+    type: "create" | "update";
+    newContent: string;
+    oldContentHash?: string;
+  }> = [];
+
+  for (const [relativePath, content] of Object.entries(template.starterFiles)) {
+    const existing = await fileSession.read(relativePath);
+
+    if (!existing.exists) {
+      proposedChanges.push({
+        path: relativePath,
+        type: "create",
+        newContent: content
+      });
+      continue;
+    }
+
+    if (existing.content === content) {
+      continue;
+    }
+
+    if (!existing.contentHash) {
+      throw new Error(`Could not resolve file hash for scaffold update '${relativePath}'.`);
+    }
+
+    proposedChanges.push({
+      path: relativePath,
+      type: "update",
+      newContent: content,
+      oldContentHash: existing.contentHash
+    });
+  }
+
+  let commitHash: string | null = null;
+  let filesChanged: string[] = [];
+
+  if (proposedChanges.length > 0) {
+    fileSession.beginStep("scaffold-template", 0);
+
+    try {
+      for (const change of proposedChanges) {
+        await fileSession.stageChange(change);
+      }
+
+      fileSession.validateStep();
+      await fileSession.applyStepChanges();
+      commitHash = await fileSession.commitStep({
+        agentRunId: `project-scaffold-${input.project.id}`,
+        stepIndex: 0,
+        stepId: "scaffold-template",
+        summary: `Scaffold ${template.name} template`
+      });
+      filesChanged = fileSession.getLastCommittedDiffs().map((entry) => entry.path);
+    } catch (error) {
+      await fileSession.abortStep().catch(() => undefined);
+      throw error;
+    }
+  }
+
+  const now = new Date().toISOString();
+
+  input.project.updatedAt = now;
+  input.project.history.unshift({
+    id: randomUUID(),
+    kind: "generate",
+    prompt: "Initial scaffold",
+    summary: `Scaffolded ${template.name} template with ${filesChanged.length} files.`,
+    provider: "system",
+    model: "template",
+    filesChanged,
+    commands: ["npm install", "npm run dev"],
+    commitHash: commitHash ?? undefined,
+    createdAt: now
+  });
+  input.project.history = input.project.history.slice(0, 80);
+
+  await store.updateProject(input.project);
+
+  return {
+    commitHash,
+    filesChanged
+  };
+}
+
+async function createProjectWithTemplate(input: {
+  workspaceId: string;
+  orgId: string;
+  createdByUserId: string;
+  name: string;
+  description?: string;
+  templateId: ProjectTemplateId;
+}): Promise<Project> {
+  const project = await store.createProject({
+    orgId: input.orgId,
+    workspaceId: input.workspaceId,
+    createdByUserId: input.createdByUserId,
+    name: input.name,
+    description: input.description,
+    templateId: input.templateId
+  });
+
+  await scaffoldProjectTemplate({
+    project,
+    templateId: input.templateId
+  });
+
+  return project;
+}
+
+function summarizeFailedChecks(
+  checks: Array<{
+    id: string;
+    status: "pass" | "fail" | "skip";
+  }>
+): string {
+  const failed = checks.filter((check) => check.status === "fail").map((check) => check.id);
+
+  if (!failed.length) {
+    return "All certification checks passed.";
+  }
+
+  return `Failed checks: ${failed.join(", ")}`;
+}
+
+function extractValidationViolations(
+  checks: Array<{
+    id: string;
+    status: "pass" | "fail" | "skip";
+    details?: Record<string, unknown>;
+  }>
+): Array<Record<string, unknown>> {
+  const violations: Array<Record<string, unknown>> = [];
+
+  for (const check of checks) {
+    if (check.status !== "fail") {
+      continue;
+    }
+
+    if (!check.details || typeof check.details !== "object") {
+      continue;
+    }
+
+    const detailViolations = (check.details as { violations?: unknown }).violations;
+    if (!Array.isArray(detailViolations)) {
+      continue;
+    }
+
+    for (const entry of detailViolations) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        continue;
+      }
+
+      violations.push(entry as Record<string, unknown>);
+
+      if (violations.length >= 100) {
+        return violations;
+      }
+    }
+  }
+
+  return violations;
+}
+
+async function runBootstrapCertification(input: {
+  project: Project;
+  runId: string;
+  requestId: string;
+}): Promise<BootstrapCertificationSummary> {
+  const startedAt = new Date().toISOString();
+
+  try {
+    const validated = await agentKernel.validateRunOutput({
+      project: input.project,
+      runId: input.runId,
+      requestId: input.requestId
+    });
+    const validatedAt = new Date().toISOString();
+    const summary = summarizeFailedChecks(validated.validation.checks);
+    const violations = extractValidationViolations(validated.validation.checks);
+    const stepIndex = Math.max(
+      Number(validated.run.currentStepIndex || 0),
+      Array.isArray(validated.run.plan?.steps) ? validated.run.plan.steps.length : 0
+    );
+    const certificationStep = await store.createAgentStep({
+      runId: validated.run.id,
+      projectId: validated.run.projectId,
+      stepIndex,
+      stepId: "post-bootstrap-certification",
+      type: "verify",
+      tool: "fetch_runtime_logs",
+      inputPayload: {
+        source: "bootstrap",
+        requestId: input.requestId
+      },
+      outputPayload: {
+        targetPath: validated.targetPath,
+        validation: validated.validation,
+        violations
+      },
+      status: validated.validation.ok ? "completed" : "failed",
+      errorMessage: validated.validation.ok ? null : summary,
+      commitHash: validated.run.currentCommitHash || validated.run.baseCommitHash || null,
+      runtimeStatus: validated.validation.ok ? "healthy" : "failed",
+      startedAt,
+      finishedAt: validatedAt
+    });
+
+    return {
+      runId: validated.run.id,
+      stepId: certificationStep.id,
+      targetPath: validated.targetPath,
+      validatedAt,
+      ok: validated.validation.ok,
+      blockingCount: validated.validation.blockingCount,
+      warningCount: validated.validation.warningCount,
+      summary: validated.validation.summary,
+      checks: validated.validation.checks,
+      violations
+    };
+  } catch (error) {
+    const validatedAt = new Date().toISOString();
+    const message = error instanceof Error ? error.message : String(error);
+    let stepId: string | null = null;
+
+    try {
+      const run = await store.getAgentRunById(input.project.id, input.runId);
+
+      if (run) {
+        const stepIndex = Math.max(
+          Number(run.currentStepIndex || 0),
+          Array.isArray(run.plan?.steps) ? run.plan.steps.length : 0
+        );
+        const certificationStep = await store.createAgentStep({
+          runId: run.id,
+          projectId: run.projectId,
+          stepIndex,
+          stepId: "post-bootstrap-certification",
+          type: "verify",
+          tool: "fetch_runtime_logs",
+          inputPayload: {
+            source: "bootstrap",
+            requestId: input.requestId
+          },
+          outputPayload: {
+            source: "bootstrap",
+            error: message
+          },
+          status: "failed",
+          errorMessage: message,
+          commitHash: run.currentCommitHash || run.baseCommitHash || null,
+          runtimeStatus: "failed",
+          startedAt,
+          finishedAt: validatedAt
+        });
+        stepId = certificationStep.id;
+      }
+    } catch (stepError) {
+      logWarn("bootstrap.certification.step_persist_failed", {
+        requestId: input.requestId,
+        projectId: input.project.id,
+        runId: input.runId,
+        error: serializeError(stepError)
+      });
+    }
+
+    logWarn("bootstrap.certification.failed", {
+      requestId: input.requestId,
+      projectId: input.project.id,
+      runId: input.runId,
+      error: serializeError(error)
+    });
+
+    return {
+      runId: input.runId,
+      stepId,
+      targetPath: store.getProjectWorkspacePath(input.project),
+      validatedAt,
+      ok: false,
+      blockingCount: 1,
+      warningCount: 0,
+      summary: "Bootstrap certification execution failed.",
+      checks: [
+        {
+          id: "certification",
+          status: "fail",
+          message,
+          details: {
+            source: "bootstrap"
+          }
+        }
+      ],
+      violations: []
+    };
+  }
+}
+
+async function persistBootstrapCertificationHistory(input: {
+  project: Project;
+  runCommitHash: string | null | undefined;
+  certification: BootstrapCertificationSummary;
+}): Promise<Project> {
+  const latestProject = (await store.getProject(input.project.id)) || input.project;
+  const summaryPrefix = input.certification.ok ? "Certification passed" : "Certification failed";
+
+  latestProject.updatedAt = input.certification.validatedAt;
+  latestProject.history.unshift({
+    id: randomUUID(),
+    kind: "generate",
+    prompt: `Post-bootstrap certification for run ${input.certification.runId}`,
+    summary: `${summaryPrefix}: ${input.certification.summary}`,
+    provider: "system",
+    model: "validation",
+    filesChanged: [],
+    commands: ["POST /api/projects/:projectId/agent/runs/:runId/validate"],
+    commitHash: input.runCommitHash || undefined,
+    metadata: {
+      source: "bootstrap",
+      runId: input.certification.runId,
+      stepId: input.certification.stepId,
+      targetPath: input.certification.targetPath,
+      validatedAt: input.certification.validatedAt,
+      validation: {
+        ok: input.certification.ok,
+        blockingCount: input.certification.blockingCount,
+        warningCount: input.certification.warningCount,
+        summary: input.certification.summary,
+        checks: input.certification.checks,
+        violations: input.certification.violations
+      }
+    },
+    createdAt: input.certification.validatedAt
+  });
+  latestProject.history = latestProject.history.slice(0, 80);
+
+  await store.updateProject(latestProject);
+  return latestProject;
 }
 
 async function buildAccountPayload(user: PublicUser) {
@@ -825,7 +1214,7 @@ async function runDeploymentPipeline(input: {
     queueLog("Launching production container...");
 
     const hostPort = await acquireFreePort();
-    const containerName = `forgeai-${input.project.id.slice(0, 8)}-${input.deploymentId.slice(0, 8)}`;
+    const containerName = `deeprun-${input.project.id.slice(0, 8)}-${input.deploymentId.slice(0, 8)}`;
 
     const runArgs = [
       "run",
@@ -1273,44 +1662,70 @@ app.post("/api/projects", authRequired, async (req, res, next) => {
     const parsed = createProjectSchema.parse(req.body ?? {});
     const { workspace } = await requireWorkspaceAccess(auth.user.id, parsed.workspaceId);
 
-    const project = await store.createProject({
-      orgId: workspace.orgId,
+    const project = await createProjectWithTemplate({
       workspaceId: workspace.id,
+      orgId: workspace.orgId,
       createdByUserId: auth.user.id,
       name: parsed.name,
       description: parsed.description,
       templateId: parsed.templateId
     });
 
-    const template = getTemplate(parsed.templateId);
-    const projectPath = store.getProjectWorkspacePath(project);
+    res.status(201).json({ project });
+  } catch (error) {
+    next(error);
+  }
+});
 
-    for (const [relativePath, content] of Object.entries(template.starterFiles)) {
-      const target = safeResolvePath(projectPath, relativePath);
-      await writeTextFile(target, content);
-    }
+app.post("/api/projects/bootstrap/backend", authRequired, async (req, res, next) => {
+  try {
+    const auth = getAuth(req);
+    const requestId = getRequestId(req);
+    const parsed = bootstrapBackendSchema.parse(req.body ?? {});
+    const { workspace } = await requireWorkspaceAccess(auth.user.id, parsed.workspaceId);
 
-    const commitHash = await createAutoCommit(
-      projectPath,
-      `Scaffold ${template.name} template`
-    ).catch(() => null);
-
-    project.history.unshift({
-      id: randomUUID(),
-      kind: "generate",
-      prompt: "Initial scaffold",
-      summary: `Scaffolded ${template.name} template with ${Object.keys(template.starterFiles).length} files.`,
-      provider: "system",
-      model: "template",
-      filesChanged: Object.keys(template.starterFiles),
-      commands: ["npm install", "npm run dev"],
-      commitHash: commitHash ?? undefined,
-      createdAt: new Date().toISOString()
+    await enforceRateLimit(req, res, {
+      key: `generate:${auth.user.id}`,
+      limit: rateLimitConfig.generationMax,
+      windowSec: rateLimitConfig.generationWindowSec,
+      reason: "Generation rate limit reached. Try again shortly."
     });
 
-    await store.updateProject(project);
+    const projectName = parsed.name?.trim() || suggestProjectNameFromGoal(parsed.goal);
+    const project = await createProjectWithTemplate({
+      workspaceId: workspace.id,
+      orgId: workspace.orgId,
+      createdByUserId: auth.user.id,
+      name: projectName,
+      description: parsed.description,
+      templateId: "canonical-backend"
+    });
 
-    res.status(201).json({ project });
+    const run = await agentKernel.startRun({
+      project,
+      createdByUserId: auth.user.id,
+      goal: parsed.goal,
+      providerId: parsed.provider,
+      model: parsed.model,
+      requestId
+    });
+
+    const certification = await runBootstrapCertification({
+      project,
+      runId: run.run.id,
+      requestId
+    });
+    const updatedProject = await persistBootstrapCertificationHistory({
+      project,
+      runCommitHash: run.run.currentCommitHash || run.run.baseCommitHash,
+      certification
+    });
+
+    res.status(201).json({
+      project: updatedProject,
+      run,
+      certification
+    });
   } catch (error) {
     next(error);
   }
@@ -1367,25 +1782,70 @@ app.put("/api/projects/:projectId/file", authRequired, async (req, res, next) =>
     await assertNoActiveAgentRunMutation(project.id);
 
     const parsed = updateFileSchema.parse(req.body ?? {});
-    const target = safeResolvePath(store.getProjectWorkspacePath(project), parsed.path);
-    await writeTextFile(target, parsed.content);
+    const projectRoot = store.getProjectWorkspacePath(project);
+    const fileSession = await FileSession.create({
+      projectId: project.id,
+      projectRoot,
+      options: {
+        maxFilesPerStep: 1,
+        maxTotalDiffBytes: Number(process.env.AGENT_FS_MAX_TOTAL_DIFF_BYTES || 400_000),
+        maxFileBytes: Number(process.env.AGENT_FS_MAX_FILE_BYTES || 1_500_000),
+        allowEnvMutation: true
+      }
+    });
+    const current = await fileSession.read(parsed.path);
+    let commitHash: string | null = null;
+    let filesChanged: string[] = [];
+
+    if (!(current.exists && current.content === parsed.content)) {
+      const stepId = "manual-edit";
+      fileSession.beginStep(stepId, 0);
+
+      try {
+        if (current.exists) {
+          if (!current.contentHash) {
+            throw new Error(`Could not resolve content hash for '${parsed.path}'.`);
+          }
+          await fileSession.stageChange({
+            path: parsed.path,
+            type: "update",
+            newContent: parsed.content,
+            oldContentHash: current.contentHash
+          });
+        } else {
+          await fileSession.stageChange({
+            path: parsed.path,
+            type: "create",
+            newContent: parsed.content
+          });
+        }
+
+        fileSession.validateStep();
+        await fileSession.applyStepChanges();
+        commitHash = await fileSession.commitStep({
+          agentRunId: `manual-edit-${project.id}`,
+          stepIndex: 0,
+          stepId,
+          summary: parsed.path
+        });
+        filesChanged = fileSession.getLastCommittedDiffs().map((entry) => entry.path);
+      } catch (error) {
+        await fileSession.abortStep().catch(() => undefined);
+        throw error;
+      }
+    }
 
     const now = new Date().toISOString();
-
-    const commitHash = await createAutoCommit(
-      store.getProjectWorkspacePath(project),
-      `Manual edit: ${parsed.path}`
-    ).catch(() => null);
 
     project.updatedAt = now;
     project.history.unshift({
       id: randomUUID(),
       kind: "manual-edit",
       prompt: `Manual edit: ${parsed.path}`,
-      summary: `Updated ${parsed.path}`,
+      summary: filesChanged.length > 0 ? `Updated ${parsed.path}` : `No-op manual edit for ${parsed.path}`,
       provider: "system",
       model: "manual",
-      filesChanged: [parsed.path],
+      filesChanged,
       commands: [],
       commitHash: commitHash ?? undefined,
       createdAt: now
@@ -1844,18 +2304,6 @@ app.post("/api/projects/:projectId/generate", authRequired, async (req, res, nex
       kind: "generate"
     });
 
-    const refreshed = await store.getProject(project.id);
-    const projectPath = store.getProjectWorkspacePath(project);
-    const commitHash = await createAutoCommit(
-      projectPath,
-      commitMessageForPrompt("generate", parsed.prompt)
-    ).catch(() => null);
-
-    if (commitHash && refreshed?.history[0]) {
-      refreshed.history[0].commitHash = commitHash;
-      await store.updateProject(refreshed);
-    }
-
     logInfo("generation.completed", {
       requestId,
       userId: auth.user.id,
@@ -1865,14 +2313,11 @@ app.post("/api/projects/:projectId/generate", authRequired, async (req, res, nex
       model: parsed.model || null,
       filesChangedCount: result.filesChanged.length,
       durationMs: Date.now() - startedAt,
-      commitHash: commitHash || null
+      commitHash: result.commitHash
     });
 
     res.json({
-      result: {
-        ...result,
-        commitHash
-      }
+      result
     });
   } catch (error) {
     next(error);
@@ -1919,18 +2364,6 @@ app.post("/api/projects/:projectId/chat", authRequired, async (req, res, next) =
       kind: "chat"
     });
 
-    const refreshed = await store.getProject(project.id);
-    const projectPath = store.getProjectWorkspacePath(project);
-    const commitHash = await createAutoCommit(
-      projectPath,
-      commitMessageForPrompt("chat", parsed.prompt)
-    ).catch(() => null);
-
-    if (commitHash && refreshed?.history[0]) {
-      refreshed.history[0].commitHash = commitHash;
-      await store.updateProject(refreshed);
-    }
-
     logInfo("generation.completed", {
       requestId,
       userId: auth.user.id,
@@ -1940,14 +2373,11 @@ app.post("/api/projects/:projectId/chat", authRequired, async (req, res, next) =
       model: parsed.model || null,
       filesChangedCount: result.filesChanged.length,
       durationMs: Date.now() - startedAt,
-      commitHash: commitHash || null
+      commitHash: result.commitHash
     });
 
     res.json({
-      result: {
-        ...result,
-        commitHash
-      }
+      result
     });
   } catch (error) {
     next(error);
@@ -2045,7 +2475,7 @@ async function main(): Promise<void> {
       port,
       origins: corsAllowedOrigins
     });
-    console.log(`ForgeAI running at http://localhost:${port}`);
+    console.log(`deeprun running at http://localhost:${port}`);
   });
 }
 

@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { randomUUID } from "node:crypto";
 import { AppStore } from "../../lib/project-store.js";
+import { pathExists } from "../../lib/fs-utils.js";
+import { createAutoCommit } from "../../lib/git-versioning.js";
 import { Project } from "../../types.js";
 import { AgentExecutor } from "../executor.js";
 import { AgentKernel } from "../kernel.js";
@@ -23,7 +25,7 @@ const databaseUrl = process.env.TEST_DATABASE_URL || process.env.DATABASE_URL;
 
 if (!databaseUrl) {
   throw new Error(
-    "Kernel flow tests require DATABASE_URL or TEST_DATABASE_URL. Example: postgres://postgres:postgres@localhost:5432/forgeai_test"
+    "Kernel flow tests require DATABASE_URL or TEST_DATABASE_URL. Example: postgres://postgres:postgres@localhost:5432/deeprun_test"
   );
 }
 const requiredDatabaseUrl: string = databaseUrl;
@@ -185,7 +187,7 @@ async function createHarness(): Promise<Harness> {
   if (!process.env.DATABASE_SSL && !isLocalDatabaseUrl(requiredDatabaseUrl)) {
     process.env.DATABASE_SSL = "require";
   }
-  const tmpRoot = await mkdtemp(path.join(os.tmpdir(), "forgeai-agent-kernel-"));
+  const tmpRoot = await mkdtemp(path.join(os.tmpdir(), "deeprun-agent-kernel-"));
   const store = new AppStore(tmpRoot);
   await store.initialize();
 
@@ -283,7 +285,7 @@ test("fork -> validate -> resume flow", async () => {
     });
 
     assert.equal(validation.run.id, forked.run.id);
-    assert.match(validation.targetPath, /\.forgeai\/worktrees\//);
+    assert.match(validation.targetPath, /\.deeprun\/worktrees\//);
     assert.ok(Array.isArray(validation.validation.checks));
 
     const resumed = await kernel.resumeRun({
@@ -297,6 +299,191 @@ test("fork -> validate -> resume flow", async () => {
     const resumedStep = resumed.steps.find((step) => step.stepId === "step-2");
     assert.ok(resumedStep);
     assert.equal(resumedStep?.status, "completed");
+  } finally {
+    if (previousLightValidation === undefined) {
+      delete process.env.AGENT_LIGHT_VALIDATION_MODE;
+    } else {
+      process.env.AGENT_LIGHT_VALIDATION_MODE = previousLightValidation;
+    }
+
+    if (previousHeavyValidation === undefined) {
+      delete process.env.AGENT_HEAVY_VALIDATION_MODE;
+    } else {
+      process.env.AGENT_HEAVY_VALIDATION_MODE = previousHeavyValidation;
+    }
+
+    if (previousHeavyInstall === undefined) {
+      delete process.env.AGENT_HEAVY_INSTALL_DEPS;
+    } else {
+      process.env.AGENT_HEAVY_INSTALL_DEPS = previousHeavyInstall;
+    }
+
+    await destroyHarness(harness);
+  }
+});
+
+test("crash replay appends retry attempt for same step index", async () => {
+  const previousLightValidation = process.env.AGENT_LIGHT_VALIDATION_MODE;
+  const previousHeavyValidation = process.env.AGENT_HEAVY_VALIDATION_MODE;
+  const previousHeavyInstall = process.env.AGENT_HEAVY_INSTALL_DEPS;
+
+  process.env.AGENT_LIGHT_VALIDATION_MODE = "off";
+  process.env.AGENT_HEAVY_VALIDATION_MODE = "off";
+  process.env.AGENT_HEAVY_INSTALL_DEPS = "false";
+
+  const harness = await createHarness();
+
+  try {
+    const kernel = new AgentKernel({
+      store: harness.store,
+      planner: new DeterministicPlanner()
+    });
+
+    const started = await kernel.startRun({
+      project: harness.project,
+      createdByUserId: harness.userId,
+      goal: "Crash replay append-only attempt test",
+      providerId: "mock",
+      requestId: "kernel-crash-replay-start"
+    });
+
+    assert.equal(started.run.status, "complete");
+
+    const firstStepTwoAttempt = started.steps.find((step) => step.stepId === "step-2");
+    assert.ok(firstStepTwoAttempt);
+    assert.equal(firstStepTwoAttempt?.attempt, 1);
+
+    const replayReady =
+      (await harness.store.updateAgentRun(started.run.id, {
+        status: "failed",
+        currentStepIndex: 1,
+        errorMessage: "simulated crash before checkpoint finalization",
+        finishedAt: null
+      })) || started.run;
+
+    assert.equal(replayReady.status, "failed");
+    assert.equal(replayReady.currentStepIndex, 1);
+
+    const resumed = await kernel.resumeRun({
+      project: harness.project,
+      runId: started.run.id,
+      requestId: "kernel-crash-replay-resume"
+    });
+
+    assert.equal(resumed.run.status, "complete");
+    assert.equal(resumed.run.currentStepIndex, resumed.run.plan.steps.length);
+
+    const replayedStepAttempts = resumed.steps.filter((step) => step.stepIndex === 1 && step.stepId === "step-2");
+    assert.equal(replayedStepAttempts.length, 2);
+    assert.equal(replayedStepAttempts[0]?.attempt, 1);
+    assert.equal(replayedStepAttempts[0]?.id, firstStepTwoAttempt?.id);
+    assert.equal(replayedStepAttempts[0]?.status, "completed");
+    assert.equal(replayedStepAttempts[1]?.attempt, 2);
+    assert.notEqual(replayedStepAttempts[1]?.id, firstStepTwoAttempt?.id);
+    assert.equal(replayedStepAttempts[1]?.status, "completed");
+  } finally {
+    if (previousLightValidation === undefined) {
+      delete process.env.AGENT_LIGHT_VALIDATION_MODE;
+    } else {
+      process.env.AGENT_LIGHT_VALIDATION_MODE = previousLightValidation;
+    }
+
+    if (previousHeavyValidation === undefined) {
+      delete process.env.AGENT_HEAVY_VALIDATION_MODE;
+    } else {
+      process.env.AGENT_HEAVY_VALIDATION_MODE = previousHeavyValidation;
+    }
+
+    if (previousHeavyInstall === undefined) {
+      delete process.env.AGENT_HEAVY_INSTALL_DEPS;
+    } else {
+      process.env.AGENT_HEAVY_INSTALL_DEPS = previousHeavyInstall;
+    }
+
+    await destroyHarness(harness);
+  }
+});
+
+test("dirty worktree recovery resets to last valid commit before replay", async () => {
+  const previousLightValidation = process.env.AGENT_LIGHT_VALIDATION_MODE;
+  const previousHeavyValidation = process.env.AGENT_HEAVY_VALIDATION_MODE;
+  const previousHeavyInstall = process.env.AGENT_HEAVY_INSTALL_DEPS;
+
+  process.env.AGENT_LIGHT_VALIDATION_MODE = "off";
+  process.env.AGENT_HEAVY_VALIDATION_MODE = "off";
+  process.env.AGENT_HEAVY_INSTALL_DEPS = "false";
+
+  const harness = await createHarness();
+
+  try {
+    const kernel = new AgentKernel({
+      store: harness.store,
+      planner: new DeterministicPlanner()
+    });
+
+    const started = await kernel.startRun({
+      project: harness.project,
+      createdByUserId: harness.userId,
+      goal: "Dirty worktree recovery test",
+      providerId: "mock",
+      requestId: "kernel-dirty-recovery-start"
+    });
+
+    assert.equal(started.run.status, "complete");
+    assert.ok(started.run.lastValidCommitHash);
+    assert.ok(started.run.worktreePath);
+
+    const worktreePath = started.run.worktreePath as string;
+    const lastValidCommit = started.run.lastValidCommitHash as string;
+    const driftRelativePath = "src/recovery-drift.ts";
+    const driftAbsolutePath = path.join(worktreePath, driftRelativePath);
+
+    await writeFile(driftAbsolutePath, "export const recoveryDrift = 1;\n", "utf8");
+    const driftCommitHash = await createAutoCommit(worktreePath, "test: recovery drift");
+    assert.ok(driftCommitHash);
+    assert.notEqual(driftCommitHash, lastValidCommit);
+
+    await writeFile(driftAbsolutePath, "export const recoveryDrift = 2;\n", "utf8");
+
+    const replayReady =
+      (await harness.store.updateAgentRun(started.run.id, {
+        status: "failed",
+        currentStepIndex: 1,
+        errorMessage: "simulated crash with dirty worktree",
+        finishedAt: null
+      })) || started.run;
+
+    assert.equal(replayReady.status, "failed");
+    assert.equal(replayReady.currentStepIndex, 1);
+
+    const resumed = await kernel.resumeRun({
+      project: harness.project,
+      runId: started.run.id,
+      requestId: "kernel-dirty-recovery-resume"
+    });
+
+    assert.equal(resumed.run.status, "complete");
+    assert.equal(resumed.run.currentCommitHash, lastValidCommit);
+    assert.equal(resumed.run.baseCommitHash, lastValidCommit);
+    assert.equal(await pathExists(driftAbsolutePath), false);
+
+    const replayedStepAttempts = resumed.steps.filter((step) => step.stepIndex === 1 && step.stepId === "step-2");
+    assert.equal(replayedStepAttempts.length, 2);
+    assert.equal(replayedStepAttempts[0]?.attempt, 1);
+    assert.equal(replayedStepAttempts[1]?.attempt, 2);
+
+    const replayEntries = replayedStepAttempts[1]?.outputPayload.entries;
+    if (Array.isArray(replayEntries)) {
+      const hasDriftPath = replayEntries.some((entry) => {
+        if (!entry || typeof entry !== "object") {
+          return false;
+        }
+
+        const value = entry as { path?: unknown };
+        return value.path === driftRelativePath;
+      });
+      assert.equal(hasDriftPath, false);
+    }
   } finally {
     if (previousLightValidation === undefined) {
       delete process.env.AGENT_LIGHT_VALIDATION_MODE;
@@ -574,6 +761,97 @@ test("heavy validation correction loop stops at configured optimization-phase li
       process.env.AGENT_OPTIMIZATION_MAX_CORRECTIONS = previousOptimizationCorrections;
     }
 
+    await destroyHarness(harness);
+  }
+});
+
+test("agent step log remains append-only with explicit attempts", async () => {
+  const harness = await createHarness();
+
+  try {
+    const run = await harness.store.createAgentRun({
+      projectId: harness.project.id,
+      orgId: harness.project.orgId,
+      workspaceId: harness.project.workspaceId,
+      createdByUserId: harness.userId,
+      goal: "append-only-step-log",
+      providerId: "mock",
+      model: "test",
+      status: "running",
+      currentStepIndex: 0,
+      plan: {
+        goal: "append-only-step-log",
+        steps: [
+          {
+            id: "step-append-only",
+            type: "analyze",
+            tool: "list_files",
+            input: {
+              path: "src"
+            }
+          }
+        ]
+      },
+      lastStepId: null
+    });
+
+    const startedAt = new Date().toISOString();
+    const finishedAt = new Date().toISOString();
+
+    const firstAttempt = await harness.store.createAgentStep({
+      runId: run.id,
+      projectId: harness.project.id,
+      stepIndex: 0,
+      stepId: "step-append-only",
+      type: "analyze",
+      tool: "list_files",
+      inputPayload: {
+        path: "src"
+      },
+      outputPayload: {
+        files: []
+      },
+      status: "failed",
+      errorMessage: "first attempt failed",
+      commitHash: null,
+      runtimeStatus: null,
+      startedAt,
+      finishedAt
+    });
+
+    const secondAttempt = await harness.store.createAgentStep({
+      runId: run.id,
+      projectId: harness.project.id,
+      stepIndex: 0,
+      stepId: "step-append-only",
+      type: "analyze",
+      tool: "list_files",
+      inputPayload: {
+        path: "src"
+      },
+      outputPayload: {
+        files: ["src/generated.ts"]
+      },
+      status: "completed",
+      errorMessage: null,
+      commitHash: "abc1234",
+      runtimeStatus: null,
+      startedAt,
+      finishedAt
+    });
+
+    assert.equal(firstAttempt.attempt, 1);
+    assert.equal(secondAttempt.attempt, 2);
+
+    const steps = await harness.store.listAgentStepsByRun(run.id);
+    assert.equal(steps.length, 2);
+    assert.equal(steps[0]?.id, firstAttempt.id);
+    assert.equal(steps[0]?.attempt, 1);
+    assert.equal(steps[0]?.status, "failed");
+    assert.equal(steps[1]?.id, secondAttempt.id);
+    assert.equal(steps[1]?.attempt, 2);
+    assert.equal(steps[1]?.status, "completed");
+  } finally {
     await destroyHarness(harness);
   }
 });

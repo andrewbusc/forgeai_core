@@ -7,5 +7,7 @@ export * from "./failure-parser.js";
 export * from "./structural-validator.js";
 export * from "./ast-validator.js";
 export * from "./security-validator.js";
+export * from "./test-contract-validator.js";
 export * from "./project-validator.js";
 export * from "./heavy-validator.js";
+export * from "./violation-utils.js";

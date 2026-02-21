@@ -3,17 +3,32 @@ import { randomBytes } from "node:crypto";
 import http from "node:http";
 import net from "node:net";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { withIsolatedWorktree } from "../../lib/git-versioning.js";
-import { pathExists } from "../../lib/fs-utils.js";
+import { pathExists, readTextFile } from "../../lib/fs-utils.js";
 import { runHeavyProjectValidation } from "./heavy-validator.js";
 
-type CheckStatus = "pass" | "fail" | "skip";
+export type CheckStatus = "pass" | "fail" | "skip";
 
-interface CheckResult {
+export interface CheckResult {
   id: string;
   status: CheckStatus;
   message: string;
   details?: Record<string, unknown>;
+}
+
+interface V1ReadinessRunOptions {
+  runHeavyCheck?: (target: string) => Promise<CheckResult>;
+  runDockerChecks?: (target: string) => Promise<CheckResult[]>;
+  now?: () => Date;
+}
+
+export interface V1ReadinessReport {
+  target: string;
+  verdict: "YES" | "NO";
+  ok: boolean;
+  checks: CheckResult[];
+  generatedAt: string;
 }
 
 interface CommandResult {
@@ -33,6 +48,50 @@ function truncateOutput(value: string, maxChars = 120_000): string {
 
 function shellSafeCommand(command: string, args: string[]): string {
   return [command, ...args.map((arg) => (/[^A-Za-z0-9_./:-]/.test(arg) ? JSON.stringify(arg) : arg))].join(" ");
+}
+
+function normalizeHealthPath(pathValue: string): string {
+  return pathValue.startsWith("/") ? pathValue : `/${pathValue}`;
+}
+
+function rewriteDatabaseUrlForDocker(raw: string): string {
+  const value = raw.trim();
+  if (!value) {
+    return value;
+  }
+
+  try {
+    const parsed = new URL(value);
+    if (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1") {
+      parsed.hostname = "host.docker.internal";
+    }
+    return parsed.toString();
+  } catch {
+    return value;
+  }
+}
+
+async function readNpmScripts(projectRoot: string): Promise<Record<string, string>> {
+  const packageJsonPath = path.join(projectRoot, "package.json");
+  if (!(await pathExists(packageJsonPath))) {
+    return {};
+  }
+
+  try {
+    const parsed = JSON.parse(await readTextFile(packageJsonPath)) as {
+      scripts?: Record<string, unknown>;
+    };
+    const scripts = parsed.scripts || {};
+    const result: Record<string, string> = {};
+    for (const [name, command] of Object.entries(scripts)) {
+      if (typeof command === "string" && command.trim().length > 0) {
+        result[name] = command;
+      }
+    }
+    return result;
+  } catch {
+    return {};
+  }
 }
 
 function runCommand(input: {
@@ -210,8 +269,16 @@ async function runDockerValidationChecks(target: string): Promise<CheckResult[]>
   const buildTimeoutMs = Number(process.env.V1_DOCKER_BUILD_TIMEOUT_MS || 600_000);
   const bootTimeoutMs = Number(process.env.V1_DOCKER_BOOT_TIMEOUT_MS || 45_000);
   const containerPort = Number(process.env.V1_DOCKER_CONTAINER_PORT || process.env.DEPLOY_CONTAINER_PORT || 3000);
-  const healthPath = process.env.V1_DOCKER_HEALTH_PATH || "/health";
+  const healthPath = normalizeHealthPath(process.env.V1_DOCKER_HEALTH_PATH || "/health");
   const keepImage = process.env.V1_DOCKER_KEEP_IMAGE === "true";
+  const runMigrationCheck = process.env.V1_DOCKER_RUN_MIGRATION === "true";
+  const migrationScript = (process.env.V1_DOCKER_MIGRATION_SCRIPT || "prisma:migrate").trim();
+  const migrationTimeoutMs = Number(process.env.V1_DOCKER_MIGRATION_TIMEOUT_MS || 180_000);
+  const migrationDatabaseUrlRaw = (
+    process.env.V1_DOCKER_MIGRATION_DATABASE_URL ||
+    process.env.DATABASE_URL ||
+    ""
+  ).trim();
 
   const checks: CheckResult[] = [];
 
@@ -231,6 +298,11 @@ async function runDockerValidationChecks(target: string): Promise<CheckResult[]>
       details: {
         stderr: dockerAvailability.stderr || undefined
       }
+    });
+    checks.push({
+      id: "docker_migration",
+      status: "skip",
+      message: "Containerized migration dry run skipped because Docker CLI is unavailable."
     });
     checks.push({
       id: "docker_boot",
@@ -254,6 +326,11 @@ async function runDockerValidationChecks(target: string): Promise<CheckResult[]>
           message: "Dockerfile is missing."
         });
         checks.push({
+          id: "docker_migration",
+          status: "skip",
+          message: "Containerized migration dry run skipped because Docker build did not run."
+        });
+        checks.push({
           id: "docker_boot",
           status: "skip",
           message: "Docker boot check skipped because Docker build did not run."
@@ -261,7 +338,7 @@ async function runDockerValidationChecks(target: string): Promise<CheckResult[]>
         return checks;
       }
 
-      const imageTag = `forgeai-v1-${Date.now()}-${randomBytes(4).toString("hex")}`.toLowerCase();
+      const imageTag = `deeprun-v1-${Date.now()}-${randomBytes(4).toString("hex")}`.toLowerCase();
       const buildArgs = ["build", "-t", imageTag, "."];
 
       const buildResult = await runCommand({
@@ -284,6 +361,11 @@ async function runDockerValidationChecks(target: string): Promise<CheckResult[]>
           }
         });
         checks.push({
+          id: "docker_migration",
+          status: "skip",
+          message: "Containerized migration dry run skipped because Docker build failed."
+        });
+        checks.push({
           id: "docker_boot",
           status: "skip",
           message: "Docker boot check skipped because Docker build failed."
@@ -300,9 +382,82 @@ async function runDockerValidationChecks(target: string): Promise<CheckResult[]>
         }
       });
 
+      if (!runMigrationCheck) {
+        checks.push({
+          id: "docker_migration",
+          status: "skip",
+          message: "Containerized migration dry run skipped (set V1_DOCKER_RUN_MIGRATION=true to enable)."
+        });
+      } else if (!migrationScript) {
+        checks.push({
+          id: "docker_migration",
+          status: "fail",
+          message: "Containerized migration dry run enabled but migration script is empty."
+        });
+      } else {
+        const scripts = await readNpmScripts(isolatedRoot);
+        if (!scripts[migrationScript]) {
+          checks.push({
+            id: "docker_migration",
+            status: "fail",
+            message: `Containerized migration script '${migrationScript}' was not found in package.json scripts.`
+          });
+        } else if (!migrationDatabaseUrlRaw) {
+          checks.push({
+            id: "docker_migration",
+            status: "fail",
+            message:
+              "Containerized migration dry run requires DATABASE_URL (or V1_DOCKER_MIGRATION_DATABASE_URL) when enabled."
+          });
+        } else {
+          const migrationDatabaseUrl = rewriteDatabaseUrlForDocker(migrationDatabaseUrlRaw);
+          const migration = await runCommand({
+            command: dockerBin,
+            args: [
+              "run",
+              "--rm",
+              "--add-host",
+              "host.docker.internal:host-gateway",
+              "-e",
+              `DATABASE_URL=${migrationDatabaseUrl}`,
+              imageTag,
+              "npm",
+              "run",
+              migrationScript
+            ],
+            cwd: isolatedRoot,
+            allowFailure: true,
+            timeoutMs: migrationTimeoutMs
+          });
+
+          if (!migration.ok) {
+            checks.push({
+              id: "docker_migration",
+              status: "fail",
+              message: "Containerized migration dry run failed.",
+              details: {
+                script: migrationScript,
+                exitCode: migration.exitCode,
+                stderr: migration.stderr || undefined,
+                logsTail: truncateOutput(migration.combined, 24_000)
+              }
+            });
+          } else {
+            checks.push({
+              id: "docker_migration",
+              status: "pass",
+              message: "Containerized migration dry run passed.",
+              details: {
+                script: migrationScript
+              }
+            });
+          }
+        }
+      }
+
       let containerId = "";
       const hostPort = await acquireFreePort();
-      const containerName = `forgeai-v1-check-${Date.now()}-${randomBytes(3).toString("hex")}`;
+      const containerName = `deeprun-v1-check-${Date.now()}-${randomBytes(3).toString("hex")}`;
       const runResult = await runCommand({
         command: dockerBin,
         args: [
@@ -350,7 +505,7 @@ async function runDockerValidationChecks(target: string): Promise<CheckResult[]>
       }
 
       containerId = runResult.stdout.split("\n")[0]?.trim() || containerName;
-      const healthUrl = `http://127.0.0.1:${hostPort}${healthPath.startsWith("/") ? healthPath : `/${healthPath}`}`;
+      const healthUrl = `http://127.0.0.1:${hostPort}${healthPath}`;
       const startedAt = Date.now();
       let lastProbe: { statusCode: number | null; body: string; error?: string } = {
         statusCode: null,
@@ -423,12 +578,18 @@ async function runDockerValidationChecks(target: string): Promise<CheckResult[]>
   );
 }
 
-async function main(): Promise<void> {
-  const target = process.argv[2] ? path.resolve(process.argv[2]) : process.cwd();
+export async function runV1ReadinessCheck(
+  targetPath?: string,
+  options: V1ReadinessRunOptions = {}
+): Promise<V1ReadinessReport> {
+  const target = targetPath ? path.resolve(targetPath) : process.cwd();
   const checks: CheckResult[] = [];
+  const runHeavyCheck = options.runHeavyCheck || runHeavyValidationCheck;
+  const runDockerChecks = options.runDockerChecks || runDockerValidationChecks;
+  const now = options.now || (() => new Date());
 
   try {
-    checks.push(await runHeavyValidationCheck(target));
+    checks.push(await runHeavyCheck(target));
   } catch (error) {
     checks.push({
       id: "heavy_validation",
@@ -441,7 +602,7 @@ async function main(): Promise<void> {
   }
 
   try {
-    const dockerChecks = await runDockerValidationChecks(target);
+    const dockerChecks = await runDockerChecks(target);
     checks.push(...dockerChecks);
   } catch (error) {
     checks.push({
@@ -453,6 +614,11 @@ async function main(): Promise<void> {
       }
     });
     checks.push({
+      id: "docker_migration",
+      status: "skip",
+      message: "Containerized migration dry run skipped due to Docker validation execution failure."
+    });
+    checks.push({
       id: "docker_boot",
       status: "skip",
       message: "Docker boot check skipped due to Docker validation execution failure."
@@ -460,33 +626,40 @@ async function main(): Promise<void> {
   }
 
   const failed = checks.filter((check) => check.status === "fail");
-  const verdict = failed.length === 0 ? "YES" : "NO";
+  const verdict: "YES" | "NO" = failed.length === 0 ? "YES" : "NO";
 
   const payload = {
     target,
     verdict,
     ok: verdict === "YES",
     checks,
-    generatedAt: new Date().toISOString()
+    generatedAt: now().toISOString()
   };
 
+  return payload;
+}
+
+async function main(): Promise<void> {
+  const payload = await runV1ReadinessCheck(process.argv[2]);
   process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
-  if (verdict !== "YES") {
+  if (!payload.ok) {
     process.exitCode = 1;
   }
 }
 
-main().catch((error) => {
-  process.stdout.write(
-    `${JSON.stringify(
-      {
-        verdict: "NO",
-        ok: false,
-        error: error instanceof Error ? error.message : String(error)
-      },
-      null,
-      2
-    )}\n`
-  );
-  process.exitCode = 1;
-});
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((error) => {
+    process.stdout.write(
+      `${JSON.stringify(
+        {
+          verdict: "NO",
+          ok: false,
+          error: error instanceof Error ? error.message : String(error)
+        },
+        null,
+        2
+      )}\n`
+    );
+    process.exitCode = 1;
+  });
+}

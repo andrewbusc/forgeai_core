@@ -253,8 +253,8 @@ export const runPreviewContainerTool: AgentTool<z.infer<typeof runPreviewContain
     const containerPort = resolveContainerPort(input.containerPort);
     const startupTimeoutMs =
       input.startupTimeoutMs ?? (Number(process.env.AGENT_RUNTIME_STARTUP_TIMEOUT_MS || 45_000) || 45_000);
-    const imageTag = `forgeai-agent-preview:${context.project.id.slice(0, 8)}-${Date.now().toString(36)}`;
-    const containerName = `forgeai-agent-preview-${context.project.id.slice(0, 8)}-${randomUUID().slice(0, 8)}`;
+    const imageTag = `deeprun-agent-preview:${context.project.id.slice(0, 8)}-${Date.now().toString(36)}`;
+    const containerName = `deeprun-agent-preview-${context.project.id.slice(0, 8)}-${randomUUID().slice(0, 8)}`;
     const hostPort = await acquireFreePort();
 
     let combinedLogs = "";

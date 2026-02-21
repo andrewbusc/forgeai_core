@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import http from "node:http";
 import net from "node:net";
 import path from "node:path";
 import { withIsolatedWorktree } from "../../lib/git-versioning.js";
@@ -140,18 +141,42 @@ async function acquireFreePort(): Promise<number> {
   });
 }
 
-async function canConnectToPort(port: number): Promise<boolean> {
+async function probeHealth(urlText: string, timeoutMs = 1_200): Promise<{ statusCode: number | null; body: string; error?: string }> {
   return new Promise((resolve) => {
-    const socket = net.createConnection({ host: "127.0.0.1", port });
-    const done = (value: boolean): void => {
-      socket.removeAllListeners();
-      socket.destroy();
-      resolve(value);
-    };
-    socket.setTimeout(1_000);
-    socket.once("connect", () => done(true));
-    socket.once("timeout", () => done(false));
-    socket.once("error", () => done(false));
+    const url = new URL(urlText);
+    const req = http.request(
+      {
+        hostname: url.hostname,
+        port: Number(url.port),
+        path: url.pathname + url.search,
+        method: "GET",
+        timeout: timeoutMs
+      },
+      (res) => {
+        let body = "";
+        res.on("data", (chunk) => {
+          body = truncateOutput(body + chunk.toString("utf8"), 16_000);
+        });
+        res.on("end", () => {
+          resolve({
+            statusCode: res.statusCode || null,
+            body: body.trim()
+          });
+        });
+      }
+    );
+
+    req.on("timeout", () => {
+      req.destroy(new Error("timeout"));
+    });
+    req.on("error", (error) => {
+      resolve({
+        statusCode: null,
+        body: "",
+        error: error.message
+      });
+    });
+    req.end();
   });
 }
 
@@ -159,7 +184,12 @@ async function wait(delayMs: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, delayMs));
 }
 
-async function runBootCheck(input: { cwd: string; npmBin: string; timeoutMs: number }): Promise<HeavyValidationCheck> {
+async function runBootCheck(input: {
+  cwd: string;
+  npmBin: string;
+  timeoutMs: number;
+  healthPath: string;
+}): Promise<HeavyValidationCheck> {
   const port = await acquireFreePort();
   const child = spawn(input.npmBin, ["run", "start"], {
     cwd: input.cwd,
@@ -168,6 +198,7 @@ async function runBootCheck(input: { cwd: string; npmBin: string; timeoutMs: num
       NODE_ENV: "production",
       PORT: String(port)
     },
+    detached: true,
     stdio: ["ignore", "pipe", "pipe"]
   });
 
@@ -181,48 +212,169 @@ async function runBootCheck(input: { cwd: string; npmBin: string; timeoutMs: num
   const startedAt = Date.now();
   let healthy = false;
   let exited = false;
+  let lastProbeStatus: number | null = null;
+  let lastProbeError: string | null = null;
+  let lastProbeBody = "";
 
   child.on("close", () => {
     exited = true;
   });
 
   while (Date.now() - startedAt < input.timeoutMs) {
-    healthy = await canConnectToPort(port);
-    if (healthy || exited) {
+    if (exited) {
       break;
     }
+
+    const probe = await probeHealth(`http://127.0.0.1:${port}${input.healthPath}`);
+    lastProbeStatus = probe.statusCode;
+    lastProbeError = probe.error || null;
+    lastProbeBody = probe.body || "";
+
+    if (probe.statusCode === 200) {
+      healthy = true;
+      break;
+    }
+
     await wait(250);
   }
 
-  if (!child.killed) {
-    child.kill("SIGTERM");
-    setTimeout(() => {
+  const terminateBootProcess = (): void => {
+    const pid = child.pid;
+
+    if (!pid || pid <= 0) {
       if (!child.killed) {
-        child.kill("SIGKILL");
+        child.kill("SIGTERM");
+      }
+      setTimeout(() => {
+        if (!child.killed) {
+          child.kill("SIGKILL");
+        }
+      }, 1_000).unref();
+      return;
+    }
+
+    try {
+      process.kill(-pid, "SIGTERM");
+    } catch {
+      if (!child.killed) {
+        child.kill("SIGTERM");
+      }
+    }
+
+    setTimeout(() => {
+      try {
+        process.kill(-pid, "SIGKILL");
+      } catch {
+        if (!child.killed) {
+          child.kill("SIGKILL");
+        }
       }
     }, 1_000).unref();
-  }
+  };
+
+  terminateBootProcess();
 
   if (healthy) {
     return {
       id: "boot",
       status: "pass",
-      message: "Application accepted TCP connections during startup check.",
+      message: `Application responded with HTTP 200 on '${input.healthPath}'.`,
       details: {
-        port
+        port,
+        healthPath: input.healthPath
+      }
+    };
+  }
+
+  const detailSuffix =
+    lastProbeStatus !== null
+      ? `Last status=${String(lastProbeStatus)}.`
+      : lastProbeError
+        ? `Last error=${lastProbeError}.`
+        : "No health response received.";
+
+  return {
+    id: "boot",
+    status: "fail",
+    message: exited
+      ? `Application exited before '${input.healthPath}' returned HTTP 200. ${detailSuffix}`
+      : `Application did not pass health check '${input.healthPath}' in time. ${detailSuffix}`,
+    details: {
+      port,
+      healthPath: input.healthPath,
+      lastStatusCode: lastProbeStatus ?? undefined,
+      lastProbeError: lastProbeError || undefined,
+      lastProbeBody: lastProbeBody || undefined,
+      logs: logs || undefined
+    }
+  };
+}
+
+async function runProductionConfigCheck(projectRoot: string): Promise<HeavyValidationCheck> {
+  const envConfigPath = path.join(projectRoot, "src", "config", "env.ts");
+  if (!(await pathExists(envConfigPath))) {
+    return {
+      id: "production_config",
+      status: "fail",
+      message: "Missing required env config file 'src/config/env.ts'."
+    };
+  }
+
+  const envConfigRaw = await readTextFile(envConfigPath);
+  const hasNodeEnvProductionSupport =
+    /NODE_ENV[\s\S]{0,320}production/i.test(envConfigRaw) || /production[\s\S]{0,320}NODE_ENV/i.test(envConfigRaw);
+
+  if (!hasNodeEnvProductionSupport) {
+    return {
+      id: "production_config",
+      status: "fail",
+      message: "Environment config must validate and support NODE_ENV=production.",
+      details: {
+        file: "src/config/env.ts"
+      }
+    };
+  }
+
+  const errorHandlerPath = path.join(projectRoot, "src", "errors", "errorHandler.ts");
+  if (!(await pathExists(errorHandlerPath))) {
+    return {
+      id: "production_config",
+      status: "fail",
+      message: "Missing required error handler file 'src/errors/errorHandler.ts'."
+    };
+  }
+
+  const errorHandlerRaw = await readTextFile(errorHandlerPath);
+  const hasStackReference = /\bstack\b/i.test(errorHandlerRaw);
+  const hasGuardedStackExposure =
+    /if\s*\(\s*[^)]*NODE_ENV[^)]*production[^)]*\)\s*\{[\s\S]{0,320}\bstack\b[\s\S]{0,320}\}/i.test(errorHandlerRaw);
+
+  if (hasStackReference && !hasGuardedStackExposure) {
+    return {
+      id: "production_config",
+      status: "fail",
+      message: "Error stack exposure must be guarded so stack traces are hidden in production.",
+      details: {
+        file: "src/errors/errorHandler.ts"
       }
     };
   }
 
   return {
-    id: "boot",
-    status: "fail",
-    message: exited ? "Application exited before becoming healthy." : "Application did not become reachable in time.",
-    details: {
-      port,
-      logs: logs || undefined
-    }
+    id: "production_config",
+    status: "pass",
+    message: "Production mode config and error sanitization checks passed."
   };
+}
+
+function resolveScript(scripts: Record<string, string | undefined>, names: string[]): string | null {
+  for (const scriptName of names) {
+    if (typeof scripts[scriptName] === "string" && scripts[scriptName]?.trim()) {
+      return scriptName;
+    }
+  }
+
+  return null;
 }
 
 function summarizeResult(result: {
@@ -273,6 +425,12 @@ export async function runHeavyProjectValidation(input: HeavyValidationInput): Pr
             violations: light.violations.slice(0, 25)
           }
         });
+      }
+
+      const productionConfig = await runProductionConfigCheck(isolatedRoot);
+      checks.push(productionConfig);
+      if (productionConfig.status === "fail") {
+        blockingCount += 1;
       }
 
       const packageJsonPath = path.join(isolatedRoot, "package.json");
@@ -358,16 +516,25 @@ export async function runHeavyProjectValidation(input: HeavyValidationInput): Pr
 
       const prismaSchemaPath = path.join(isolatedRoot, "prisma", "schema.prisma");
       const hasPrismaSchema = await pathExists(prismaSchemaPath);
-      const migrationScript =
-        (["prisma:migrate", "db:migrate", "migrate:deploy", "migrate"].find(
-          (scriptName) => typeof scripts[scriptName] === "string" && scripts[scriptName]?.trim()
-        ) as string | undefined) || null;
+      const migrationScript = resolveScript(scripts, ["prisma:migrate", "db:migrate", "migrate:deploy", "migrate"]);
+      const seedScript = resolveScript(scripts, ["prisma:seed", "db:seed", "seed"]);
+      const prismaCheckRequired = hasPrismaSchema || Boolean(migrationScript) || Boolean(seedScript);
 
-      if (migrationScript || hasPrismaSchema) {
+      if (prismaCheckRequired && !migrationScript) {
+        blockingCount += 1;
+        checks.push({
+          id: "migration",
+          status: "fail",
+          message: "Prisma migration script is required but missing.",
+          details: {
+            expectedScripts: ["prisma:migrate", "db:migrate", "migrate:deploy", "migrate"]
+          }
+        });
+      } else if (migrationScript) {
         const migration = await runCommand({
           cwd: isolatedRoot,
           command: npmBin,
-          args: migrationScript ? ["run", migrationScript] : ["exec", "prisma", "migrate", "deploy"],
+          args: ["run", migrationScript],
           timeoutMs: Number(process.env.AGENT_HEAVY_MIGRATION_TIMEOUT_MS || 180_000),
           allowFailure: true
         });
@@ -380,7 +547,7 @@ export async function runHeavyProjectValidation(input: HeavyValidationInput): Pr
             status: "fail",
             message: "Migration command failed.",
             details: {
-              command: migrationScript ? `npm run ${migrationScript}` : "npm exec prisma migrate deploy",
+              command: `npm run ${migrationScript}`,
               exitCode: migration.exitCode,
               stderr: migration.stderr || undefined
             }
@@ -404,7 +571,62 @@ export async function runHeavyProjectValidation(input: HeavyValidationInput): Pr
         checks.push({
           id: "migration",
           status: "skip",
-          message: "No prisma schema or migration script; skipping migration check."
+          message: "No Prisma schema detected; skipping migration check."
+        });
+      }
+
+      if (prismaCheckRequired && !seedScript) {
+        blockingCount += 1;
+        checks.push({
+          id: "seed",
+          status: "fail",
+          message: "Prisma seed script is required but missing.",
+          details: {
+            expectedScripts: ["prisma:seed", "db:seed", "seed"]
+          }
+        });
+      } else if (seedScript) {
+        const seed = await runCommand({
+          cwd: isolatedRoot,
+          command: npmBin,
+          args: ["run", seedScript],
+          timeoutMs: Number(process.env.AGENT_HEAVY_SEED_TIMEOUT_MS || 180_000),
+          allowFailure: true
+        });
+
+        logs.push(seed.combined);
+        if (!seed.ok) {
+          blockingCount += 1;
+          checks.push({
+            id: "seed",
+            status: "fail",
+            message: "Seed command failed.",
+            details: {
+              command: `npm run ${seedScript}`,
+              exitCode: seed.exitCode,
+              stderr: seed.stderr || undefined
+            }
+          });
+          failures.push(
+            ...parseCommandFailures({
+              sourceCheckId: "seed",
+              combined: seed.combined,
+              stderr: seed.stderr,
+              stdout: seed.stdout
+            })
+          );
+        } else {
+          checks.push({
+            id: "seed",
+            status: "pass",
+            message: "Seed command passed."
+          });
+        }
+      } else {
+        checks.push({
+          id: "seed",
+          status: "skip",
+          message: "No Prisma schema detected; skipping seed check."
         });
       }
 
@@ -544,7 +766,8 @@ export async function runHeavyProjectValidation(input: HeavyValidationInput): Pr
         const boot = await runBootCheck({
           cwd: isolatedRoot,
           npmBin,
-          timeoutMs: Number(process.env.AGENT_HEAVY_BOOT_TIMEOUT_MS || 25_000)
+          timeoutMs: Number(process.env.AGENT_HEAVY_BOOT_TIMEOUT_MS || 25_000),
+          healthPath: process.env.AGENT_HEAVY_HEALTH_PATH || "/health"
         });
 
         checks.push(boot);

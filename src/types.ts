@@ -1,4 +1,4 @@
-export type ProjectTemplateId = "saas-web-app" | "agent-workflow" | "chatbot";
+export type ProjectTemplateId = "canonical-backend" | "saas-web-app" | "agent-workflow" | "chatbot";
 
 export type ChangeKind = "generate" | "chat" | "manual-edit";
 export type BuilderRole = "system" | "user" | "assistant";
@@ -22,6 +22,7 @@ export interface GenerationHistoryItem {
   filesChanged: string[];
   commands: string[];
   commitHash?: string;
+  metadata?: Record<string, unknown>;
   createdAt: string;
 }
 
