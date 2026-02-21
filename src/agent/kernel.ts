@@ -10,6 +10,7 @@ import { logInfo, serializeError } from "../lib/logging.js";
 import { AppStore } from "../lib/project-store.js";
 import { AgentExecutor } from "./executor.js";
 import { classifyFailureForCorrection } from "./correction/failure-classifier.js";
+import { evaluateCorrectionPolicy } from "./correction/policy-engine.js";
 import { FileSession } from "./fs/file-session.js";
 import { ProposedFileChange, proposedFileChangeSchema } from "./fs/types.js";
 import { runHeavyProjectValidation } from "./validation/heavy-validator.js";
@@ -116,6 +117,7 @@ export class AgentKernel {
   private readonly store: AppStore;
   private readonly maxRuntimeCorrectionAttempts: number;
   private readonly maxHeavyCorrectionAttempts: number;
+  private readonly correctionPolicyMode: "off" | "warn" | "enforce";
   private readonly correctionConvergenceMode: "off" | "warn" | "enforce";
 
   constructor(input: { store: AppStore; planner?: AgentPlanner; executor?: AgentExecutor }) {
@@ -124,6 +126,7 @@ export class AgentKernel {
     this.executor = input.executor ?? new AgentExecutor(createDefaultAgentToolRegistry());
     this.maxRuntimeCorrectionAttempts = this.resolveMaxRuntimeCorrectionAttempts();
     this.maxHeavyCorrectionAttempts = this.resolveMaxHeavyCorrectionAttempts();
+    this.correctionPolicyMode = this.resolveCorrectionPolicyMode();
     this.correctionConvergenceMode = this.resolveCorrectionConvergenceMode();
   }
 
@@ -500,6 +503,14 @@ export class AgentKernel {
 
   private resolveHeavyValidationMode(): "off" | "warn" | "enforce" {
     const raw = (process.env.AGENT_HEAVY_VALIDATION_MODE || "enforce").trim().toLowerCase();
+    if (raw === "off" || raw === "warn" || raw === "enforce") {
+      return raw;
+    }
+    return "enforce";
+  }
+
+  private resolveCorrectionPolicyMode(): "off" | "warn" | "enforce" {
+    const raw = (process.env.AGENT_CORRECTION_POLICY_MODE || "enforce").trim().toLowerCase();
     if (raw === "off" || raw === "warn" || raw === "enforce") {
       return raw;
     }
@@ -943,13 +954,15 @@ export class AgentKernel {
       let lastHeavyBlockingCount: number | null = null;
       const lightValidationMode = this.resolveLightValidationMode();
       const heavyValidationMode = this.resolveHeavyValidationMode();
+      const maxFilesPerStep = Number(process.env.AGENT_FS_MAX_FILES_PER_STEP || 15);
+      const maxTotalDiffBytes = Number(process.env.AGENT_FS_MAX_TOTAL_DIFF_BYTES || 400_000);
       const fileSession = await FileSession.create({
         projectId: run.projectId,
         projectRoot,
         baseCommitHash: run.currentCommitHash || run.baseCommitHash || undefined,
         options: {
-          maxFilesPerStep: Number(process.env.AGENT_FS_MAX_FILES_PER_STEP || 15),
-          maxTotalDiffBytes: Number(process.env.AGENT_FS_MAX_TOTAL_DIFF_BYTES || 400_000),
+          maxFilesPerStep,
+          maxTotalDiffBytes,
           maxFileBytes: Number(process.env.AGENT_FS_MAX_FILE_BYTES || 1_500_000),
           allowEnvMutation: process.env.AGENT_FS_ALLOW_ENV_MUTATION === "true"
         }
@@ -1260,6 +1273,38 @@ export class AgentKernel {
               ...output,
               heavyValidationError: serializeError(error)
             };
+          }
+        }
+
+        if (this.isCorrectionStep(step) && this.correctionPolicyMode !== "off") {
+          const correctionPolicy = evaluateCorrectionPolicy({
+            step,
+            status,
+            errorMessage,
+            commitHash,
+            outputPayload: output,
+            resolvedConstraint: correctionConstraint,
+            maxFilesPerStep,
+            maxTotalDiffBytes
+          });
+
+          output = {
+            ...output,
+            correctionPolicy: {
+              ok: correctionPolicy.ok,
+              mode: this.correctionPolicyMode,
+              blockingCount: correctionPolicy.blockingCount,
+              warningCount: correctionPolicy.warningCount,
+              summary: correctionPolicy.summary,
+              violations: correctionPolicy.violations
+            }
+          };
+
+          if (!correctionPolicy.ok && status === "completed" && this.correctionPolicyMode === "enforce") {
+            const message = `Correction policy violation: ${correctionPolicy.summary}`;
+            status = "failed";
+            errorMessage = message;
+            heavyRollbackReason = heavyRollbackReason || message;
           }
         }
 

@@ -178,6 +178,44 @@ class DisallowedPathCorrectionPlanner extends AgentPlanner {
   }
 }
 
+class MalformedCorrectionMetadataPlanner extends AgentPlanner {
+  override async plan(input: PlannerInput): Promise<AgentPlan> {
+    return {
+      goal: input.goal,
+      steps: [
+        {
+          id: "runtime-correction-1",
+          type: "modify",
+          tool: "write_file",
+          input: {
+            path: "src/malformed-correction.ts",
+            content: "export const malformedCorrection = true;\n",
+            _deepCorrection: {
+              phase: "goal",
+              attempt: 2,
+              failedStepId: "step-verify-runtime",
+              classification: {
+                intent: "runtime_boot",
+                failedChecks: [],
+                failureKinds: [],
+                rationale: "intentional mismatch for policy gate test"
+              },
+              constraint: {
+                intent: "runtime_boot",
+                maxFiles: 6,
+                maxTotalDiffBytes: 120000,
+                allowedPathPrefixes: ["src/"],
+                guidance: ["Fix runtime boot only."]
+              },
+              createdAt: new Date().toISOString()
+            }
+          }
+        }
+      ]
+    };
+  }
+}
+
 class ScriptedExecutor extends AgentExecutor {
   constructor(
     private readonly executeFn: (step: AgentStep) => Promise<AgentStepExecution> | AgentStepExecution
@@ -718,6 +756,76 @@ test("runtime correction is blocked when proposed file paths violate classified 
       delete process.env.AGENT_HEAVY_INSTALL_DEPS;
     } else {
       process.env.AGENT_HEAVY_INSTALL_DEPS = previousHeavyInstall;
+    }
+
+    await destroyHarness(harness);
+  }
+});
+
+test("correction policy engine blocks malformed correction metadata in enforce mode", async () => {
+  const previousLightValidation = process.env.AGENT_LIGHT_VALIDATION_MODE;
+  const previousHeavyValidation = process.env.AGENT_HEAVY_VALIDATION_MODE;
+  const previousHeavyInstall = process.env.AGENT_HEAVY_INSTALL_DEPS;
+  const previousCorrectionPolicyMode = process.env.AGENT_CORRECTION_POLICY_MODE;
+
+  process.env.AGENT_LIGHT_VALIDATION_MODE = "off";
+  process.env.AGENT_HEAVY_VALIDATION_MODE = "off";
+  process.env.AGENT_HEAVY_INSTALL_DEPS = "false";
+  process.env.AGENT_CORRECTION_POLICY_MODE = "enforce";
+
+  const harness = await createHarness();
+
+  try {
+    const kernel = new AgentKernel({
+      store: harness.store,
+      planner: new MalformedCorrectionMetadataPlanner()
+    });
+
+    const started = await kernel.startRun({
+      project: harness.project,
+      createdByUserId: harness.userId,
+      goal: "Exercise correction policy gate",
+      providerId: "mock",
+      requestId: "kernel-correction-policy-malformed"
+    });
+
+    assert.equal(started.run.status, "failed");
+    assert.match(started.run.errorMessage || "", /Correction policy violation:/);
+
+    const correctionStep = started.steps.find((entry) => entry.stepId === "runtime-correction-1");
+    assert.ok(correctionStep);
+    assert.equal(correctionStep?.status, "failed");
+    assert.equal(
+      (correctionStep?.outputPayload.correctionPolicy as { ok?: boolean } | undefined)?.ok,
+      false
+    );
+    assert.match(
+      (correctionStep?.outputPayload.correctionPolicy as { summary?: string } | undefined)?.summary || "",
+      /correction_attempt_suffix_match/
+    );
+  } finally {
+    if (previousLightValidation === undefined) {
+      delete process.env.AGENT_LIGHT_VALIDATION_MODE;
+    } else {
+      process.env.AGENT_LIGHT_VALIDATION_MODE = previousLightValidation;
+    }
+
+    if (previousHeavyValidation === undefined) {
+      delete process.env.AGENT_HEAVY_VALIDATION_MODE;
+    } else {
+      process.env.AGENT_HEAVY_VALIDATION_MODE = previousHeavyValidation;
+    }
+
+    if (previousHeavyInstall === undefined) {
+      delete process.env.AGENT_HEAVY_INSTALL_DEPS;
+    } else {
+      process.env.AGENT_HEAVY_INSTALL_DEPS = previousHeavyInstall;
+    }
+
+    if (previousCorrectionPolicyMode === undefined) {
+      delete process.env.AGENT_CORRECTION_POLICY_MODE;
+    } else {
+      process.env.AGENT_CORRECTION_POLICY_MODE = previousCorrectionPolicyMode;
     }
 
     await destroyHarness(harness);

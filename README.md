@@ -452,6 +452,7 @@ Correction safety:
 Correction steps must produce real staged diffs and a commit; no-op/silent patch corrections are rejected.
 Correction attempts are exposed as first-class telemetry in run detail responses and CLI status/log output.
 Each correction carries classified intent, bounded constraint metadata, and final step outcome.
+Correction policy gate evaluates deterministic integrity rules and can hard-fail malformed correction attempts.
 
 Environment knobs:
 
@@ -462,6 +463,7 @@ AGENT_FS_ALLOW_ENV_MUTATION
 AGENT_LIGHT_VALIDATION_MODE (off | warn | enforce)
 AGENT_RUN_LOCK_STALE_SECONDS
 AGENT_HEAVY_VALIDATION_MODE (off | warn | enforce)
+AGENT_CORRECTION_POLICY_MODE (off | warn | enforce)
 AGENT_GOAL_MAX_CORRECTIONS
 AGENT_OPTIMIZATION_MAX_CORRECTIONS
 AGENT_RUNTIME_MAX_CORRECTIONS (legacy alias for goal max)
