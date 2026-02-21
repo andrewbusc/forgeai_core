@@ -450,6 +450,8 @@ No existing step record is overwritten.
 Correction safety:
 
 Correction steps must produce real staged diffs and a commit; no-op/silent patch corrections are rejected.
+Correction attempts are exposed as first-class telemetry in run detail responses and CLI status/log output.
+Each correction carries classified intent, bounded constraint metadata, and final step outcome.
 
 Environment knobs:
 
@@ -464,6 +466,7 @@ AGENT_GOAL_MAX_CORRECTIONS
 AGENT_OPTIMIZATION_MAX_CORRECTIONS
 AGENT_RUNTIME_MAX_CORRECTIONS (legacy alias for goal max)
 AGENT_HEAVY_MAX_CORRECTIONS
+AGENT_CORRECTION_CONVERGENCE_MODE (off | warn | enforce)
 AGENT_HEAVY_INSTALL_DEPS
 AGENT_HEAVY_BUILD_TIMEOUT_MS
 
@@ -492,6 +495,12 @@ Fork endpoint (step commit-based):
 Validate run output endpoint (isolated heavy validation):
 
 `POST /api/projects/:projectId/agent/runs/:runId/validate`
+
+Run detail telemetry:
+
+`GET /api/projects/:projectId/agent/runs/:runId` includes:
+- `telemetry.corrections[]` timeline entries
+- step-level `correctionTelemetry` on correction steps
 
 Backend bootstrap endpoint (canonical template + immediate kernel run):
 

@@ -14,7 +14,7 @@
     "test:validation": "tsx --test src/agent/validation/__tests__/ast-validator.test.ts src/agent/validation/__tests__/security-validator.test.ts src/agent/validation/__tests__/failure-parser.test.ts src/agent/validation/__tests__/graph-builder.test.ts src/agent/validation/__tests__/project-validator.test.ts src/agent/validation/__tests__/structural-validator.test.ts src/agent/validation/__tests__/test-contract-validator.test.ts src/agent/validation/__tests__/heavy-validator.test.ts src/agent/validation/__tests__/canonical-backend-fixture.test.ts src/agent/validation/__tests__/check-architecture.test.ts src/agent/validation/__tests__/check-v1-ready.test.ts",
     "test:validation-ast": "tsx --test src/agent/validation/__tests__/ast-validator.test.ts",
     "test:agent-state": "tsx -r dotenv/config --test src/agent/__tests__/run-service.test.ts",
-    "test:agent-kernel": "tsx -r dotenv/config --test src/agent/__tests__/kernel-run-flow.test.ts",
+    "test:agent-kernel": "tsx -r dotenv/config --test src/agent/__tests__/kernel-run-flow.test.ts src/agent/correction/__tests__/failure-classifier.test.ts",
     "test:server-routes": "tsx -r dotenv/config --test src/__tests__/project-mutation-routes.test.ts",
     "test:server-agent-state": "tsx -r dotenv/config --test src/__tests__/agent-state-routes.test.ts",
     "test:server-agent-kernel": "tsx -r dotenv/config --test src/__tests__/agent-kernel-routes.test.ts",

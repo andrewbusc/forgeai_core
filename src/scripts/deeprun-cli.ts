@@ -69,6 +69,33 @@ interface StateRunDetail {
   }>;
 }
 
+interface KernelCorrectionConstraint {
+  intent: string;
+  maxFiles: number;
+  maxTotalDiffBytes: number;
+  allowedPathPrefixes: string[];
+  guidance: string[];
+}
+
+interface KernelCorrectionClassification {
+  intent: string;
+  failedChecks: string[];
+  failureKinds: string[];
+  rationale: string;
+}
+
+interface KernelCorrectionTelemetry {
+  phase: string;
+  attempt: number;
+  failedStepId: string;
+  reason?: string;
+  summary?: string;
+  runtimeLogTail?: string;
+  classification: KernelCorrectionClassification;
+  constraint: KernelCorrectionConstraint;
+  createdAt: string;
+}
+
 interface KernelRunDetail {
   run: {
     id: string;
@@ -94,7 +121,21 @@ interface KernelRunDetail {
     startedAt: string;
     finishedAt: string;
     outputPayload: Record<string, unknown>;
+    correctionTelemetry?: KernelCorrectionTelemetry | null;
   }>;
+  telemetry?: {
+    corrections: Array<{
+      stepRecordId: string;
+      stepId: string;
+      stepIndex: number;
+      stepAttempt: number;
+      status: string;
+      errorMessage: string | null;
+      commitHash: string | null;
+      createdAt: string;
+      telemetry: KernelCorrectionTelemetry;
+    }>;
+  };
 }
 
 interface CertificationDetail {
@@ -544,16 +585,26 @@ async function pollKernelRun(input: {
     const detail = await input.client.requestOk<KernelRunDetail>("GET", `/api/projects/${input.projectId}/agent/runs/${input.runId}`);
 
     const run = detail.run;
-    const signature = `${run.status}|${run.currentStepIndex}|${detail.steps.length}`;
+    const correctionCount = detail.telemetry?.corrections.length || 0;
+    const signature = `${run.status}|${run.currentStepIndex}|${detail.steps.length}|${correctionCount}`;
 
     if (signature !== lastSignature) {
-      process.stdout.write(`kernel status=${run.status} stepIndex=${run.currentStepIndex} steps=${detail.steps.length}\n`);
+      process.stdout.write(
+        `kernel status=${run.status} stepIndex=${run.currentStepIndex} steps=${detail.steps.length} corrections=${correctionCount}\n`
+      );
 
       if (input.verbose && detail.steps.length > 0) {
         const lastStep = detail.steps[detail.steps.length - 1];
         process.stdout.write(
           `  last-step id=${lastStep.stepId} idx=${lastStep.stepIndex} attempt=${lastStep.attempt} status=${lastStep.status} tool=${lastStep.tool}\n`
         );
+
+        const lastCorrection = correctionCount ? detail.telemetry?.corrections[correctionCount - 1] : null;
+        if (lastCorrection) {
+          process.stdout.write(
+            `  correction intent=${lastCorrection.telemetry.classification.intent} phase=${lastCorrection.telemetry.phase} step=${lastCorrection.stepId} status=${lastCorrection.status}\n`
+          );
+        }
       }
 
       lastSignature = signature;
@@ -922,6 +973,18 @@ async function handleStatus(input: {
   process.stdout.write(`RUN_STATUS=${detail.run.status}\n`);
   process.stdout.write(`STEP_INDEX=${detail.run.currentStepIndex}\n`);
   process.stdout.write(`STEP_COUNT=${detail.steps.length}\n`);
+  const corrections = detail.telemetry?.corrections || [];
+  const completedCorrections = corrections.filter((entry) => entry.status === "completed").length;
+  const failedCorrections = corrections.filter((entry) => entry.status === "failed").length;
+  process.stdout.write(`CORRECTION_ATTEMPTS=${corrections.length}\n`);
+  process.stdout.write(`CORRECTION_COMPLETED=${completedCorrections}\n`);
+  process.stdout.write(`CORRECTION_FAILED=${failedCorrections}\n`);
+  if (corrections.length > 0) {
+    const last = corrections[corrections.length - 1];
+    process.stdout.write(`LAST_CORRECTION_STEP_ID=${last.stepId}\n`);
+    process.stdout.write(`LAST_CORRECTION_PHASE=${last.telemetry.phase}\n`);
+    process.stdout.write(`LAST_CORRECTION_INTENT=${last.telemetry.classification.intent}\n`);
+  }
 
   if (detail.run.errorMessage) {
     process.stdout.write(`RUN_ERROR=${detail.run.errorMessage}\n`);
@@ -976,7 +1039,8 @@ async function handleLogs(input: {
 
   const detail = await client.requestOk<KernelRunDetail>("GET", `/api/projects/${projectId}/agent/runs/${runId}`);
 
-  process.stdout.write(`KERNEL_RUN_LOGS run=${runId} status=${detail.run.status}\n`);
+  const corrections = detail.telemetry?.corrections || [];
+  process.stdout.write(`KERNEL_RUN_LOGS run=${runId} status=${detail.run.status} corrections=${corrections.length}\n`);
 
   for (const step of detail.steps) {
     const line =
@@ -985,7 +1049,18 @@ async function handleLogs(input: {
       `${step.errorMessage ? ` error=${step.errorMessage}` : ""}`;
     process.stdout.write(`${line}\n`);
 
+    if (step.correctionTelemetry) {
+      process.stdout.write(
+        `  correction phase=${step.correctionTelemetry.phase} intent=${step.correctionTelemetry.classification.intent}` +
+          ` correctionAttempt=${step.correctionTelemetry.attempt} failedStep=${step.correctionTelemetry.failedStepId}` +
+          ` files<=${step.correctionTelemetry.constraint.maxFiles} diffBytes<=${step.correctionTelemetry.constraint.maxTotalDiffBytes}\n`
+      );
+    }
+
     if (input.verbose) {
+      if (step.correctionTelemetry) {
+        process.stdout.write(`${JSON.stringify(step.correctionTelemetry, null, 2)}\n`);
+      }
       process.stdout.write(`${JSON.stringify(step.outputPayload || {}, null, 2)}\n`);
     }
   }

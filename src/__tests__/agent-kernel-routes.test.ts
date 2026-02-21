@@ -340,6 +340,7 @@ test("kernel run endpoints support start/list/detail/resume/validate", async () 
     const detail = await requestJson<{
       run: { id: string; status: string };
       steps: Array<{ id: string }>;
+      telemetry?: { corrections?: unknown[] };
     }>({
       baseUrl: server.baseUrl,
       jar,
@@ -351,6 +352,7 @@ test("kernel run endpoints support start/list/detail/resume/validate", async () 
     assert.equal(detail.body.run.id, runId);
     assert.equal(detail.body.run.status, "complete");
     assert.ok(detail.body.steps.length >= 1);
+    assert.ok(Array.isArray(detail.body.telemetry?.corrections || []));
 
     const resumed = await requestJson<{
       run: { id: string; status: string };

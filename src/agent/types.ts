@@ -71,6 +71,7 @@ export interface AgentStepRecord {
   startedAt: string;
   finishedAt: string;
   createdAt: string;
+  correctionTelemetry?: AgentCorrectionTelemetry | null;
 }
 
 export interface AgentRun {
@@ -109,21 +110,10 @@ export interface StartAgentRunInput {
   requestId: string;
 }
 
-export interface StartAgentRunOutput {
-  run: AgentRun;
-  steps: AgentStepRecord[];
-  executedStep?: AgentStepExecution;
-}
-
 export interface ResumeAgentRunInput {
   project: Project;
   runId: string;
   requestId: string;
-}
-
-export interface ResumeAgentRunOutput {
-  run: AgentRun;
-  steps: AgentStepRecord[];
 }
 
 export interface ForkAgentRunInput {
@@ -132,11 +122,6 @@ export interface ForkAgentRunInput {
   stepId: string;
   createdByUserId: string;
   requestId: string;
-}
-
-export interface ForkAgentRunOutput {
-  run: AgentRun;
-  steps: AgentStepRecord[];
 }
 
 export interface ValidateAgentRunInput {
@@ -165,7 +150,51 @@ export interface ValidateAgentRunOutput {
 export interface AgentRunDetail {
   run: AgentRun;
   steps: AgentStepRecord[];
+  telemetry: AgentRunTelemetry;
 }
+
+export interface AgentCorrectionClassificationTelemetry {
+  intent: PlannerCorrectionIntent;
+  failedChecks: string[];
+  failureKinds: string[];
+  rationale: string;
+}
+
+export interface AgentCorrectionTelemetry {
+  phase: string;
+  attempt: number;
+  failedStepId: string;
+  reason?: string;
+  summary?: string;
+  runtimeLogTail?: string;
+  classification: AgentCorrectionClassificationTelemetry;
+  constraint: PlannerCorrectionConstraint;
+  createdAt: string;
+}
+
+export interface AgentRunCorrectionTelemetryEntry {
+  stepRecordId: string;
+  stepId: string;
+  stepIndex: number;
+  stepAttempt: number;
+  status: AgentStepExecutionStatus;
+  errorMessage: string | null;
+  commitHash: string | null;
+  createdAt: string;
+  telemetry: AgentCorrectionTelemetry;
+}
+
+export interface AgentRunTelemetry {
+  corrections: AgentRunCorrectionTelemetryEntry[];
+}
+
+export interface StartAgentRunOutput extends AgentRunDetail {
+  executedStep?: AgentStepExecution;
+}
+
+export interface ResumeAgentRunOutput extends AgentRunDetail {}
+
+export interface ForkAgentRunOutput extends AgentRunDetail {}
 
 export interface ProjectArchitectureSummary {
   framework: string;
@@ -229,9 +258,28 @@ export interface PlannerFailureReport {
   failures: PlannerFailureDiagnostic[];
 }
 
+export type PlannerCorrectionIntent =
+  | "runtime_boot"
+  | "runtime_health"
+  | "typescript_compile"
+  | "test_failure"
+  | "migration_failure"
+  | "architecture_violation"
+  | "security_baseline"
+  | "unknown";
+
+export interface PlannerCorrectionConstraint {
+  intent: PlannerCorrectionIntent;
+  maxFiles: number;
+  maxTotalDiffBytes: number;
+  allowedPathPrefixes: string[];
+  guidance: string[];
+}
+
 export interface PlannerRuntimeCorrectionInput extends PlannerInput {
   failedStepId: string;
   runtimeLogs: string;
   attempt: number;
   failureReport?: PlannerFailureReport;
+  correctionConstraint?: PlannerCorrectionConstraint;
 }

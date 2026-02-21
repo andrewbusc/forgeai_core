@@ -260,6 +260,7 @@ test("deeprun CLI supports init -> run(kernel) -> status -> validate", async () 
     assert.equal(statusKv.RUN_ID, runKv.RUN_ID);
     assert.equal(statusKv.ENGINE, "kernel");
     assert.ok(statusKv.RUN_STATUS);
+    assert.ok(statusKv.CORRECTION_ATTEMPTS !== undefined);
 
     const validateResult = await runCli(
       ["validate", "--project", runKv.PROJECT_ID, "--run", runKv.RUN_ID],

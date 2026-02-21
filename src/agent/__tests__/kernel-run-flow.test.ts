@@ -141,8 +141,38 @@ class HeavyValidationCorrectionPlanner extends AgentPlanner {
       type: "modify",
       tool: "write_file",
       input: {
-        path: `src/illegal-layer/validation-correction-${input.attempt}.ts`,
+        path: `src/modules/repair/validation-correction-${input.attempt}.ts`,
         content: `export const heavyValidationCorrectionAttempt = ${input.attempt};\n`
+      }
+    };
+  }
+}
+
+class DisallowedPathCorrectionPlanner extends AgentPlanner {
+  override async plan(input: PlannerInput): Promise<AgentPlan> {
+    return {
+      goal: input.goal,
+      steps: [
+        {
+          id: "step-verify-runtime",
+          type: "verify",
+          tool: "run_preview_container",
+          input: {
+            mode: "healthcheck"
+          }
+        }
+      ]
+    };
+  }
+
+  override async planRuntimeCorrection(_input: PlannerRuntimeCorrectionInput): Promise<AgentStep> {
+    return {
+      id: "runtime-correction-1",
+      type: "modify",
+      tool: "write_file",
+      input: {
+        path: ".env",
+        content: "DANGEROUS=true\n"
       }
     };
   }
@@ -523,13 +553,14 @@ test("runtime correction step cannot silently no-op", async () => {
   try {
     const executor = new ScriptedExecutor((step) => {
       if (step.tool === "run_preview_container") {
+        const failureToken = step.id;
         return buildExecution({
           step,
           status: "completed",
           output: {
             runtimeStatus: "failed",
-            errorMessage: "runtime unhealthy",
-            logs: "startup error"
+            errorMessage: `runtime unhealthy ${failureToken}`,
+            logs: `startup error ${failureToken}`
           }
         });
       }
@@ -571,6 +602,15 @@ test("runtime correction step cannot silently no-op", async () => {
     assert.ok(correctionStep);
     assert.equal(correctionStep?.status, "failed");
     assert.equal(correctionStep?.commitHash, null);
+    assert.ok(correctionStep?.correctionTelemetry);
+    assert.equal(correctionStep?.correctionTelemetry?.classification.intent, "runtime_boot");
+    assert.ok((started.telemetry?.corrections.length || 0) >= 1);
+
+    const persistedDetail = await kernel.getRunWithSteps(harness.project.id, started.run.id);
+    assert.ok(persistedDetail);
+    assert.ok(Array.isArray(persistedDetail?.telemetry.corrections));
+    assert.ok((persistedDetail?.telemetry.corrections.length || 0) >= 1);
+    assert.equal(persistedDetail?.telemetry.corrections[0]?.telemetry.classification.intent, "runtime_boot");
   } finally {
     if (previousLightValidation === undefined) {
       delete process.env.AGENT_LIGHT_VALIDATION_MODE;
@@ -594,6 +634,90 @@ test("runtime correction step cannot silently no-op", async () => {
       delete process.env.AGENT_GOAL_MAX_CORRECTIONS;
     } else {
       process.env.AGENT_GOAL_MAX_CORRECTIONS = previousGoalCorrections;
+    }
+
+    await destroyHarness(harness);
+  }
+});
+
+test("runtime correction is blocked when proposed file paths violate classified scope", async () => {
+  const previousLightValidation = process.env.AGENT_LIGHT_VALIDATION_MODE;
+  const previousHeavyValidation = process.env.AGENT_HEAVY_VALIDATION_MODE;
+  const previousHeavyInstall = process.env.AGENT_HEAVY_INSTALL_DEPS;
+
+  process.env.AGENT_LIGHT_VALIDATION_MODE = "off";
+  process.env.AGENT_HEAVY_VALIDATION_MODE = "off";
+  process.env.AGENT_HEAVY_INSTALL_DEPS = "false";
+
+  const harness = await createHarness();
+
+  try {
+    const executor = new ScriptedExecutor((step) => {
+      if (step.tool === "run_preview_container") {
+        const failureToken = step.id;
+        return buildExecution({
+          step,
+          status: "completed",
+          output: {
+            runtimeStatus: "failed",
+            errorMessage: `runtime unhealthy ${failureToken}`,
+            logs: `startup error ${failureToken}`
+          }
+        });
+      }
+
+      return buildExecution({
+        step,
+        status: "completed",
+        output: {
+          proposedChanges: [
+            {
+              path: ".env",
+              type: "create",
+              newContent: "DANGEROUS=true\n"
+            }
+          ]
+        }
+      });
+    });
+
+    const kernel = new AgentKernel({
+      store: harness.store,
+      planner: new DisallowedPathCorrectionPlanner(),
+      executor
+    });
+
+    const started = await kernel.startRun({
+      project: harness.project,
+      createdByUserId: harness.userId,
+      goal: "Repair runtime startup with bounded scope",
+      providerId: "mock",
+      requestId: "kernel-runtime-correction-disallowed-path"
+    });
+
+    assert.equal(started.run.status, "failed");
+    assert.match(started.run.errorMessage || "", /disallowed paths/i);
+    const correctionStep = started.steps.find((entry) => entry.stepId === "runtime-correction-1");
+    assert.ok(correctionStep);
+    assert.equal(correctionStep?.status, "failed");
+    assert.equal(correctionStep?.commitHash, null);
+  } finally {
+    if (previousLightValidation === undefined) {
+      delete process.env.AGENT_LIGHT_VALIDATION_MODE;
+    } else {
+      process.env.AGENT_LIGHT_VALIDATION_MODE = previousLightValidation;
+    }
+
+    if (previousHeavyValidation === undefined) {
+      delete process.env.AGENT_HEAVY_VALIDATION_MODE;
+    } else {
+      process.env.AGENT_HEAVY_VALIDATION_MODE = previousHeavyValidation;
+    }
+
+    if (previousHeavyInstall === undefined) {
+      delete process.env.AGENT_HEAVY_INSTALL_DEPS;
+    } else {
+      process.env.AGENT_HEAVY_INSTALL_DEPS = previousHeavyInstall;
     }
 
     await destroyHarness(harness);
@@ -633,13 +757,14 @@ test("runtime correction loop stops at configured goal-phase limit", async () =>
       }
 
       if (step.tool === "run_preview_container") {
+        const failureToken = step.id;
         return buildExecution({
           step,
           status: "completed",
           output: {
             runtimeStatus: "failed",
-            errorMessage: "runtime unhealthy",
-            logs: "startup error"
+            errorMessage: `runtime unhealthy ${failureToken}`,
+            logs: `startup error ${failureToken}`
           }
         });
       }
@@ -702,7 +827,7 @@ test("runtime correction loop stops at configured goal-phase limit", async () =>
   }
 });
 
-test("heavy validation correction loop stops at configured optimization-phase limit", async () => {
+test("heavy validation correction loop fails fast when blocking violations do not improve", async () => {
   const previousLightValidation = process.env.AGENT_LIGHT_VALIDATION_MODE;
   const previousHeavyValidation = process.env.AGENT_HEAVY_VALIDATION_MODE;
   const previousHeavyInstall = process.env.AGENT_HEAVY_INSTALL_DEPS;
@@ -730,12 +855,12 @@ test("heavy validation correction loop stops at configured optimization-phase li
     });
 
     assert.equal(started.run.status, "failed");
-    assert.equal(started.run.errorMessage, "Heavy validation failed after 3/3 correction attempts.");
+    assert.match(started.run.errorMessage || "", /Heavy validation did not converge: blocking count \d+ -> \d+\./);
 
     const correctionSteps = started.steps.filter((entry) => entry.stepId.startsWith("validation-correction-"));
-    assert.equal(correctionSteps.length, 3);
+    assert.equal(correctionSteps.length, 1);
     assert.ok(correctionSteps.every((entry) => Boolean(entry.commitHash)));
-    assert.equal(correctionSteps[2]?.status, "failed");
+    assert.equal(correctionSteps[0]?.status, "failed");
   } finally {
     if (previousLightValidation === undefined) {
       delete process.env.AGENT_LIGHT_VALIDATION_MODE;

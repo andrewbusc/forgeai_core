@@ -9,6 +9,7 @@ import {
 import { logInfo, serializeError } from "../lib/logging.js";
 import { AppStore } from "../lib/project-store.js";
 import { AgentExecutor } from "./executor.js";
+import { classifyFailureForCorrection } from "./correction/failure-classifier.js";
 import { FileSession } from "./fs/file-session.js";
 import { ProposedFileChange, proposedFileChangeSchema } from "./fs/types.js";
 import { runHeavyProjectValidation } from "./validation/heavy-validator.js";
@@ -18,7 +19,9 @@ import { AgentPlanner } from "./planner.js";
 import { isExecutingAgentRunStatus } from "./run-status.js";
 import { createDefaultAgentToolRegistry } from "./tools/index.js";
 import {
+  AgentCorrectionTelemetry,
   AgentRun,
+  AgentRunCorrectionTelemetryEntry,
   AgentRunDetail,
   AgentStep,
   AgentStepExecution,
@@ -27,6 +30,7 @@ import {
   ForkAgentRunOutput,
   PlannerFailureReport,
   PlannerMemoryContext,
+  PlannerCorrectionConstraint,
   ResumeAgentRunInput,
   ResumeAgentRunOutput,
   StartAgentRunInput,
@@ -112,6 +116,7 @@ export class AgentKernel {
   private readonly store: AppStore;
   private readonly maxRuntimeCorrectionAttempts: number;
   private readonly maxHeavyCorrectionAttempts: number;
+  private readonly correctionConvergenceMode: "off" | "warn" | "enforce";
 
   constructor(input: { store: AppStore; planner?: AgentPlanner; executor?: AgentExecutor }) {
     this.store = input.store;
@@ -119,6 +124,7 @@ export class AgentKernel {
     this.executor = input.executor ?? new AgentExecutor(createDefaultAgentToolRegistry());
     this.maxRuntimeCorrectionAttempts = this.resolveMaxRuntimeCorrectionAttempts();
     this.maxHeavyCorrectionAttempts = this.resolveMaxHeavyCorrectionAttempts();
+    this.correctionConvergenceMode = this.resolveCorrectionConvergenceMode();
   }
 
   private resolveMaxRuntimeCorrectionAttempts(): number {
@@ -219,6 +225,271 @@ export class AgentKernel {
     return plan.steps.filter((step) => step.id.startsWith("validation-correction-")).length;
   }
 
+  private runtimeFailureSignature(reason: string | null, logs: string): string {
+    const reasonPart = truncateText(reason || "runtime-failure", 240).toLowerCase();
+    const logsPart = tailText(logs || "", 2_000).toLowerCase();
+    return `${reasonPart}::${logsPart}`;
+  }
+
+  private normalizeCorrectionPathPrefix(value: string): string {
+    return value.replaceAll("\\", "/").replace(/^\/+/, "").trim();
+  }
+
+  private coerceCorrectionIntent(value: unknown): PlannerCorrectionConstraint["intent"] {
+    const normalized = String(value || "").trim();
+    switch (normalized) {
+      case "runtime_boot":
+      case "runtime_health":
+      case "typescript_compile":
+      case "test_failure":
+      case "migration_failure":
+      case "architecture_violation":
+      case "security_baseline":
+      case "unknown":
+        return normalized;
+      default:
+        return "unknown";
+    }
+  }
+
+  private toRecord(value: unknown): Record<string, unknown> | null {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return null;
+    }
+    return value as Record<string, unknown>;
+  }
+
+  private toStringArray(value: unknown): string[] {
+    if (!Array.isArray(value)) {
+      return [];
+    }
+
+    const deduped = new Set<string>();
+    for (const entry of value) {
+      if (typeof entry !== "string") {
+        continue;
+      }
+      const normalized = entry.trim();
+      if (!normalized) {
+        continue;
+      }
+      deduped.add(normalized);
+    }
+
+    return Array.from(deduped.values());
+  }
+
+  private parseCorrectionConstraint(value: unknown): PlannerCorrectionConstraint | null {
+    const constraint = this.toRecord(value);
+    if (!constraint) {
+      return null;
+    }
+
+    const allowedPathPrefixes = this.toStringArray(constraint.allowedPathPrefixes)
+      .map((entry) => this.normalizeCorrectionPathPrefix(entry))
+      .filter(Boolean);
+    const maxFiles = Number(constraint.maxFiles);
+    const maxTotalDiffBytes = Number(constraint.maxTotalDiffBytes);
+
+    return {
+      intent: this.coerceCorrectionIntent(constraint.intent),
+      maxFiles: Number.isFinite(maxFiles) && maxFiles > 0 ? Math.floor(maxFiles) : 15,
+      maxTotalDiffBytes:
+        Number.isFinite(maxTotalDiffBytes) && maxTotalDiffBytes > 0 ? Math.floor(maxTotalDiffBytes) : 400_000,
+      allowedPathPrefixes,
+      guidance: this.toStringArray(constraint.guidance)
+    };
+  }
+
+  private resolveCorrectionConstraintForStep(step: AgentStep): PlannerCorrectionConstraint | null {
+    const deepCorrection = this.toRecord(step.input?._deepCorrection);
+    if (!deepCorrection) {
+      return null;
+    }
+
+    return this.parseCorrectionConstraint(deepCorrection.constraint);
+  }
+
+  private extractCorrectionTelemetryForStep(step: AgentStepRecord): AgentCorrectionTelemetry | null {
+    const inputPayload = this.toRecord(step.inputPayload);
+    const deepCorrection = this.toRecord(inputPayload?._deepCorrection);
+    if (!deepCorrection) {
+      return null;
+    }
+
+    const classificationRaw = this.toRecord(deepCorrection.classification);
+    const classificationIntent = this.coerceCorrectionIntent(classificationRaw?.intent);
+    const constraint =
+      this.parseCorrectionConstraint(deepCorrection.constraint) || {
+        intent: classificationIntent,
+        maxFiles: 15,
+        maxTotalDiffBytes: 400_000,
+        allowedPathPrefixes: [],
+        guidance: []
+      };
+    const phase =
+      typeof deepCorrection.phase === "string" && deepCorrection.phase.trim()
+        ? deepCorrection.phase.trim()
+        : "unknown";
+    const attempt = Number(deepCorrection.attempt);
+    const createdAt =
+      typeof deepCorrection.createdAt === "string" && deepCorrection.createdAt.trim()
+        ? deepCorrection.createdAt
+        : step.createdAt;
+
+    return {
+      phase,
+      attempt: Number.isFinite(attempt) && attempt > 0 ? Math.floor(attempt) : step.attempt,
+      failedStepId:
+        typeof deepCorrection.failedStepId === "string" && deepCorrection.failedStepId.trim()
+          ? deepCorrection.failedStepId.trim()
+          : step.stepId,
+      reason:
+        typeof deepCorrection.reason === "string" && deepCorrection.reason.trim()
+          ? deepCorrection.reason.trim()
+          : undefined,
+      summary:
+        typeof deepCorrection.summary === "string" && deepCorrection.summary.trim()
+          ? deepCorrection.summary.trim()
+          : undefined,
+      runtimeLogTail:
+        typeof deepCorrection.runtimeLogTail === "string" && deepCorrection.runtimeLogTail.trim()
+          ? deepCorrection.runtimeLogTail
+          : undefined,
+      classification: {
+        intent: classificationIntent,
+        failedChecks: this.toStringArray(classificationRaw?.failedChecks),
+        failureKinds: this.toStringArray(classificationRaw?.failureKinds),
+        rationale:
+          typeof classificationRaw?.rationale === "string" && classificationRaw.rationale.trim()
+            ? classificationRaw.rationale.trim()
+            : `intent=${classificationIntent}`
+      },
+      constraint,
+      createdAt
+    };
+  }
+
+  private buildRunDetail(run: AgentRun, steps: AgentStepRecord[]): AgentRunDetail {
+    const corrections: AgentRunCorrectionTelemetryEntry[] = [];
+    const enrichedSteps = steps.map((step) => {
+      const correctionTelemetry = this.extractCorrectionTelemetryForStep(step);
+      if (!correctionTelemetry) {
+        return step;
+      }
+
+      corrections.push({
+        stepRecordId: step.id,
+        stepId: step.stepId,
+        stepIndex: step.stepIndex,
+        stepAttempt: step.attempt,
+        status: step.status,
+        errorMessage: step.errorMessage,
+        commitHash: step.commitHash,
+        createdAt: step.createdAt,
+        telemetry: correctionTelemetry
+      });
+
+      return {
+        ...step,
+        correctionTelemetry
+      };
+    });
+
+    return {
+      run: attachLastStep(run, enrichedSteps),
+      steps: enrichedSteps,
+      telemetry: {
+        corrections
+      }
+    };
+  }
+
+  private isPathAllowedByConstraint(pathValue: string, allowedPathPrefixes: string[]): boolean {
+    if (!allowedPathPrefixes.length) {
+      return true;
+    }
+
+    const normalizedPath = this.normalizeCorrectionPathPrefix(pathValue);
+
+    for (const candidate of allowedPathPrefixes) {
+      const prefix = this.normalizeCorrectionPathPrefix(candidate);
+      if (!prefix) {
+        continue;
+      }
+
+      const isDirectoryPrefix = prefix.endsWith("/");
+      if (isDirectoryPrefix) {
+        if (normalizedPath.startsWith(prefix)) {
+          return true;
+        }
+        continue;
+      }
+
+      if (normalizedPath === prefix || normalizedPath.startsWith(`${prefix}/`)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  private assertCorrectionChangeScope(input: {
+    step: AgentStep;
+    proposedChanges: ProposedFileChange[];
+    constraint: PlannerCorrectionConstraint | null;
+  }): void {
+    const constraint = input.constraint;
+    if (!constraint) {
+      return;
+    }
+
+    if (input.proposedChanges.length > constraint.maxFiles) {
+      throw new Error(
+        `Correction step '${input.step.id}' exceeds file cap (${input.proposedChanges.length}/${constraint.maxFiles}).`
+      );
+    }
+
+    const disallowedPaths = input.proposedChanges
+      .map((entry) => entry.path)
+      .filter((entry) => !this.isPathAllowedByConstraint(entry, constraint.allowedPathPrefixes));
+
+    if (disallowedPaths.length) {
+      throw new Error(
+        `Correction step '${input.step.id}' changed disallowed paths: ${disallowedPaths.slice(0, 5).join(", ")}.`
+      );
+    }
+  }
+
+  private assertCorrectionStagedBounds(input: {
+    step: AgentStep;
+    stagedDiffs: Array<{ path: string; diffBytes: number }>;
+    constraint: PlannerCorrectionConstraint | null;
+  }): void {
+    const constraint = input.constraint;
+    if (!constraint) {
+      return;
+    }
+
+    const totalBytes = input.stagedDiffs.reduce((sum, entry) => sum + Math.max(0, Number(entry.diffBytes || 0)), 0);
+
+    if (totalBytes > constraint.maxTotalDiffBytes) {
+      throw new Error(
+        `Correction step '${input.step.id}' exceeds diff-size cap (${totalBytes}/${constraint.maxTotalDiffBytes} bytes).`
+      );
+    }
+
+    const disallowedPaths = input.stagedDiffs
+      .map((entry) => entry.path)
+      .filter((entry) => !this.isPathAllowedByConstraint(entry, constraint.allowedPathPrefixes));
+
+    if (disallowedPaths.length) {
+      throw new Error(
+        `Correction step '${input.step.id}' staged disallowed paths: ${disallowedPaths.slice(0, 5).join(", ")}.`
+      );
+    }
+  }
+
   private resolveLightValidationMode(): "off" | "warn" | "enforce" {
     const raw = (process.env.AGENT_LIGHT_VALIDATION_MODE || "enforce").trim().toLowerCase();
     if (raw === "off" || raw === "warn" || raw === "enforce") {
@@ -229,6 +500,14 @@ export class AgentKernel {
 
   private resolveHeavyValidationMode(): "off" | "warn" | "enforce" {
     const raw = (process.env.AGENT_HEAVY_VALIDATION_MODE || "enforce").trim().toLowerCase();
+    if (raw === "off" || raw === "warn" || raw === "enforce") {
+      return raw;
+    }
+    return "enforce";
+  }
+
+  private resolveCorrectionConvergenceMode(): "off" | "warn" | "enforce" {
+    const raw = (process.env.AGENT_CORRECTION_CONVERGENCE_MODE || "enforce").trim().toLowerCase();
     if (raw === "off" || raw === "warn" || raw === "enforce") {
       return raw;
     }
@@ -424,11 +703,7 @@ export class AgentKernel {
     }
 
     const steps = await this.store.listAgentStepsByRun(run.id);
-
-    return {
-      run: attachLastStep(run, steps),
-      steps
-    };
+    return this.buildRunDetail(run, steps);
   }
 
   private async queueRuntimeCorrection(input: {
@@ -438,11 +713,24 @@ export class AgentKernel {
     stepIndex: number;
     attempt: number;
     runtimeLogs: string;
+    failureReport?: PlannerFailureReport;
     project: StartAgentRunInput["project"] | ResumeAgentRunInput["project"];
     executionRoot: string;
     requestId: string;
     plannerMemory?: PlannerMemoryContext;
   }): Promise<AgentRun> {
+    const classification = classifyFailureForCorrection({
+      phase: "goal",
+      failedStepId: input.failedStep.id,
+      attempt: input.attempt,
+      runtimeLogs: input.runtimeLogs,
+      failureReport: input.failureReport,
+      limits: {
+        maxFilesPerStep: Number(process.env.AGENT_FS_MAX_FILES_PER_STEP || 15),
+        maxTotalDiffBytes: Number(process.env.AGENT_FS_MAX_TOTAL_DIFF_BYTES || 400_000)
+      }
+    });
+
     const correction = await this.planner.planRuntimeCorrection({
       goal: input.run.goal,
       providerId: input.run.providerId,
@@ -452,7 +740,9 @@ export class AgentKernel {
       memory: input.plannerMemory,
       failedStepId: input.failedStep.id,
       runtimeLogs: input.runtimeLogs,
-      attempt: input.attempt
+      attempt: input.attempt,
+      failureReport: input.failureReport,
+      correctionConstraint: classification.constraint
     });
 
     const correctionReasoning = {
@@ -461,6 +751,13 @@ export class AgentKernel {
       failedStepId: input.failedStep.id,
       reason: input.failedStepRecord.errorMessage || "Runtime verification failed.",
       runtimeLogTail: tailText(input.runtimeLogs || "", 3_000),
+      classification: {
+        intent: classification.intent,
+        failedChecks: classification.failedChecks,
+        failureKinds: classification.failureKinds,
+        rationale: classification.rationale
+      },
+      constraint: classification.constraint,
       createdAt: new Date().toISOString()
     };
 
@@ -518,6 +815,18 @@ export class AgentKernel {
     plannerMemory?: PlannerMemoryContext;
   }): Promise<AgentRun> {
     const failedStepId = `heavy-validation-${input.attempt}`;
+    const classification = classifyFailureForCorrection({
+      phase: "optimization",
+      failedStepId,
+      attempt: input.attempt,
+      runtimeLogs: `${input.heavyValidationSummary}\n\n${input.heavyValidationLogs}`.trim(),
+      failureReport: input.heavyFailureReport,
+      limits: {
+        maxFilesPerStep: Number(process.env.AGENT_FS_MAX_FILES_PER_STEP || 15),
+        maxTotalDiffBytes: Number(process.env.AGENT_FS_MAX_TOTAL_DIFF_BYTES || 400_000)
+      }
+    });
+
     const correction = await this.planner.planRuntimeCorrection({
       goal: input.run.goal,
       providerId: input.run.providerId,
@@ -528,7 +837,8 @@ export class AgentKernel {
       failedStepId,
       runtimeLogs: `${input.heavyValidationSummary}\n\n${input.heavyValidationLogs}`.trim(),
       attempt: input.attempt,
-      failureReport: input.heavyFailureReport
+      failureReport: input.heavyFailureReport,
+      correctionConstraint: classification.constraint
     });
 
     const correctionReasoning = {
@@ -538,6 +848,13 @@ export class AgentKernel {
       summary: input.heavyValidationSummary,
       failureCount: input.heavyFailureReport?.failures.length || 0,
       runtimeLogTail: tailText(input.heavyValidationLogs || "", 3_000),
+      classification: {
+        intent: classification.intent,
+        failedChecks: classification.failedChecks,
+        failureKinds: classification.failureKinds,
+        rationale: classification.rationale
+      },
+      constraint: classification.constraint,
       createdAt: new Date().toISOString()
     };
 
@@ -622,6 +939,8 @@ export class AgentKernel {
         })) || run;
       let runtimeCorrectionCount = this.countRuntimeCorrectionSteps(run.plan);
       let heavyCorrectionCount = this.countHeavyCorrectionSteps(run.plan);
+      let lastRuntimeFailureSignature: string | null = null;
+      let lastHeavyBlockingCount: number | null = null;
       const lightValidationMode = this.resolveLightValidationMode();
       const heavyValidationMode = this.resolveHeavyValidationMode();
       const fileSession = await FileSession.create({
@@ -659,6 +978,7 @@ export class AgentKernel {
         let heavyFailureReport: PlannerFailureReport | undefined;
         let queueHeavyCorrectionAttempt: number | null = null;
         let heavyRollbackReason: string | null = null;
+        const correctionConstraint = this.isCorrectionStep(step) ? this.resolveCorrectionConstraintForStep(step) : null;
 
         if (status === "completed" && this.isMutatingStep(step)) {
           try {
@@ -675,10 +995,30 @@ export class AgentKernel {
                 stagedDiffs: []
               };
             } else {
+              if (this.isCorrectionStep(step)) {
+                this.assertCorrectionChangeScope({
+                  step,
+                  proposedChanges,
+                  constraint: correctionConstraint
+                });
+              }
+
               fileSession.beginStep(step.id, stepIndex);
 
               for (const change of proposedChanges) {
                 await fileSession.stageChange(change);
+              }
+
+              if (this.isCorrectionStep(step)) {
+                const stagedForConstraint = fileSession.getStagedDiffs().map((entry) => ({
+                  path: entry.path,
+                  diffBytes: entry.diffBytes
+                }));
+                this.assertCorrectionStagedBounds({
+                  step,
+                  stagedDiffs: stagedForConstraint,
+                  constraint: correctionConstraint
+                });
               }
 
               const validation = fileSession.validateStep();
@@ -771,11 +1111,49 @@ export class AgentKernel {
           if (!verification.ok) {
             status = "failed";
             errorMessage = verification.reason;
-            output = {
-              ...output,
-              runtimeStatus: "failed"
-            };
+            const signature = this.runtimeFailureSignature(errorMessage, runtimeLogs);
+            const repeatedSignature =
+              runtimeCorrectionCount > 0 && lastRuntimeFailureSignature !== null && signature === lastRuntimeFailureSignature;
+
+            if (repeatedSignature && this.correctionConvergenceMode !== "off") {
+              const message = `Runtime correction did not converge: repeated failure signature after ${runtimeCorrectionCount} correction attempt(s).`;
+
+              if (this.correctionConvergenceMode === "enforce") {
+                heavyRollbackReason = message;
+                errorMessage = message;
+                output = {
+                  ...output,
+                  runtimeStatus: "failed",
+                  runtimeConvergence: {
+                    ok: false,
+                    repeatedSignature: true,
+                    signature,
+                    mode: this.correctionConvergenceMode
+                  }
+                };
+              } else {
+                output = {
+                  ...output,
+                  runtimeStatus: "failed",
+                  runtimeConvergence: {
+                    ok: false,
+                    repeatedSignature: true,
+                    signature,
+                    mode: this.correctionConvergenceMode,
+                    warning: message
+                  }
+                };
+              }
+            } else {
+              output = {
+                ...output,
+                runtimeStatus: "failed"
+              };
+            }
+
+            lastRuntimeFailureSignature = signature;
           } else {
+            lastRuntimeFailureSignature = null;
             output = {
               ...output,
               runtimeStatus: "healthy"
@@ -814,29 +1192,65 @@ export class AgentKernel {
             };
 
             if (!heavyValidation.ok) {
-              if (heavyCorrectionCount < this.maxHeavyCorrectionAttempts) {
-                queueHeavyCorrectionAttempt = heavyCorrectionCount + 1;
-                runtimeLogs = heavyValidation.logs;
-                if (heavyValidation.failures.length > 0) {
-                  heavyFailureReport = {
-                    summary: heavyValidation.summary,
-                    failures: heavyValidation.failures.slice(0, 25).map((entry) => ({
-                      sourceCheckId: entry.sourceCheckId,
-                      kind: entry.kind,
-                      code: entry.code,
-                      message: entry.message,
-                      file: entry.file,
-                      line: entry.line,
-                      column: entry.column,
-                      excerpt: entry.excerpt
-                    }))
-                  };
+              const previousBlocking = lastHeavyBlockingCount;
+              const regressionDetected =
+                previousBlocking !== null && heavyValidation.blockingCount >= previousBlocking;
+              const convergenceMessage =
+                previousBlocking === null
+                  ? null
+                  : `Heavy validation did not converge: blocking count ${previousBlocking} -> ${heavyValidation.blockingCount}.`;
+
+              if (regressionDetected && this.correctionConvergenceMode !== "off") {
+                if (this.correctionConvergenceMode === "enforce") {
+                  status = "failed";
+                  heavyRollbackReason = convergenceMessage;
+                  errorMessage = convergenceMessage;
                 }
-              } else {
-                status = "failed";
-                heavyRollbackReason = `Heavy validation failed after ${heavyCorrectionCount}/${this.maxHeavyCorrectionAttempts} correction attempts.`;
-                errorMessage = heavyRollbackReason;
+
+                output = {
+                  ...output,
+                  heavyValidation: {
+                    ...(output.heavyValidation as Record<string, unknown>),
+                    convergence: {
+                      ok: false,
+                      mode: this.correctionConvergenceMode,
+                      previousBlockingCount: previousBlocking,
+                      currentBlockingCount: heavyValidation.blockingCount,
+                      warning: this.correctionConvergenceMode === "warn" ? convergenceMessage : undefined
+                    }
+                  }
+                };
               }
+
+              lastHeavyBlockingCount = heavyValidation.blockingCount;
+
+              if (status === "completed") {
+                if (heavyCorrectionCount < this.maxHeavyCorrectionAttempts) {
+                  queueHeavyCorrectionAttempt = heavyCorrectionCount + 1;
+                  runtimeLogs = heavyValidation.logs;
+                  if (heavyValidation.failures.length > 0) {
+                    heavyFailureReport = {
+                      summary: heavyValidation.summary,
+                      failures: heavyValidation.failures.slice(0, 25).map((entry) => ({
+                        sourceCheckId: entry.sourceCheckId,
+                        kind: entry.kind,
+                        code: entry.code,
+                        message: entry.message,
+                        file: entry.file,
+                        line: entry.line,
+                        column: entry.column,
+                        excerpt: entry.excerpt
+                      }))
+                    };
+                  }
+                } else {
+                  status = "failed";
+                  heavyRollbackReason = `Heavy validation failed after ${heavyCorrectionCount}/${this.maxHeavyCorrectionAttempts} correction attempts.`;
+                  errorMessage = heavyRollbackReason;
+                }
+              }
+            } else {
+              lastHeavyBlockingCount = null;
             }
           } catch (error) {
             status = "failed";
@@ -910,10 +1324,7 @@ export class AgentKernel {
                 finishedAt: new Date().toISOString()
               })) || run;
 
-            return {
-              run: attachLastStep(run, steps),
-              steps
-            };
+            return this.buildRunDetail(run, steps);
           }
         }
 
@@ -948,10 +1359,7 @@ export class AgentKernel {
                 finishedAt: new Date().toISOString()
               })) || run;
 
-            return {
-              run: attachLastStep(run, steps),
-              steps
-            };
+            return this.buildRunDetail(run, steps);
           }
         }
 
@@ -979,10 +1387,7 @@ export class AgentKernel {
               finishedAt: new Date().toISOString()
             })) || run;
 
-          return {
-            run: attachLastStep(run, steps),
-            steps
-          };
+          return this.buildRunDetail(run, steps);
         }
 
         const nextStepIndex = stepIndex + 1;
@@ -999,10 +1404,7 @@ export class AgentKernel {
           })) || run;
       }
 
-      return {
-        run: attachLastStep(run, steps),
-        steps
-      };
+      return this.buildRunDetail(run, steps);
     } finally {
       await this.store.releaseAgentRunExecutionLock(run.id, lockOwner).catch(() => undefined);
     }
@@ -1041,10 +1443,7 @@ export class AgentKernel {
       finishedAt: plan.steps.length ? null : new Date().toISOString()
     });
 
-    let detail: AgentRunDetail = {
-      run,
-      steps: []
-    };
+    let detail: AgentRunDetail = this.buildRunDetail(run, []);
 
     if (plan.steps.length) {
       detail = await this.executeLoop({
@@ -1072,6 +1471,7 @@ export class AgentKernel {
     return {
       run: detail.run,
       steps: detail.steps,
+      telemetry: detail.telemetry,
       executedStep
     };
   }
@@ -1085,10 +1485,7 @@ export class AgentKernel {
 
     if (existing.status === "complete") {
       const steps = await this.store.listAgentStepsByRun(existing.id);
-      return {
-        run: attachLastStep(existing, steps),
-        steps
-      };
+      return this.buildRunDetail(existing, steps);
     }
 
     const run =
@@ -1185,10 +1582,7 @@ export class AgentKernel {
       forkCurrentStepIndex: forkRun.currentStepIndex
     });
 
-    return {
-      run: forkRun,
-      steps: []
-    };
+    return this.buildRunDetail(forkRun, []);
   }
 
   async validateRunOutput(input: ValidateAgentRunInput): Promise<ValidateAgentRunOutput> {
