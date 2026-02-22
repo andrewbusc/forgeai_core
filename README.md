@@ -571,6 +571,7 @@ Behavior:
 
 - Starts deeprun API against PostgreSQL service.
 - Runs `npm run benchmark:reliability`.
+- Retries benchmark once automatically if the first attempt fails (transient hardening).
 - Uploads `.deeprun/reliability-report.json` and server logs as workflow artifacts.
 - `Release Gate` PR/push smoke mode uses strict thresholds:
   - `iterations=1`

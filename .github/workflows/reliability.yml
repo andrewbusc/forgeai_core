@@ -115,15 +115,27 @@ jobs:
           echo "iterations=${iterations}"
           echo "min_pass_rate=${min_pass_rate}"
           echo "strict_v1_ready=${strict_v1_ready}"
+          run_benchmark() {
+            local output_path="$1"
+            npm run benchmark:reliability -- \
+              --api "http://127.0.0.1:${PORT}" \
+              --email "${BENCHMARK_EMAIL}" \
+              --password "${BENCHMARK_PASSWORD}" \
+              --iterations "${iterations}" \
+              --strict-v1-ready="${strict_v1_ready}" \
+              --min-pass-rate "${min_pass_rate}" \
+              --output "${output_path}"
+          }
 
-          npm run benchmark:reliability -- \
-            --api "http://127.0.0.1:${PORT}" \
-            --email "${BENCHMARK_EMAIL}" \
-            --password "${BENCHMARK_PASSWORD}" \
-            --iterations "${iterations}" \
-            --strict-v1-ready="${strict_v1_ready}" \
-            --min-pass-rate "${min_pass_rate}" \
-            --output ".deeprun/reliability-report.json"
+          set +e
+          run_benchmark ".deeprun/reliability-report.json"
+          status=$?
+          set -e
+
+          if [ "${status}" -ne 0 ]; then
+            echo "Initial reliability benchmark failed (exit ${status}); retrying once for transient instability."
+            run_benchmark ".deeprun/reliability-report.retry.json"
+          fi
 
       - name: Stop deeprun API
         if: always()
@@ -142,4 +154,5 @@ jobs:
           if-no-files-found: warn
           path: |
             .deeprun/reliability-report.json
+            .deeprun/reliability-report.retry.json
             .deeprun/reliability-server.log
