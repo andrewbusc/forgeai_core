@@ -69,6 +69,7 @@ export interface ReliabilityIteration {
     ok: boolean;
     verdict: "YES" | "NO";
     generatedAt: string;
+    failedChecks?: string[];
   };
   ok: boolean;
   failureReason?: string;
@@ -192,6 +193,16 @@ function apiErrorMessage(body: unknown): string {
 
   const candidate = (body as { error?: unknown }).error;
   return typeof candidate === "string" ? candidate : "";
+}
+
+function summarizeFailedV1Checks(v1Report: Awaited<ReturnType<typeof runV1ReadinessCheck>>): string[] {
+  if (!v1Report || !Array.isArray(v1Report.checks)) {
+    return [];
+  }
+
+  return v1Report.checks
+    .filter((check) => check.status === "fail")
+    .map((check) => `${check.id}: ${check.message}`);
 }
 
 export function isExistingUserRegisterConflict(status: number, body: unknown): boolean {
@@ -579,6 +590,7 @@ async function runSingleIteration(
         failureReason = failureReason || "Bootstrap response did not include certification targetPath.";
       } else {
         const previousV1DockerMigrationDatabaseUrl = process.env.V1_DOCKER_MIGRATION_DATABASE_URL;
+        const previousV1DockerBootDatabaseUrl = process.env.V1_DOCKER_BOOT_DATABASE_URL;
         const iterationScopedMigrationDatabaseUrl = buildIterationScopedMigrationDatabaseUrl(
           previousV1DockerMigrationDatabaseUrl || process.env.DATABASE_URL,
           index
@@ -588,23 +600,32 @@ async function runSingleIteration(
           if (iterationScopedMigrationDatabaseUrl) {
             // Prevent generated-backend migration dry-run from colliding with the control-plane API DB schema.
             process.env.V1_DOCKER_MIGRATION_DATABASE_URL = iterationScopedMigrationDatabaseUrl;
+            process.env.V1_DOCKER_BOOT_DATABASE_URL = iterationScopedMigrationDatabaseUrl;
           }
 
           const v1Report = await runV1ReadinessCheck(targetPath);
+          const failedChecks = summarizeFailedV1Checks(v1Report);
           v1Ready = {
             ok: v1Report.ok,
             verdict: v1Report.verdict,
-            generatedAt: v1Report.generatedAt
+            generatedAt: v1Report.generatedAt,
+            ...(failedChecks.length ? { failedChecks } : {})
           };
 
           if (!v1Report.ok) {
-            failureReason = failureReason || "Full v1-ready check failed.";
+            const failureSuffix = failedChecks.length ? ` (${failedChecks.join("; ")})` : "";
+            failureReason = failureReason || `Full v1-ready check failed.${failureSuffix}`;
           }
         } finally {
           if (previousV1DockerMigrationDatabaseUrl === undefined) {
             delete process.env.V1_DOCKER_MIGRATION_DATABASE_URL;
           } else {
             process.env.V1_DOCKER_MIGRATION_DATABASE_URL = previousV1DockerMigrationDatabaseUrl;
+          }
+          if (previousV1DockerBootDatabaseUrl === undefined) {
+            delete process.env.V1_DOCKER_BOOT_DATABASE_URL;
+          } else {
+            process.env.V1_DOCKER_BOOT_DATABASE_URL = previousV1DockerBootDatabaseUrl;
           }
         }
       }
