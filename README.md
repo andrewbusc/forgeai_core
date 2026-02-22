@@ -543,7 +543,8 @@ CI Gate
 
 GitHub Actions workflow: `.github/workflows/ci.yml`
 
-It runs on push to `main` and pull requests with a PostgreSQL service, then executes:
+This is a reusable workflow (called by `Release Gate`) and can also be run manually (`workflow_dispatch`).
+It provisions PostgreSQL and executes:
 
 npm run test:ci
 
@@ -562,18 +563,19 @@ GitHub Actions workflow: `.github/workflows/reliability.yml`
 
 Triggers:
 
-- `pull_request`: reliability PR gate
 - nightly schedule (`0 6 * * *` UTC)
 - manual dispatch (`workflow_dispatch`)
+- reusable `workflow_call` (used by `Release Gate`)
 
 Behavior:
 
 - Starts deeprun API against PostgreSQL service.
 - Runs `npm run benchmark:reliability`.
 - Uploads `.deeprun/reliability-report.json` and server logs as workflow artifacts.
-- PR mode uses strict thresholds:
-  - `iterations=3`
+- `Release Gate` PR/push smoke mode uses strict thresholds:
+  - `iterations=1`
   - `min_pass_rate=1.0`
+  - `strict_v1_ready=true`
 - Nightly/manual defaults:
   - `iterations=10`
   - `min_pass_rate=0.95`
@@ -603,9 +605,8 @@ GitHub Actions gate: `.github/workflows/v1-ready.yml`
 
 Triggers:
 
-- `pull_request`
-- `push` to `main`
 - manual dispatch (`workflow_dispatch`)
+- reusable `workflow_call` (used by `Release Gate`)
 
 Behavior:
 
@@ -618,6 +619,28 @@ Manual dispatch inputs:
 
 - `target_path` (optional)
 - `template_id` (used only when `target_path` is empty; defaults to `canonical-backend`)
+
+Release Gate (Required Merge Gate)
+
+GitHub Actions gate: `.github/workflows/release-gate.yml`
+
+Triggers:
+
+- `pull_request`
+- `push` to `main`
+- manual dispatch (`workflow_dispatch`)
+
+It orchestrates three required jobs:
+
+- `CI`
+- `V1 Ready Gate`
+- `Reliability Benchmark`
+
+Branch protection recommendation for `main`:
+
+- Require status checks: `Release Gate / CI`
+- Require status checks: `Release Gate / V1 Ready Gate`
+- Require status checks: `Release Gate / Reliability Benchmark`
 
 Local equivalent (matches CI default behavior):
 

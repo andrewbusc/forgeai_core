@@ -1,7 +1,23 @@
 name: Reliability Benchmark
 
 on:
-  pull_request:
+  workflow_call:
+    inputs:
+      iterations:
+        description: "Number of reliability benchmark samples"
+        required: false
+        type: string
+        default: "10"
+      min_pass_rate:
+        description: "Minimum acceptable pass rate (0..1)"
+        required: false
+        type: string
+        default: "0.95"
+      strict_v1_ready:
+        description: "Run full v1-ready checks for each sample"
+        required: false
+        type: string
+        default: "true"
   schedule:
     - cron: "0 6 * * *"
   workflow_dispatch:
@@ -56,9 +72,9 @@ jobs:
       V1_DOCKER_RUN_MIGRATION: "true"
       BENCHMARK_EMAIL: ci-reliability@deeprun.local
       BENCHMARK_PASSWORD: Password123!
-      INPUT_ITERATIONS: ${{ github.event.inputs.iterations }}
-      INPUT_MIN_PASS_RATE: ${{ github.event.inputs.min_pass_rate }}
-      INPUT_STRICT_V1_READY: ${{ github.event.inputs.strict_v1_ready }}
+      INPUT_ITERATIONS: ${{ inputs.iterations || github.event.inputs.iterations || '10' }}
+      INPUT_MIN_PASS_RATE: ${{ inputs.min_pass_rate || github.event.inputs.min_pass_rate || '0.95' }}
+      INPUT_STRICT_V1_READY: ${{ inputs.strict_v1_ready || github.event.inputs.strict_v1_ready || 'true' }}
 
     steps:
       - name: Checkout
@@ -93,14 +109,8 @@ jobs:
 
       - name: Run reliability benchmark
         run: |
-          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
-            iterations="3"
-            min_pass_rate="1"
-          else
-            iterations="${INPUT_ITERATIONS:-10}"
-            min_pass_rate="${INPUT_MIN_PASS_RATE:-0.95}"
-          fi
-
+          iterations="${INPUT_ITERATIONS:-10}"
+          min_pass_rate="${INPUT_MIN_PASS_RATE:-0.95}"
           strict_v1_ready="${INPUT_STRICT_V1_READY:-true}"
           echo "iterations=${iterations}"
           echo "min_pass_rate=${min_pass_rate}"

@@ -1,10 +1,18 @@
 name: V1 Ready Gate
 
 on:
-  pull_request:
-  push:
-    branches:
-      - main
+  workflow_call:
+    inputs:
+      target_path:
+        description: "Project path to validate"
+        required: false
+        type: string
+        default: ""
+      template_id:
+        description: "Template id used when target_path is empty"
+        required: false
+        type: string
+        default: "canonical-backend"
   workflow_dispatch:
     inputs:
       target_path:
@@ -45,8 +53,8 @@ jobs:
       NODE_ENV: test
       V1_DOCKER_BIN: docker
       V1_DOCKER_RUN_MIGRATION: "true"
-      V1_TARGET_INPUT: ${{ github.event.inputs.target_path }}
-      V1_TEMPLATE_INPUT: ${{ github.event.inputs.template_id }}
+      V1_TARGET_INPUT: ${{ inputs.target_path || github.event.inputs.target_path }}
+      V1_TEMPLATE_INPUT: ${{ inputs.template_id || github.event.inputs.template_id || 'canonical-backend' }}
 
     steps:
       - name: Checkout
