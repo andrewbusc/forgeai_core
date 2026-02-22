@@ -26,6 +26,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   ci:
@@ -58,3 +59,181 @@ jobs:
     with:
       target_path: ""
       template_id: "canonical-backend"
+
+  summary:
+    name: Release Gate Summary
+    runs-on: ubuntu-latest
+    if: ${{ always() }}
+    needs:
+      - ci
+      - v1_ready
+      - reliability_smoke
+      - deployment_dry_run
+    steps:
+      - name: Download gate artifacts
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          path: .artifacts
+          if-no-files-found: ignore
+
+      - name: Publish release gate summary
+        env:
+          NEEDS_CI: ${{ needs.ci.result }}
+          NEEDS_V1_READY: ${{ needs.v1_ready.result }}
+          NEEDS_RELIABILITY: ${{ needs.reliability_smoke.result }}
+          NEEDS_DEPLOYMENT_DRY_RUN: ${{ needs.deployment_dry_run.result }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: |
+          node <<'NODE'
+          const fs = require("node:fs");
+          const path = require("node:path");
+
+          const summaryPath = process.env.GITHUB_STEP_SUMMARY;
+          if (!summaryPath) {
+            process.exit(0);
+          }
+
+          function walk(dir) {
+            if (!fs.existsSync(dir)) return [];
+            const out = [];
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              const full = path.join(dir, entry.name);
+              if (entry.isDirectory()) out.push(...walk(full));
+              else out.push(full);
+            }
+            return out;
+          }
+
+          function findArtifactFile(files, suffixes) {
+            for (const suffix of suffixes) {
+              const match = files.find((file) => file.replace(/\\/g, "/").endsWith(suffix));
+              if (match) return match;
+            }
+            return null;
+          }
+
+          function readJson(filePath) {
+            if (!filePath) return null;
+            try {
+              return JSON.parse(fs.readFileSync(filePath, "utf8"));
+            } catch {
+              return null;
+            }
+          }
+
+          function statusEmoji(result) {
+            if (result === "success") return "✅";
+            if (result === "failure") return "❌";
+            if (result === "cancelled") return "⛔";
+            if (result === "skipped") return "⏭️";
+            return "⚪";
+          }
+
+          function append(lines, line = "") {
+            lines.push(line);
+          }
+
+          const files = walk(".artifacts");
+          const reliabilityReportPath = findArtifactFile(files, [
+            "/reliability-report.retry.json",
+            "/reliability-report.json"
+          ]);
+          const v1ReadyReportPath = findArtifactFile(files, ["/v1-ready-report.json"]);
+          const deploymentDryRunReportPath = findArtifactFile(files, ["/deployment-dry-run-report.json"]);
+
+          const reliabilityReport = readJson(reliabilityReportPath);
+          const v1ReadyReport = readJson(v1ReadyReportPath);
+          const deploymentDryRunReport = readJson(deploymentDryRunReportPath);
+
+          const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+          const rows = [
+            ["CI", process.env.NEEDS_CI || "unknown"],
+            ["V1 Ready Gate", process.env.NEEDS_V1_READY || "unknown"],
+            ["Reliability Benchmark", process.env.NEEDS_RELIABILITY || "unknown"],
+            ["Deployment Dry Run", process.env.NEEDS_DEPLOYMENT_DRY_RUN || "unknown"]
+          ];
+
+          const lines = [];
+          append(lines, "## Release Gate Summary");
+          append(lines);
+          append(
+            lines,
+            `Run: [${process.env.GITHUB_RUN_ID}](${runUrl}) | Commit: \`${(process.env.GITHUB_SHA || "").slice(0, 7)}\` | Branch: \`${process.env.GITHUB_REF_NAME || ""}\` | Event: \`${process.env.GITHUB_EVENT_NAME || ""}\``
+          );
+          append(lines);
+          append(lines, "### Job Status");
+          append(lines);
+          append(lines, "| Gate | Result |");
+          append(lines, "| --- | --- |");
+          for (const [name, result] of rows) {
+            append(lines, `| ${name} | ${statusEmoji(result)} \`${result}\` |`);
+          }
+
+          if (reliabilityReport) {
+            append(lines);
+            append(lines, "### Reliability Benchmark");
+            append(lines);
+            append(
+              lines,
+              `- Pass rate: \`${Number(reliabilityReport.passRate || 0).toFixed(4)}\` (${reliabilityReport.passCount || 0}/${reliabilityReport.iterationsCompleted || 0})`
+            );
+            append(lines, `- Threshold met: \`${String(reliabilityReport.thresholdMet)}\``);
+            append(lines, `- Strict v1-ready: \`${String(reliabilityReport.strictV1Ready)}\``);
+
+            const failedRun = Array.isArray(reliabilityReport.runs)
+              ? reliabilityReport.runs.find((run) => run && run.ok === false)
+              : null;
+            if (failedRun) {
+              append(lines, `- First failure: run \`${failedRun.index}\` status=\`${failedRun.runStatus || "unknown"}\``);
+              if (failedRun.failureReason) {
+                append(lines, `- Failure reason: ${failedRun.failureReason}`);
+              }
+              const failedChecks = failedRun.v1Ready && Array.isArray(failedRun.v1Ready.failedChecks)
+                ? failedRun.v1Ready.failedChecks
+                : [];
+              if (failedChecks.length > 0) {
+                append(lines, "- Failed v1 checks:");
+                for (const item of failedChecks.slice(0, 8)) {
+                  append(lines, `  - ${item}`);
+                }
+              }
+            }
+          }
+
+          function appendV1LikeReport(title, report) {
+            if (!report || !Array.isArray(report.checks)) return;
+            append(lines);
+            append(lines, `### ${title}`);
+            append(lines);
+            append(lines, `- Verdict: \`${report.verdict}\``);
+            const failedChecks = report.checks.filter((check) => check && check.status === "fail");
+            if (failedChecks.length === 0) {
+              append(lines, "- Failed checks: none");
+              return;
+            }
+            append(lines, `- Failed checks: \`${failedChecks.length}\``);
+            for (const check of failedChecks.slice(0, 8)) {
+              append(lines, `  - \`${check.id}\`: ${check.message}`);
+            }
+          }
+
+          appendV1LikeReport("V1 Ready Report", v1ReadyReport);
+          appendV1LikeReport("Deployment Dry Run Report", deploymentDryRunReport);
+
+          if (files.length > 0) {
+            append(lines);
+            append(lines, "### Artifacts");
+            append(lines);
+            for (const file of files.sort()) {
+              append(lines, `- \`${file}\``);
+            }
+          }
+
+          fs.appendFileSync(summaryPath, `${lines.join("\n")}\n`);
+          NODE
