@@ -904,12 +904,21 @@ test("runtime correction loop stops at configured goal-phase limit", async () =>
 
     assert.equal(started.run.status, "failed");
     assert.equal(started.run.errorMessage, "Runtime correction limit reached (2/2).");
+    assert.equal((started.run.errorDetails as { category?: string } | undefined)?.category, "runtime_correction_limit");
     const correctionSteps = started.steps.filter((entry) => entry.stepId.startsWith("runtime-correction-"));
     assert.equal(correctionSteps.length, 2);
     for (const step of correctionSteps) {
       assert.equal(step.status, "completed");
       assert.ok(step.commitHash);
     }
+
+    const failedVerifyStep = [...started.steps]
+      .sort((a, b) => b.stepIndex - a.stepIndex || b.attempt - a.attempt)
+      .find((entry) => entry.stepId.includes("runtime-retry-2"));
+    assert.ok(failedVerifyStep);
+    const failureDetails = failedVerifyStep?.outputPayload.failureDetails as { category?: string; runtimeStatus?: string } | undefined;
+    assert.equal(failureDetails?.category, "runtime_verification");
+    assert.equal(failureDetails?.runtimeStatus, "failed");
   } finally {
     if (previousLightValidation === undefined) {
       delete process.env.AGENT_LIGHT_VALIDATION_MODE;

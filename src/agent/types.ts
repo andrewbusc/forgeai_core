@@ -97,6 +97,7 @@ export interface AgentRun {
   runLockOwner?: string | null;
   runLockAcquiredAt?: string | null;
   errorMessage?: string | null;
+  errorDetails?: Record<string, unknown> | null;
   finishedAt?: string | null;
   createdAt: string;
   updatedAt: string;

@@ -112,6 +112,7 @@ interface CreateAgentRunInput {
   currentCommitHash?: string | null;
   lastValidCommitHash?: string | null;
   errorMessage?: string | null;
+  errorDetails?: Record<string, unknown> | null;
   finishedAt?: string | null;
 }
 
@@ -128,6 +129,7 @@ interface AgentRunPatchInput {
   runLockOwner?: string | null;
   runLockAcquiredAt?: string | null;
   errorMessage?: string | null;
+  errorDetails?: Record<string, unknown> | null;
   finishedAt?: string | null;
 }
 
@@ -287,6 +289,7 @@ CREATE TABLE IF NOT EXISTS agent_runs (
   run_lock_owner TEXT,
   run_lock_acquired_at TIMESTAMPTZ,
   error_message TEXT,
+  error_details JSONB,
   created_at TIMESTAMPTZ NOT NULL,
   updated_at TIMESTAMPTZ NOT NULL,
   finished_at TIMESTAMPTZ
@@ -362,7 +365,7 @@ id, project_id, org_id, workspace_id, created_by_user_id, goal,
 provider_id, model, status, current_step_index, plan, last_step_id,
 run_branch, worktree_path, base_commit_hash, current_commit_hash, last_valid_commit_hash,
 run_lock_owner, run_lock_acquired_at,
-error_message, created_at, updated_at, finished_at
+error_message, error_details, created_at, updated_at, finished_at
 `;
 
 const agentStepSelectColumns = `
@@ -507,6 +510,7 @@ interface DbAgentRunRow {
   run_lock_owner: string | null;
   run_lock_acquired_at: Date | string | null;
   error_message: string | null;
+  error_details: unknown;
   created_at: Date | string;
   updated_at: Date | string;
   finished_at: Date | string | null;
@@ -771,6 +775,10 @@ function mapAgentRun(row: DbAgentRunRow): AgentRun {
     runLockOwner: row.run_lock_owner,
     runLockAcquiredAt: row.run_lock_acquired_at ? toIso(row.run_lock_acquired_at) : null,
     errorMessage: row.error_message,
+    errorDetails:
+      row.error_details && typeof row.error_details === "object" && !Array.isArray(row.error_details)
+        ? (row.error_details as Record<string, unknown>)
+        : null,
     createdAt: toIso(row.created_at),
     updatedAt: toIso(row.updated_at),
     finishedAt: row.finished_at ? toIso(row.finished_at) : null
@@ -1505,7 +1513,8 @@ export class AppStore {
        ADD COLUMN IF NOT EXISTS current_commit_hash TEXT,
        ADD COLUMN IF NOT EXISTS last_valid_commit_hash TEXT,
        ADD COLUMN IF NOT EXISTS run_lock_owner TEXT,
-       ADD COLUMN IF NOT EXISTS run_lock_acquired_at TIMESTAMPTZ`
+       ADD COLUMN IF NOT EXISTS run_lock_acquired_at TIMESTAMPTZ,
+       ADD COLUMN IF NOT EXISTS error_details JSONB`
     );
 
     await this.pool.query(
@@ -1944,14 +1953,14 @@ export class AppStore {
          provider_id, model, status, current_step_index, plan, last_step_id,
          run_branch, worktree_path, base_commit_hash, current_commit_hash, last_valid_commit_hash,
          run_lock_owner, run_lock_acquired_at,
-         error_message, created_at, updated_at, finished_at
+         error_message, error_details, created_at, updated_at, finished_at
        )
        VALUES (
          $1, $2, $3, $4, $5, $6,
          $7, $8, $9, $10, $11::jsonb, $12,
          $13, $14, $15, $16, $17,
          NULL, NULL,
-         $18, $19::timestamptz, $20::timestamptz, $21::timestamptz
+         $18, $19::jsonb, $20::timestamptz, $21::timestamptz, $22::timestamptz
        )
        RETURNING ${agentRunSelectColumns}`,
       [
@@ -1973,6 +1982,7 @@ export class AppStore {
         input.currentCommitHash ?? null,
         input.lastValidCommitHash ?? null,
         input.errorMessage ?? null,
+        JSON.stringify(input.errorDetails ?? null),
         now,
         now,
         input.finishedAt ?? null
@@ -2066,6 +2076,11 @@ export class AppStore {
       runLockOwner: { column: "run_lock_owner" },
       runLockAcquiredAt: { column: "run_lock_acquired_at", cast: "::timestamptz" },
       errorMessage: { column: "error_message" },
+      errorDetails: {
+        column: "error_details",
+        cast: "::jsonb",
+        transform: (value) => JSON.stringify(value ?? null)
+      },
       finishedAt: { column: "finished_at", cast: "::timestamptz" }
     };
 

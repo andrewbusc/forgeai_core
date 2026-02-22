@@ -236,6 +236,171 @@ export class AgentKernel {
     return `${reasonPart}::${logsPart}`;
   }
 
+  private buildStepFailureDetails(input: {
+    run: AgentRun;
+    step: AgentStep;
+    stepIndex: number;
+    errorMessage: string | null;
+    output: Record<string, unknown>;
+    runtimeStatus: string | null;
+    runtimeLogs: string;
+    finishedAt: string;
+  }): Record<string, unknown> {
+    const transactionError = this.toRecord(input.output.transactionError);
+    const heavyValidationError = this.toRecord(input.output.heavyValidationError);
+    const heavyValidation = this.toRecord(input.output.heavyValidation);
+    const correctionPolicy = this.toRecord(input.output.correctionPolicy);
+    const runtimeConvergence = this.toRecord(input.output.runtimeConvergence);
+    const heavyValidationConvergence = heavyValidation ? this.toRecord(heavyValidation.convergence) : null;
+
+    let category = "step_execution";
+    if (transactionError || String(input.errorMessage || "").startsWith("Step transaction failed:")) {
+      category = "step_transaction";
+    } else if (heavyValidationError) {
+      category = "heavy_validation_execution";
+    } else if (heavyValidation && heavyValidation.ok === false) {
+      category = "heavy_validation";
+    } else if (this.isRuntimeVerifyStep(input.step)) {
+      category = "runtime_verification";
+    } else if (
+      correctionPolicy &&
+      typeof input.errorMessage === "string" &&
+      input.errorMessage.startsWith("Correction policy violation:")
+    ) {
+      category = "correction_policy";
+    }
+
+    const details: Record<string, unknown> = {
+      version: 1,
+      source: "agent_kernel",
+      category,
+      runId: input.run.id,
+      stepId: input.step.id,
+      stepType: input.step.type,
+      tool: input.step.tool,
+      stepIndex: input.stepIndex,
+      errorMessage: input.errorMessage || "Agent step failed.",
+      runtimeStatus: input.runtimeStatus,
+      createdAt: input.finishedAt
+    };
+
+    if (input.runtimeLogs) {
+      details.runtimeLogTail = tailText(input.runtimeLogs, 4_000);
+    }
+
+    if (transactionError) {
+      details.transactionError = transactionError;
+    }
+
+    if (heavyValidationError) {
+      details.heavyValidationError = heavyValidationError;
+    }
+
+    if (runtimeConvergence) {
+      details.runtimeConvergence = runtimeConvergence;
+    }
+
+    if (heavyValidationConvergence) {
+      details.heavyValidationConvergence = heavyValidationConvergence;
+    }
+
+    if (correctionPolicy) {
+      details.correctionPolicy = {
+        ok: correctionPolicy.ok === true,
+        blockingCount: Number(correctionPolicy.blockingCount || 0),
+        warningCount: Number(correctionPolicy.warningCount || 0),
+        summary: typeof correctionPolicy.summary === "string" ? correctionPolicy.summary : ""
+      };
+    }
+
+    if (heavyValidation) {
+      const failedChecks = Array.isArray(heavyValidation.checks)
+        ? heavyValidation.checks
+            .map((entry) => this.toRecord(entry))
+            .filter((entry): entry is Record<string, unknown> => Boolean(entry))
+            .filter((entry) => String(entry.status || "") === "fail")
+            .map((entry) => ({
+              id: typeof entry.id === "string" ? entry.id : "unknown",
+              message: typeof entry.message === "string" ? entry.message : ""
+            }))
+            .slice(0, 12)
+        : [];
+
+      const parsedFailures = Array.isArray(heavyValidation.failures)
+        ? heavyValidation.failures
+            .map((entry) => this.toRecord(entry))
+            .filter((entry): entry is Record<string, unknown> => Boolean(entry))
+            .map((entry) => ({
+              sourceCheckId: typeof entry.sourceCheckId === "string" ? entry.sourceCheckId : "unknown",
+              kind: typeof entry.kind === "string" ? entry.kind : "unknown",
+              code: typeof entry.code === "string" ? entry.code : undefined,
+              message: typeof entry.message === "string" ? entry.message : "",
+              file: typeof entry.file === "string" ? entry.file : undefined,
+              line: Number.isFinite(Number(entry.line)) ? Number(entry.line) : undefined,
+              column: Number.isFinite(Number(entry.column)) ? Number(entry.column) : undefined
+            }))
+            .slice(0, 25)
+        : [];
+
+      details.heavyValidation = {
+        ok: heavyValidation.ok === true,
+        blockingCount: Number(heavyValidation.blockingCount || 0),
+        warningCount: Number(heavyValidation.warningCount || 0),
+        summary: typeof heavyValidation.summary === "string" ? heavyValidation.summary : "",
+        failedChecks,
+        failures: parsedFailures
+      };
+    }
+
+    return details;
+  }
+
+  private buildRunFailureDetailsFromStepRecord(input: {
+    run: AgentRun;
+    stepRecord: AgentStepRecord;
+    category: string;
+    errorMessage: string | null;
+    rollbackReason?: string | null;
+    plannerError?: unknown;
+  }): Record<string, unknown> {
+    const outputPayload = this.toRecord(input.stepRecord.outputPayload);
+    const stepFailureDetails = this.toRecord(outputPayload?.failureDetails);
+    const details: Record<string, unknown> = {
+      version: 1,
+      source: "agent_kernel",
+      category: input.category,
+      errorMessage: input.errorMessage || input.stepRecord.errorMessage || "Agent run failed.",
+      runId: input.run.id,
+      projectId: input.run.projectId,
+      failedStep: {
+        recordId: input.stepRecord.id,
+        stepId: input.stepRecord.stepId,
+        stepIndex: input.stepRecord.stepIndex,
+        attempt: input.stepRecord.attempt,
+        type: input.stepRecord.type,
+        tool: input.stepRecord.tool,
+        status: input.stepRecord.status,
+        runtimeStatus: input.stepRecord.runtimeStatus,
+        commitHash: input.stepRecord.commitHash
+      },
+      createdAt: new Date().toISOString()
+    };
+
+    if (input.rollbackReason) {
+      details.rollbackReason = input.rollbackReason;
+    }
+
+    if (stepFailureDetails) {
+      details.stepFailure = stepFailureDetails;
+    }
+
+    if (input.plannerError !== undefined) {
+      details.plannerError = serializeError(input.plannerError);
+    }
+
+    return details;
+  }
+
   private normalizeCorrectionPathPrefix(value: string): string {
     return value.replaceAll("\\", "/").replace(/^\/+/, "").trim();
   }
@@ -905,6 +1070,7 @@ export class AgentKernel {
         plan: input.run.plan,
         lastStepId: input.failedStepRecord.id,
         errorMessage: null,
+        errorDetails: null,
         finishedAt: null
       })) || input.run
     );
@@ -994,6 +1160,7 @@ export class AgentKernel {
         currentStepIndex: input.stepIndex + 1,
         plan: input.run.plan,
         errorMessage: null,
+        errorDetails: null,
         finishedAt: null
       })) || input.run
     );
@@ -1043,6 +1210,7 @@ export class AgentKernel {
         (await this.store.updateAgentRun(run.id, {
           status: "running",
           errorMessage: null,
+          errorDetails: null,
           finishedAt: null
         })) || run;
       let runtimeCorrectionCount = this.countRuntimeCorrectionSteps(run.plan);
@@ -1278,6 +1446,7 @@ export class AgentKernel {
             (await this.store.updateAgentRun(run.id, {
               status: "validating",
               errorMessage: null,
+              errorDetails: null,
               finishedAt: null
             })) || run;
 
@@ -1405,6 +1574,22 @@ export class AgentKernel {
           }
         }
 
+        if (status === "failed") {
+          output = {
+            ...output,
+            failureDetails: this.buildStepFailureDetails({
+              run,
+              step,
+              stepIndex,
+              errorMessage,
+              output,
+              runtimeStatus,
+              runtimeLogs,
+              finishedAt: executed.finishedAt
+            })
+          };
+        }
+
         const stepRecord = await this.store.createAgentStep({
           runId: run.id,
           projectId: run.projectId,
@@ -1463,6 +1648,13 @@ export class AgentKernel {
                 currentStepIndex: stepIndex,
                 lastStepId: stepRecord.id,
                 errorMessage: correctionMessage,
+                errorDetails: this.buildRunFailureDetailsFromStepRecord({
+                  run,
+                  stepRecord,
+                  category: "heavy_validation_correction_planning_failure",
+                  errorMessage: correctionMessage,
+                  plannerError: error
+                }),
                 finishedAt: new Date().toISOString()
               })) || run;
 
@@ -1498,6 +1690,13 @@ export class AgentKernel {
                 currentStepIndex: stepIndex,
                 lastStepId: stepRecord.id,
                 errorMessage: correctionMessage,
+                errorDetails: this.buildRunFailureDetailsFromStepRecord({
+                  run,
+                  stepRecord,
+                  category: "runtime_correction_planning_failure",
+                  errorMessage: correctionMessage,
+                  plannerError: error
+                }),
                 finishedAt: new Date().toISOString()
               })) || run;
 
@@ -1526,6 +1725,22 @@ export class AgentKernel {
               currentStepIndex: stepIndex,
               lastStepId: stepRecord.id,
               errorMessage: errorMessage || "Agent step failed.",
+              errorDetails: this.buildRunFailureDetailsFromStepRecord({
+                run,
+                stepRecord,
+                category:
+                  heavyRollbackReason && heavyRollbackReason.startsWith("Runtime correction limit reached")
+                    ? "runtime_correction_limit"
+                    : heavyRollbackReason && heavyRollbackReason.startsWith("Heavy validation failed after")
+                      ? "heavy_validation_correction_limit"
+                      : heavyRollbackReason && heavyRollbackReason.startsWith("Heavy validation did not converge")
+                        ? "heavy_validation_convergence"
+                        : heavyRollbackReason && heavyRollbackReason.startsWith("Runtime correction did not converge")
+                          ? "runtime_correction_convergence"
+                          : "step_failure",
+                errorMessage: errorMessage || "Agent step failed.",
+                rollbackReason: heavyRollbackReason
+              }),
               finishedAt: new Date().toISOString()
             })) || run;
 
@@ -1541,6 +1756,7 @@ export class AgentKernel {
             currentStepIndex: nextStepIndex,
             lastStepId: stepRecord.id,
             errorMessage: null,
+            errorDetails: null,
             finishedAt: done ? new Date().toISOString() : null,
             plan: run.plan
           })) || run;
@@ -1634,6 +1850,7 @@ export class AgentKernel {
       (await this.store.updateAgentRun(existing.id, {
         status: "queued",
         errorMessage: null,
+        errorDetails: null,
         finishedAt: null
       })) || existing;
 
