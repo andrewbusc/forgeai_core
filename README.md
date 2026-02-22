@@ -656,6 +656,36 @@ Direct path validation:
 
 npm run check:v1-ready -- <target_path>
 
+Deployment Dry Run Workflow (Containerized Production Boot)
+
+GitHub Actions gate: `.github/workflows/deployment-dry-run.yml`
+
+Triggers:
+
+- nightly schedule (`0 7 * * *` UTC)
+- manual dispatch (`workflow_dispatch`)
+- reusable `workflow_call`
+
+Behavior:
+
+- Scaffolds canonical backend target by default (or validates a provided `target_path`)
+- Runs containerized deployment dry run using `check:v1-ready`
+- Verifies:
+  - Docker image build
+  - containerized migration run
+  - production-mode container boot
+  - `/health` returns success
+- Uploads `.deeprun/deployment-dry-run-report.json` and generated target (when scaffolded) as artifacts
+
+Manual dispatch inputs:
+
+- `target_path` (optional)
+- `template_id` (used only when `target_path` is empty; defaults to `canonical-backend`)
+
+Local equivalent:
+
+npm run test:deployment-dry-run
+
 CLI Commands (deeprun)
 
 Run via npm script:

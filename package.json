@@ -24,6 +24,7 @@
     "test:benchmark": "tsx --test src/scripts/__tests__/reliability-benchmark.test.ts",
     "test:ci": "npm run check && npm run test:providers && npm run test:benchmark && npm run test:validation && npm run test:agent-state && npm run test:agent-kernel && npm run test:server-routes && npm run test:server-agent-state && npm run test:bootstrap",
     "test:v1-ready": "npm run prepare:v1-ready-target -- --output .deeprun/v1-ready-target && npm run check:v1-ready -- .deeprun/v1-ready-target",
+    "test:deployment-dry-run": "npm run prepare:v1-ready-target -- --output .deeprun/deployment-dry-run-target && npm run check:v1-ready -- .deeprun/deployment-dry-run-target",
     "benchmark:reliability": "tsx -r dotenv/config src/scripts/reliability-benchmark.ts",
     "prepare:v1-ready-target": "tsx src/scripts/prepare-v1-ready-target.ts",
     "deeprun": "tsx -r dotenv/config src/scripts/deeprun-cli.ts",
