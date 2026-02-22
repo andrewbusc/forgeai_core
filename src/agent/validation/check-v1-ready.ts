@@ -279,6 +279,12 @@ async function runDockerValidationChecks(target: string): Promise<CheckResult[]>
     process.env.DATABASE_URL ||
     ""
   ).trim();
+  const bootDatabaseUrlRaw = (
+    process.env.V1_DOCKER_BOOT_DATABASE_URL ||
+    process.env.V1_DOCKER_MIGRATION_DATABASE_URL ||
+    process.env.DATABASE_URL ||
+    ""
+  ).trim();
 
   const checks: CheckResult[] = [];
 
@@ -458,6 +464,10 @@ async function runDockerValidationChecks(target: string): Promise<CheckResult[]>
       let containerId = "";
       const hostPort = await acquireFreePort();
       const containerName = `deeprun-v1-check-${Date.now()}-${randomBytes(3).toString("hex")}`;
+      const dockerBootEnvArgs: string[] = [];
+      if (bootDatabaseUrlRaw) {
+        dockerBootEnvArgs.push("-e", `DATABASE_URL=${rewriteDatabaseUrlForDocker(bootDatabaseUrlRaw)}`);
+      }
       const runResult = await runCommand({
         command: dockerBin,
         args: [
@@ -470,6 +480,7 @@ async function runDockerValidationChecks(target: string): Promise<CheckResult[]>
           "NODE_ENV=production",
           "-e",
           `PORT=${containerPort}`,
+          ...dockerBootEnvArgs,
           "-p",
           `127.0.0.1:${hostPort}:${containerPort}`,
           imageTag

@@ -69,6 +69,7 @@ export interface ReliabilityIteration {
     ok: boolean;
     verdict: "YES" | "NO";
     generatedAt: string;
+    failedChecks?: string[];
   };
   ok: boolean;
   failureReason?: string;
@@ -183,6 +184,73 @@ class ApiClient {
       body: payload as T
     };
   }
+}
+
+function apiErrorMessage(body: unknown): string {
+  if (!body || typeof body !== "object") {
+    return "";
+  }
+
+  const candidate = (body as { error?: unknown }).error;
+  return typeof candidate === "string" ? candidate : "";
+}
+
+function summarizeFailedV1Checks(v1Report: Awaited<ReturnType<typeof runV1ReadinessCheck>>): string[] {
+  if (!v1Report || !Array.isArray(v1Report.checks)) {
+    return [];
+  }
+
+  return v1Report.checks
+    .filter((check) => check.status === "fail")
+    .map((check) => `${check.id}: ${check.message}`);
+}
+
+export function isExistingUserRegisterConflict(status: number, body: unknown): boolean {
+  if (status === 409) {
+    return true;
+  }
+
+  if (status < 500) {
+    return false;
+  }
+
+  const message = apiErrorMessage(body).toLowerCase();
+  if (!message) {
+    return false;
+  }
+
+  return (
+    message.includes("already exists") ||
+    message.includes("duplicate key") ||
+    message.includes("users_email_key")
+  );
+}
+
+export function buildIterationScopedMigrationDatabaseUrl(
+  baseUrl: string | undefined,
+  iteration: number,
+  uniqueToken: string = randomUUID()
+): string | undefined {
+  const raw = (baseUrl || "").trim();
+  if (!raw) {
+    return undefined;
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return raw;
+  }
+
+  if (parsed.protocol !== "postgres:" && parsed.protocol !== "postgresql:") {
+    return raw;
+  }
+
+  const token = uniqueToken.replace(/[^a-zA-Z0-9]/g, "").toLowerCase().slice(0, 16) || "bench";
+  const schemaName = `deeprun_bench_${iteration}_${token}`.slice(0, 63);
+  parsed.searchParams.set("schema", schemaName);
+  return parsed.toString();
 }
 
 function parseArgs(argv: string[]): ParsedArgs {
@@ -395,6 +463,25 @@ export function summarizeReliabilityRuns(
 }
 
 async function authenticate(client: ApiClient, options: ReliabilityBenchmarkOptions): Promise<{ workspaceId: string }> {
+  const login = await client.request<AuthPayload & { error?: string }>("POST", "/api/auth/login", {
+    email: options.email,
+    password: options.password
+  });
+
+  if (login.status === 200) {
+    const workspaceId = resolveWorkspaceId(login.body);
+    if (!workspaceId) {
+      throw new Error("Login succeeded but no workspace id was returned.");
+    }
+
+    return { workspaceId };
+  }
+
+  if (login.status !== 401) {
+    const message = apiErrorMessage(login.body) || `Auth login failed with HTTP ${login.status}.`;
+    throw new Error(message);
+  }
+
   const register = await client.request<AuthPayload & { error?: string }>("POST", "/api/auth/register", {
     name: options.name,
     email: options.email,
@@ -412,22 +499,23 @@ async function authenticate(client: ApiClient, options: ReliabilityBenchmarkOpti
     return { workspaceId };
   }
 
-  if (register.status !== 409) {
-    const message = (register.body as { error?: string } | undefined)?.error || `Auth register failed with HTTP ${register.status}.`;
+  if (!isExistingUserRegisterConflict(register.status, register.body)) {
+    const message = apiErrorMessage(register.body) || `Auth register failed with HTTP ${register.status}.`;
     throw new Error(message);
   }
 
-  const login = await client.request<AuthPayload & { error?: string }>("POST", "/api/auth/login", {
+  const loginAfterRegisterConflict = await client.request<AuthPayload & { error?: string }>("POST", "/api/auth/login", {
     email: options.email,
     password: options.password
   });
 
-  if (login.status !== 200) {
-    const message = (login.body as { error?: string } | undefined)?.error || `Auth login failed with HTTP ${login.status}.`;
+  if (loginAfterRegisterConflict.status !== 200) {
+    const message =
+      apiErrorMessage(loginAfterRegisterConflict.body) || `Auth login failed with HTTP ${loginAfterRegisterConflict.status}.`;
     throw new Error(message);
   }
 
-  const workspaceId = resolveWorkspaceId(login.body);
+  const workspaceId = resolveWorkspaceId(loginAfterRegisterConflict.body);
   if (!workspaceId) {
     throw new Error("Login succeeded but no workspace id was returned.");
   }
@@ -501,15 +589,44 @@ async function runSingleIteration(
       if (!targetPath) {
         failureReason = failureReason || "Bootstrap response did not include certification targetPath.";
       } else {
-        const v1Report = await runV1ReadinessCheck(targetPath);
-        v1Ready = {
-          ok: v1Report.ok,
-          verdict: v1Report.verdict,
-          generatedAt: v1Report.generatedAt
-        };
+        const previousV1DockerMigrationDatabaseUrl = process.env.V1_DOCKER_MIGRATION_DATABASE_URL;
+        const previousV1DockerBootDatabaseUrl = process.env.V1_DOCKER_BOOT_DATABASE_URL;
+        const iterationScopedMigrationDatabaseUrl = buildIterationScopedMigrationDatabaseUrl(
+          previousV1DockerMigrationDatabaseUrl || process.env.DATABASE_URL,
+          index
+        );
 
-        if (!v1Report.ok) {
-          failureReason = failureReason || "Full v1-ready check failed.";
+        try {
+          if (iterationScopedMigrationDatabaseUrl) {
+            // Prevent generated-backend migration dry-run from colliding with the control-plane API DB schema.
+            process.env.V1_DOCKER_MIGRATION_DATABASE_URL = iterationScopedMigrationDatabaseUrl;
+            process.env.V1_DOCKER_BOOT_DATABASE_URL = iterationScopedMigrationDatabaseUrl;
+          }
+
+          const v1Report = await runV1ReadinessCheck(targetPath);
+          const failedChecks = summarizeFailedV1Checks(v1Report);
+          v1Ready = {
+            ok: v1Report.ok,
+            verdict: v1Report.verdict,
+            generatedAt: v1Report.generatedAt,
+            ...(failedChecks.length ? { failedChecks } : {})
+          };
+
+          if (!v1Report.ok) {
+            const failureSuffix = failedChecks.length ? ` (${failedChecks.join("; ")})` : "";
+            failureReason = failureReason || `Full v1-ready check failed.${failureSuffix}`;
+          }
+        } finally {
+          if (previousV1DockerMigrationDatabaseUrl === undefined) {
+            delete process.env.V1_DOCKER_MIGRATION_DATABASE_URL;
+          } else {
+            process.env.V1_DOCKER_MIGRATION_DATABASE_URL = previousV1DockerMigrationDatabaseUrl;
+          }
+          if (previousV1DockerBootDatabaseUrl === undefined) {
+            delete process.env.V1_DOCKER_BOOT_DATABASE_URL;
+          } else {
+            process.env.V1_DOCKER_BOOT_DATABASE_URL = previousV1DockerBootDatabaseUrl;
+          }
         }
       }
     }

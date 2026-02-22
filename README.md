@@ -450,6 +450,9 @@ No existing step record is overwritten.
 Correction safety:
 
 Correction steps must produce real staged diffs and a commit; no-op/silent patch corrections are rejected.
+Correction attempts are exposed as first-class telemetry in run detail responses and CLI status/log output.
+Each correction carries classified intent, bounded constraint metadata, and final step outcome.
+Correction policy gate evaluates deterministic integrity rules and can hard-fail malformed correction attempts.
 
 Environment knobs:
 
@@ -460,12 +463,15 @@ AGENT_FS_ALLOW_ENV_MUTATION
 AGENT_LIGHT_VALIDATION_MODE (off | warn | enforce)
 AGENT_RUN_LOCK_STALE_SECONDS
 AGENT_HEAVY_VALIDATION_MODE (off | warn | enforce)
+AGENT_CORRECTION_POLICY_MODE (off | warn | enforce)
 AGENT_GOAL_MAX_CORRECTIONS
 AGENT_OPTIMIZATION_MAX_CORRECTIONS
 AGENT_RUNTIME_MAX_CORRECTIONS (legacy alias for goal max)
 AGENT_HEAVY_MAX_CORRECTIONS
+AGENT_CORRECTION_CONVERGENCE_MODE (off | warn | enforce)
 AGENT_HEAVY_INSTALL_DEPS
 AGENT_HEAVY_BUILD_TIMEOUT_MS
+DEEPRUN_PROMOTE_REQUIRE_V1_READY
 
 V1 readiness gate knobs:
 
@@ -492,6 +498,14 @@ Fork endpoint (step commit-based):
 Validate run output endpoint (isolated heavy validation):
 
 `POST /api/projects/:projectId/agent/runs/:runId/validate`
+
+Run detail telemetry:
+
+`GET /api/projects/:projectId/agent/runs/:runId` includes:
+- `telemetry.corrections[]` timeline entries
+- `telemetry.correctionPolicies[]` policy verdict timeline entries
+- step-level `correctionTelemetry` on correction steps
+- step-level `correctionPolicy` verdicts on correction steps
 
 Backend bootstrap endpoint (canonical template + immediate kernel run):
 
@@ -529,7 +543,8 @@ CI Gate
 
 GitHub Actions workflow: `.github/workflows/ci.yml`
 
-It runs on push to `main` and pull requests with a PostgreSQL service, then executes:
+This is a reusable workflow (called by `Release Gate`) and can also be run manually (`workflow_dispatch`).
+It provisions PostgreSQL and executes:
 
 npm run test:ci
 
@@ -548,18 +563,20 @@ GitHub Actions workflow: `.github/workflows/reliability.yml`
 
 Triggers:
 
-- `pull_request`: reliability PR gate
 - nightly schedule (`0 6 * * *` UTC)
 - manual dispatch (`workflow_dispatch`)
+- reusable `workflow_call` (used by `Release Gate`)
 
 Behavior:
 
 - Starts deeprun API against PostgreSQL service.
 - Runs `npm run benchmark:reliability`.
+- Retries benchmark once automatically if the first attempt fails (transient hardening).
 - Uploads `.deeprun/reliability-report.json` and server logs as workflow artifacts.
-- PR mode uses strict thresholds:
-  - `iterations=3`
+- `Release Gate` PR/push smoke mode uses strict thresholds:
+  - `iterations=1`
   - `min_pass_rate=1.0`
+  - `strict_v1_ready=true`
 - Nightly/manual defaults:
   - `iterations=10`
   - `min_pass_rate=0.95`
@@ -589,9 +606,8 @@ GitHub Actions gate: `.github/workflows/v1-ready.yml`
 
 Triggers:
 
-- `pull_request`
-- `push` to `main`
 - manual dispatch (`workflow_dispatch`)
+- reusable `workflow_call` (used by `Release Gate`)
 
 Behavior:
 
@@ -605,6 +621,33 @@ Manual dispatch inputs:
 - `target_path` (optional)
 - `template_id` (used only when `target_path` is empty; defaults to `canonical-backend`)
 
+Release Gate (Required Merge Gate)
+
+GitHub Actions gate: `.github/workflows/release-gate.yml`
+
+Triggers:
+
+- `pull_request`
+- `push` to `main`
+- manual dispatch (`workflow_dispatch`)
+
+It orchestrates three required jobs:
+
+- `CI`
+- `V1 Ready Gate`
+- `Reliability Benchmark`
+
+It also supports an optional heavier job:
+
+- `Deployment Dry Run` (runs automatically on `push` to `main`; optional on manual dispatch via `run_deployment_dry_run=true`)
+
+Branch protection recommendation for `main`:
+
+- Require status checks: `Release Gate / CI`
+- Require status checks: `Release Gate / V1 Ready Gate`
+- Require status checks: `Release Gate / Reliability Benchmark`
+- Keep `Release Gate / Deployment Dry Run` non-required initially (heavier runtime); promote to required after stability is proven.
+
 Local equivalent (matches CI default behavior):
 
 npm run test:v1-ready
@@ -617,6 +660,36 @@ npm run check:v1-ready -- .deeprun/v1-ready-target
 Direct path validation:
 
 npm run check:v1-ready -- <target_path>
+
+Deployment Dry Run Workflow (Containerized Production Boot)
+
+GitHub Actions gate: `.github/workflows/deployment-dry-run.yml`
+
+Triggers:
+
+- nightly schedule (`0 7 * * *` UTC)
+- manual dispatch (`workflow_dispatch`)
+- reusable `workflow_call`
+
+Behavior:
+
+- Scaffolds canonical backend target by default (or validates a provided `target_path`)
+- Runs containerized deployment dry run using `check:v1-ready`
+- Verifies:
+  - Docker image build
+  - containerized migration run
+  - production-mode container boot
+  - `/health` returns success
+- Uploads `.deeprun/deployment-dry-run-report.json` and generated target (when scaffolded) as artifacts
+
+Manual dispatch inputs:
+
+- `target_path` (optional)
+- `template_id` (used only when `target_path` is empty; defaults to `canonical-backend`)
+
+Local equivalent:
+
+npm run test:deployment-dry-run
 
 CLI Commands (deeprun)
 
@@ -636,7 +709,9 @@ npm run deeprun -- continue
 npm run deeprun -- branch --engine kernel
 npm run deeprun -- fork <stepId>
 npm run deeprun -- validate
+npm run deeprun -- validate --strict-v1-ready
 npm run deeprun -- promote
+npm run deeprun -- promote --strict-v1-ready
 
 Notes:
 
@@ -645,6 +720,13 @@ Notes:
 - `bootstrap` is strict: it exits non-zero if post-bootstrap certification reports `CERTIFICATION_OK=false`.
 - If `--provider` is omitted, deeprun uses server-side default provider selection (`DEEPRUN_DEFAULT_PROVIDER` override, otherwise first configured real provider, else `mock`).
 - Default output is concise; add `--verbose` for expanded request and step details.
+- Kernel `status` reports correction-policy counters (`CORRECTION_POLICY_*`) and last-policy summary keys.
+- Kernel `logs` includes correction-policy totals and per-step policy verdict lines when present.
+- `promote` is validation-gated: deployment is blocked unless the latest project validation record has `ok=true`.
+- Run `deeprun validate --project <projectId> --run <runId>` and confirm `VALIDATION_OK=true` before `deeprun promote`.
+- `validate --strict-v1-ready` also runs full v1-ready checks (heavy + Docker) and emits `V1_READY_*` keys.
+- Set `DEEPRUN_PROMOTE_REQUIRE_V1_READY=true` to require latest `V1_READY_OK=true` before `promote`.
+- `promote --strict-v1-ready` runs a strict preflight (`validate --strict-v1-ready`) before deployment and exits non-zero when preflight fails.
 
 CLI integration test:
 

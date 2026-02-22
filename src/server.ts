@@ -16,6 +16,7 @@ import { ProviderRegistry } from "./lib/providers.js";
 import { AgentKernel } from "./agent/kernel.js";
 import { AgentRunService } from "./agent/run-service.js";
 import { AgentRunWorker } from "./agent/run-worker.js";
+import { runV1ReadinessCheck, V1ReadinessReport } from "./agent/validation/check-v1-ready.js";
 import { getTemplate, listTemplates } from "./templates/catalog.js";
 import { hashPassword, verifyPassword } from "./lib/auth.js";
 import { slugify } from "./lib/strings.js";
@@ -89,6 +90,10 @@ const createAgentRunSchema = z.object({
   goal: z.string().min(4).max(24_000),
   provider: z.string().optional(),
   model: z.string().max(100).optional()
+});
+
+const validateAgentRunSchema = z.object({
+  strictV1Ready: z.boolean().default(false)
 });
 
 const createAgentStateRunSchema = z.object({
@@ -229,6 +234,34 @@ interface BootstrapCertificationSummary {
     details?: Record<string, unknown>;
   }>;
   violations: Array<Record<string, unknown>>;
+}
+
+interface ValidationCheckResult {
+  id: string;
+  status: "pass" | "fail" | "skip";
+  message: string;
+  details?: Record<string, unknown>;
+}
+
+interface ValidationSummaryLike {
+  ok: boolean;
+  blockingCount: number;
+  warningCount: number;
+  summary: string;
+  checks: ValidationCheckResult[];
+}
+
+interface ProjectValidationSnapshot {
+  source: string;
+  runId: string | null;
+  targetPath: string | null;
+  validatedAt: string;
+  validation: ValidationSummaryLike;
+  v1Ready: {
+    ok: boolean;
+    verdict: "YES" | "NO";
+    generatedAt: string;
+  } | null;
 }
 
 class HttpError extends Error {
@@ -675,6 +708,161 @@ function extractValidationViolations(
   }
 
   return violations;
+}
+
+function extractLatestProjectValidation(project: Project): ProjectValidationSnapshot | null {
+  for (const entry of project.history) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      continue;
+    }
+
+    const metadata =
+      entry.metadata && typeof entry.metadata === "object" && !Array.isArray(entry.metadata)
+        ? (entry.metadata as Record<string, unknown>)
+        : null;
+
+    if (!metadata) {
+      continue;
+    }
+
+    const validation =
+      metadata.validation && typeof metadata.validation === "object" && !Array.isArray(metadata.validation)
+        ? (metadata.validation as Record<string, unknown>)
+        : null;
+
+    if (!validation || typeof validation.ok !== "boolean") {
+      continue;
+    }
+
+    const checks: ValidationCheckResult[] = [];
+    const rawChecks = Array.isArray(validation.checks) ? validation.checks : [];
+    for (const rawCheck of rawChecks) {
+      if (!rawCheck || typeof rawCheck !== "object" || Array.isArray(rawCheck)) {
+        continue;
+      }
+
+      const check = rawCheck as Record<string, unknown>;
+      const id = typeof check.id === "string" ? check.id.trim() : "";
+      const status = typeof check.status === "string" ? check.status.trim() : "";
+      const message = typeof check.message === "string" ? check.message.trim() : "";
+
+      if (!id || !message || (status !== "pass" && status !== "fail" && status !== "skip")) {
+        continue;
+      }
+
+      const details =
+        check.details && typeof check.details === "object" && !Array.isArray(check.details)
+          ? (check.details as Record<string, unknown>)
+          : undefined;
+
+      checks.push({
+        id,
+        status,
+        message,
+        ...(details ? { details } : {})
+      });
+    }
+
+    const blockingCount = Number(validation.blockingCount);
+    const warningCount = Number(validation.warningCount);
+    const summary = typeof validation.summary === "string" && validation.summary.trim() ? validation.summary.trim() : "";
+    const validatedAt =
+      typeof metadata.validatedAt === "string" && metadata.validatedAt.trim() ? metadata.validatedAt : entry.createdAt;
+    const source = typeof metadata.source === "string" && metadata.source.trim() ? metadata.source.trim() : "unknown";
+    const runId = typeof metadata.runId === "string" && metadata.runId.trim() ? metadata.runId.trim() : null;
+    const targetPath = typeof metadata.targetPath === "string" && metadata.targetPath.trim() ? metadata.targetPath : null;
+    const v1ReadyRaw =
+      metadata.v1Ready && typeof metadata.v1Ready === "object" && !Array.isArray(metadata.v1Ready)
+        ? (metadata.v1Ready as Record<string, unknown>)
+        : null;
+    const v1ReadyOk = typeof v1ReadyRaw?.ok === "boolean" ? v1ReadyRaw.ok : null;
+    const v1ReadyVerdict = typeof v1ReadyRaw?.verdict === "string" ? v1ReadyRaw.verdict.trim().toUpperCase() : "";
+    const v1ReadyGeneratedAt =
+      typeof v1ReadyRaw?.generatedAt === "string" && v1ReadyRaw.generatedAt.trim()
+        ? v1ReadyRaw.generatedAt
+        : validatedAt;
+
+    return {
+      source,
+      runId,
+      targetPath,
+      validatedAt,
+      validation: {
+        ok: validation.ok,
+        blockingCount: Number.isFinite(blockingCount) && blockingCount >= 0 ? Math.floor(blockingCount) : 0,
+        warningCount: Number.isFinite(warningCount) && warningCount >= 0 ? Math.floor(warningCount) : 0,
+        summary,
+        checks
+      },
+      v1Ready:
+        v1ReadyOk === null
+          ? null
+          : {
+              ok: v1ReadyOk,
+              verdict: v1ReadyVerdict === "YES" ? "YES" : "NO",
+              generatedAt: v1ReadyGeneratedAt
+            }
+    };
+  }
+
+  return null;
+}
+
+async function persistValidationHistoryEntry(input: {
+  project: Project;
+  runId: string;
+  source: "bootstrap" | "agent_validate";
+  targetPath: string;
+  validatedAt: string;
+  validation: ValidationSummaryLike;
+  v1Ready?: V1ReadinessReport | null;
+  runCommitHash: string | null | undefined;
+}): Promise<Project> {
+  const latestProject = (await store.getProject(input.project.id)) || input.project;
+  const summaryPrefix = input.validation.ok ? "Validation passed" : "Validation failed";
+  const violations = extractValidationViolations(input.validation.checks);
+
+  latestProject.updatedAt = input.validatedAt;
+  latestProject.history.unshift({
+    id: randomUUID(),
+    kind: "generate",
+    prompt: `Validation report for run ${input.runId}`,
+    summary: `${summaryPrefix}: ${input.validation.summary}`,
+    provider: "system",
+    model: "validation",
+    filesChanged: [],
+    commands: ["POST /api/projects/:projectId/agent/runs/:runId/validate"],
+    commitHash: input.runCommitHash || undefined,
+    metadata: {
+      source: input.source,
+      runId: input.runId,
+      targetPath: input.targetPath,
+      validatedAt: input.validatedAt,
+      validation: {
+        ok: input.validation.ok,
+        blockingCount: input.validation.blockingCount,
+        warningCount: input.validation.warningCount,
+        summary: input.validation.summary,
+        checks: input.validation.checks,
+        violations
+      },
+      ...(input.v1Ready
+        ? {
+            v1Ready: {
+              ok: input.v1Ready.ok,
+              verdict: input.v1Ready.verdict,
+              generatedAt: input.v1Ready.generatedAt,
+              checks: input.v1Ready.checks
+            }
+          }
+        : {})
+    },
+    createdAt: input.validatedAt
+  });
+  latestProject.history = latestProject.history.slice(0, 80);
+
+  await store.updateProject(latestProject);
+  return latestProject;
 }
 
 async function runBootstrapCertification(input: {
@@ -2003,6 +2191,7 @@ app.post("/api/projects/:projectId/agent/runs/:runId/validate", authRequired, as
     const auth = getAuth(req);
     const requestId = getRequestId(req);
     const project = await requireProjectAccess(auth.user.id, req.params.projectId);
+    const parsed = validateAgentRunSchema.parse(req.body ?? {});
 
     const result = await agentKernel.validateRunOutput({
       project,
@@ -2010,7 +2199,51 @@ app.post("/api/projects/:projectId/agent/runs/:runId/validate", authRequired, as
       requestId
     });
 
-    res.json(result);
+    const validatedAt = new Date().toISOString();
+    let v1Ready: V1ReadinessReport | null = null;
+
+    if (parsed.strictV1Ready) {
+      try {
+        v1Ready = await runV1ReadinessCheck(result.targetPath);
+      } catch (error) {
+        v1Ready = {
+          target: result.targetPath,
+          verdict: "NO",
+          ok: false,
+          checks: [
+            {
+              id: "v1_ready_execution",
+              status: "fail",
+              message: error instanceof Error ? error.message : String(error)
+            }
+          ],
+          generatedAt: new Date().toISOString()
+        };
+      }
+    }
+
+    void persistValidationHistoryEntry({
+      project,
+      runId: result.run.id,
+      source: "agent_validate",
+      targetPath: result.targetPath,
+      validatedAt,
+      validation: result.validation,
+      v1Ready,
+      runCommitHash: result.run.currentCommitHash || result.run.baseCommitHash || null
+    }).catch((error) => {
+      logWarn("agent.validate.history_persist_failed", {
+        requestId,
+        projectId: project.id,
+        runId: result.run.id,
+        ...serializeError(error)
+      });
+    });
+
+    res.json({
+      ...result,
+      ...(v1Ready ? { v1Ready } : {})
+    });
   } catch (error) {
     if (error instanceof Error && error.message === "Agent run not found.") {
       next(new HttpError(404, "Agent run not found."));
@@ -2166,6 +2399,29 @@ app.post("/api/projects/:projectId/deployments", authRequired, async (req, res, 
 
     const customDomain = sanitizeCustomDomain(parsed.customDomain);
     const containerPort = getContainerPort(parsed.containerPort);
+    const latestProject = (await store.getProject(project.id)) || project;
+    const latestValidation = extractLatestProjectValidation(latestProject);
+    const requireV1ReadyForPromote = process.env.DEEPRUN_PROMOTE_REQUIRE_V1_READY === "true";
+
+    if (!latestValidation?.validation.ok) {
+      const summary = latestValidation?.validation.summary || "No passing validation record exists for this project.";
+      const runHint = latestValidation?.runId ? ` --run ${latestValidation.runId}` : "";
+      throw new HttpError(
+        409,
+        `Project promotion blocked: ${summary} Run 'deeprun validate --project ${project.id}${runHint}' and retry promote after VALIDATION_OK=true.`
+      );
+    }
+
+    if (requireV1ReadyForPromote && latestValidation.v1Ready?.ok !== true) {
+      const runHint = latestValidation.runId ? ` --run ${latestValidation.runId}` : "";
+      const v1Summary = latestValidation.v1Ready
+        ? `Latest v1-ready verdict is ${latestValidation.v1Ready.verdict}.`
+        : "No v1-ready report exists in project history.";
+      throw new HttpError(
+        409,
+        `Project promotion blocked: ${v1Summary} Run 'deeprun validate --project ${project.id}${runHint} --strict-v1-ready' and retry promote after V1_READY_OK=true.`
+      );
+    }
 
     if (deploymentJobsByProject.has(project.id) || (await store.hasInProgressDeployment(project.id))) {
       throw new HttpError(409, "A deployment is already running for this project.");

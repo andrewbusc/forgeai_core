@@ -260,6 +260,22 @@ test("deeprun CLI supports init -> run(kernel) -> status -> validate", async () 
     assert.equal(statusKv.RUN_ID, runKv.RUN_ID);
     assert.equal(statusKv.ENGINE, "kernel");
     assert.ok(statusKv.RUN_STATUS);
+    assert.ok(statusKv.CORRECTION_ATTEMPTS !== undefined);
+    assert.ok(statusKv.CORRECTION_POLICY_ATTEMPTS !== undefined);
+    assert.ok(statusKv.CORRECTION_POLICY_PASSED !== undefined);
+    assert.ok(statusKv.CORRECTION_POLICY_FAILED !== undefined);
+
+    const logsResult = await runCli(
+      ["logs", "--engine", "kernel", "--project", runKv.PROJECT_ID, "--run", runKv.RUN_ID],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl
+      }
+    );
+
+    assert.equal(logsResult.code, 0, `logs failed: ${logsResult.stderr}\n${logsResult.stdout}`);
+    assert.match(logsResult.stdout, /KERNEL_RUN_LOGS run=/);
+    assert.match(logsResult.stdout, /correctionPolicies=/);
 
     const validateResult = await runCli(
       ["validate", "--project", runKv.PROJECT_ID, "--run", runKv.RUN_ID],
@@ -363,6 +379,228 @@ test("deeprun CLI supports backend bootstrap command", async () => {
       assert.equal(bootstrapResult.code, 2, `bootstrap should fail-fast on certification failure: ${bootstrapResult.stdout}`);
       assert.match(bootstrapResult.stderr, /bootstrap certification failed/i);
     }
+  } finally {
+    await server.stop();
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("deeprun CLI promote is blocked until validation passes", async () => {
+  const server = await startServer();
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "deeprun-cli-promote-gate-"));
+  const configPath = path.join(tmpDir, "cli.json");
+  const suffix = randomUUID().slice(0, 8);
+  const email = `cli-promote-${suffix}@example.com`;
+
+  try {
+    const initResult = await runCli(
+      [
+        "init",
+        "--api",
+        server.baseUrl,
+        "--email",
+        email,
+        "--password",
+        "Password123!",
+        "--name",
+        `CLI Promote Tester ${suffix}`,
+        "--org",
+        `CLI Promote Org ${suffix}`,
+        "--workspace",
+        `CLI Promote Workspace ${suffix}`
+      ],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl
+      }
+    );
+
+    assert.equal(initResult.code, 0, `init failed: ${initResult.stderr}`);
+
+    const runResult = await runCli(
+      [
+        "run",
+        `Build kernel run for promote ${suffix}`,
+        "--engine",
+        "kernel",
+        "--provider",
+        "mock",
+        "--project-name",
+        `CLI Promote Project ${suffix}`
+      ],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl
+      }
+    );
+
+    assert.equal(runResult.code, 0, `run failed: ${runResult.stderr}\n${runResult.stdout}`);
+    const runKv = parseKeyValueLines(runResult.stdout);
+    assert.ok(runKv.PROJECT_ID, `run output missing PROJECT_ID: ${runResult.stdout}`);
+
+    const promoteResult = await runCli(
+      ["promote", "--project", runKv.PROJECT_ID],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl
+      }
+    );
+
+    assert.equal(promoteResult.code, 1, `promote should fail without validation: ${promoteResult.stdout}`);
+    assert.match(promoteResult.stderr, /promotion blocked/i);
+    assert.match(promoteResult.stderr, /validate/i);
+  } finally {
+    await server.stop();
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("deeprun CLI promote --strict-v1-ready runs preflight and blocks deployment on v1 failure", async () => {
+  const server = await startServer();
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "deeprun-cli-promote-strict-v1-"));
+  const configPath = path.join(tmpDir, "cli.json");
+  const suffix = randomUUID().slice(0, 8);
+  const email = `cli-promote-v1-${suffix}@example.com`;
+
+  try {
+    const initResult = await runCli(
+      [
+        "init",
+        "--api",
+        server.baseUrl,
+        "--email",
+        email,
+        "--password",
+        "Password123!",
+        "--name",
+        `CLI Promote V1 Tester ${suffix}`,
+        "--org",
+        `CLI Promote V1 Org ${suffix}`,
+        "--workspace",
+        `CLI Promote V1 Workspace ${suffix}`
+      ],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl
+      }
+    );
+
+    assert.equal(initResult.code, 0, `init failed: ${initResult.stderr}`);
+
+    const runResult = await runCli(
+      [
+        "run",
+        `Build kernel run for strict promote ${suffix}`,
+        "--engine",
+        "kernel",
+        "--provider",
+        "mock",
+        "--project-name",
+        `CLI Promote V1 Project ${suffix}`
+      ],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl
+      }
+    );
+
+    assert.equal(runResult.code, 0, `run failed: ${runResult.stderr}\n${runResult.stdout}`);
+    const runKv = parseKeyValueLines(runResult.stdout);
+    assert.ok(runKv.PROJECT_ID, `run output missing PROJECT_ID: ${runResult.stdout}`);
+    assert.ok(runKv.RUN_ID, `run output missing RUN_ID: ${runResult.stdout}`);
+
+    const promoteResult = await runCli(
+      ["promote", "--project", runKv.PROJECT_ID, "--run", runKv.RUN_ID, "--strict-v1-ready"],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl,
+        V1_DOCKER_BIN: "__missing_docker_binary__"
+      }
+    );
+
+    assert.equal(promoteResult.code, 1, `strict promote should fail preflight: ${promoteResult.stdout}`);
+    assert.match(promoteResult.stderr, /strict v1-ready preflight failed/i);
+
+    const promoteKv = parseKeyValueLines(promoteResult.stdout);
+    assert.equal(promoteKv.PROMOTE_PREFLIGHT_PROJECT_ID, runKv.PROJECT_ID);
+    assert.equal(promoteKv.PROMOTE_PREFLIGHT_RUN_ID, runKv.RUN_ID);
+    assert.ok(promoteKv.PROMOTE_PREFLIGHT_VALIDATION_OK !== undefined, `missing preflight validation output: ${promoteResult.stdout}`);
+    assert.equal(promoteKv.PROMOTE_PREFLIGHT_V1_READY_OK, "false");
+  } finally {
+    await server.stop();
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("deeprun CLI validate --strict-v1-ready emits v1-ready summary keys", async () => {
+  const server = await startServer();
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "deeprun-cli-validate-v1-ready-"));
+  const configPath = path.join(tmpDir, "cli.json");
+  const suffix = randomUUID().slice(0, 8);
+  const email = `cli-validate-v1-${suffix}@example.com`;
+
+  try {
+    const initResult = await runCli(
+      [
+        "init",
+        "--api",
+        server.baseUrl,
+        "--email",
+        email,
+        "--password",
+        "Password123!",
+        "--name",
+        `CLI Validate V1 Tester ${suffix}`,
+        "--org",
+        `CLI Validate V1 Org ${suffix}`,
+        "--workspace",
+        `CLI Validate V1 Workspace ${suffix}`
+      ],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl
+      }
+    );
+
+    assert.equal(initResult.code, 0, `init failed: ${initResult.stderr}`);
+
+    const runResult = await runCli(
+      [
+        "run",
+        `Build kernel run for strict v1 validate ${suffix}`,
+        "--engine",
+        "kernel",
+        "--provider",
+        "mock",
+        "--project-name",
+        `CLI Validate V1 Project ${suffix}`
+      ],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl
+      }
+    );
+
+    assert.equal(runResult.code, 0, `run failed: ${runResult.stderr}\n${runResult.stdout}`);
+    const runKv = parseKeyValueLines(runResult.stdout);
+    assert.ok(runKv.PROJECT_ID, `run output missing PROJECT_ID: ${runResult.stdout}`);
+    assert.ok(runKv.RUN_ID, `run output missing RUN_ID: ${runResult.stdout}`);
+
+    const validateResult = await runCli(
+      ["validate", "--project", runKv.PROJECT_ID, "--run", runKv.RUN_ID, "--strict-v1-ready"],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl,
+        V1_DOCKER_BIN: "__missing_docker_binary__"
+      }
+    );
+
+    assert.equal(validateResult.code, 1, `strict v1 validate should fail when docker checks fail: ${validateResult.stdout}`);
+    const validateKv = parseKeyValueLines(validateResult.stdout);
+    assert.ok(validateKv.V1_READY_OK !== undefined, `missing V1_READY_OK: ${validateResult.stdout}`);
+    assert.ok(validateKv.V1_READY_VERDICT !== undefined, `missing V1_READY_VERDICT: ${validateResult.stdout}`);
+    assert.ok(validateKv.V1_READY_TARGET !== undefined, `missing V1_READY_TARGET: ${validateResult.stdout}`);
+    assert.ok(validateKv.V1_READY_GENERATED_AT !== undefined, `missing V1_READY_GENERATED_AT: ${validateResult.stdout}`);
   } finally {
     await server.stop();
     await rm(tmpDir, { recursive: true, force: true });
