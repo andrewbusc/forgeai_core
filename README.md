@@ -637,11 +637,16 @@ It orchestrates three required jobs:
 - `V1 Ready Gate`
 - `Reliability Benchmark`
 
+It also supports an optional heavier job:
+
+- `Deployment Dry Run` (runs automatically on `push` to `main`; optional on manual dispatch via `run_deployment_dry_run=true`)
+
 Branch protection recommendation for `main`:
 
 - Require status checks: `Release Gate / CI`
 - Require status checks: `Release Gate / V1 Ready Gate`
 - Require status checks: `Release Gate / Reliability Benchmark`
+- Keep `Release Gate / Deployment Dry Run` non-required initially (heavier runtime); promote to required after stability is proven.
 
 Local equivalent (matches CI default behavior):
 

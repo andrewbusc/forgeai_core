@@ -19,6 +19,10 @@ on:
         description: "Run strict v1-ready inside reliability smoke"
         required: false
         default: "true"
+      run_deployment_dry_run:
+        description: "Also run Deployment Dry Run job"
+        required: false
+        default: "false"
 
 permissions:
   contents: read
@@ -42,3 +46,15 @@ jobs:
       iterations: ${{ github.event.inputs.reliability_iterations || '1' }}
       min_pass_rate: ${{ github.event.inputs.reliability_min_pass_rate || '1' }}
       strict_v1_ready: ${{ github.event.inputs.reliability_strict_v1_ready || 'true' }}
+
+  deployment_dry_run:
+    name: Deployment Dry Run
+    needs:
+      - ci
+      - v1_ready
+      - reliability_smoke
+    if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.run_deployment_dry_run == 'true') }}
+    uses: ./.github/workflows/deployment-dry-run.yml
+    with:
+      target_path: ""
+      template_id: "canonical-backend"
