@@ -185,6 +185,36 @@ class ApiClient {
   }
 }
 
+function apiErrorMessage(body: unknown): string {
+  if (!body || typeof body !== "object") {
+    return "";
+  }
+
+  const candidate = (body as { error?: unknown }).error;
+  return typeof candidate === "string" ? candidate : "";
+}
+
+export function isExistingUserRegisterConflict(status: number, body: unknown): boolean {
+  if (status === 409) {
+    return true;
+  }
+
+  if (status < 500) {
+    return false;
+  }
+
+  const message = apiErrorMessage(body).toLowerCase();
+  if (!message) {
+    return false;
+  }
+
+  return (
+    message.includes("already exists") ||
+    message.includes("duplicate key") ||
+    message.includes("users_email_key")
+  );
+}
+
 function parseArgs(argv: string[]): ParsedArgs {
   const options: OptionMap = {};
 
@@ -395,6 +425,25 @@ export function summarizeReliabilityRuns(
 }
 
 async function authenticate(client: ApiClient, options: ReliabilityBenchmarkOptions): Promise<{ workspaceId: string }> {
+  const login = await client.request<AuthPayload & { error?: string }>("POST", "/api/auth/login", {
+    email: options.email,
+    password: options.password
+  });
+
+  if (login.status === 200) {
+    const workspaceId = resolveWorkspaceId(login.body);
+    if (!workspaceId) {
+      throw new Error("Login succeeded but no workspace id was returned.");
+    }
+
+    return { workspaceId };
+  }
+
+  if (login.status !== 401) {
+    const message = apiErrorMessage(login.body) || `Auth login failed with HTTP ${login.status}.`;
+    throw new Error(message);
+  }
+
   const register = await client.request<AuthPayload & { error?: string }>("POST", "/api/auth/register", {
     name: options.name,
     email: options.email,
@@ -412,22 +461,23 @@ async function authenticate(client: ApiClient, options: ReliabilityBenchmarkOpti
     return { workspaceId };
   }
 
-  if (register.status !== 409) {
-    const message = (register.body as { error?: string } | undefined)?.error || `Auth register failed with HTTP ${register.status}.`;
+  if (!isExistingUserRegisterConflict(register.status, register.body)) {
+    const message = apiErrorMessage(register.body) || `Auth register failed with HTTP ${register.status}.`;
     throw new Error(message);
   }
 
-  const login = await client.request<AuthPayload & { error?: string }>("POST", "/api/auth/login", {
+  const loginAfterRegisterConflict = await client.request<AuthPayload & { error?: string }>("POST", "/api/auth/login", {
     email: options.email,
     password: options.password
   });
 
-  if (login.status !== 200) {
-    const message = (login.body as { error?: string } | undefined)?.error || `Auth login failed with HTTP ${login.status}.`;
+  if (loginAfterRegisterConflict.status !== 200) {
+    const message =
+      apiErrorMessage(loginAfterRegisterConflict.body) || `Auth login failed with HTTP ${loginAfterRegisterConflict.status}.`;
     throw new Error(message);
   }
 
-  const workspaceId = resolveWorkspaceId(login.body);
+  const workspaceId = resolveWorkspaceId(loginAfterRegisterConflict.body);
   if (!workspaceId) {
     throw new Error("Login succeeded but no workspace id was returned.");
   }
