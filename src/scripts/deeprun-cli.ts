@@ -69,6 +69,49 @@ interface StateRunDetail {
   }>;
 }
 
+interface KernelCorrectionConstraint {
+  intent: string;
+  maxFiles: number;
+  maxTotalDiffBytes: number;
+  allowedPathPrefixes: string[];
+  guidance: string[];
+}
+
+interface KernelCorrectionClassification {
+  intent: string;
+  failedChecks: string[];
+  failureKinds: string[];
+  rationale: string;
+}
+
+interface KernelCorrectionTelemetry {
+  phase: string;
+  attempt: number;
+  failedStepId: string;
+  reason?: string;
+  summary?: string;
+  runtimeLogTail?: string;
+  classification: KernelCorrectionClassification;
+  constraint: KernelCorrectionConstraint;
+  createdAt: string;
+}
+
+interface KernelCorrectionPolicyViolation {
+  ruleId: string;
+  severity: "error" | "warning";
+  message: string;
+  details?: Record<string, unknown>;
+}
+
+interface KernelCorrectionPolicyTelemetry {
+  ok: boolean;
+  mode?: "off" | "warn" | "enforce";
+  blockingCount: number;
+  warningCount: number;
+  summary: string;
+  violations: KernelCorrectionPolicyViolation[];
+}
+
 interface KernelRunDetail {
   run: {
     id: string;
@@ -94,7 +137,34 @@ interface KernelRunDetail {
     startedAt: string;
     finishedAt: string;
     outputPayload: Record<string, unknown>;
+    correctionTelemetry?: KernelCorrectionTelemetry | null;
+    correctionPolicy?: KernelCorrectionPolicyTelemetry | null;
   }>;
+  telemetry?: {
+    corrections: Array<{
+      stepRecordId: string;
+      stepId: string;
+      stepIndex: number;
+      stepAttempt: number;
+      status: string;
+      errorMessage: string | null;
+      commitHash: string | null;
+      createdAt: string;
+      telemetry: KernelCorrectionTelemetry;
+      correctionPolicy?: KernelCorrectionPolicyTelemetry | null;
+    }>;
+    correctionPolicies: Array<{
+      stepRecordId: string;
+      stepId: string;
+      stepIndex: number;
+      stepAttempt: number;
+      status: string;
+      errorMessage: string | null;
+      commitHash: string | null;
+      createdAt: string;
+      policy: KernelCorrectionPolicyTelemetry;
+    }>;
+  };
 }
 
 interface CertificationDetail {
@@ -399,16 +469,58 @@ function commandUsage(): string {
     "  status [--engine state|kernel] [--project <projectId>] [--run <runId>] [--watch] [--timeout-ms <ms>] [--verbose]",
     "  logs [--engine state|kernel] [--project <projectId>] [--run <runId>] [--verbose]",
     "  continue [--engine state|kernel] [--project <projectId>] [--run <runId>]",
-    "  validate [--project <projectId>] [--run <runId>]",
+    "  validate [--project <projectId>] [--run <runId>] [--strict-v1-ready]",
     "  branch [--project <projectId>] [--run <runId>]",
     "  fork <stepId> [--project <projectId>] [--run <runId>]",
-    "  promote [--project <projectId>] [--custom-domain <domain>] [--container-port <port>]",
+    "  promote [--project <projectId>] [--run <runId>] [--custom-domain <domain>] [--container-port <port>] [--strict-v1-ready]",
     "",
     "Notes:",
     "  - Session state is persisted in .deeprun/cli.json (or DEEPRUN_CLI_CONFIG).",
     "  - If --provider is omitted, server-side default provider selection is used.",
     "  - Use --verbose to include request tracing and expanded step output."
   ].join("\n");
+}
+
+interface KernelRunValidationResult {
+  run: { id: string };
+  targetPath: string;
+  validation: {
+    ok: boolean;
+    blockingCount: number;
+    warningCount: number;
+    summary: string;
+    checks: Array<{
+      id: string;
+      status: "pass" | "fail" | "skip";
+      message: string;
+    }>;
+  };
+  v1Ready?: {
+    target: string;
+    verdict: "YES" | "NO";
+    ok: boolean;
+    generatedAt: string;
+    checks: Array<{
+      id: string;
+      status: "pass" | "fail" | "skip";
+      message: string;
+    }>;
+  };
+}
+
+async function runKernelValidation(input: {
+  client: ApiClient;
+  projectId: string;
+  runId: string;
+  strictV1Ready: boolean;
+}): Promise<KernelRunValidationResult> {
+  return input.client.requestOk<KernelRunValidationResult>(
+    "POST",
+    `/api/projects/${input.projectId}/agent/runs/${input.runId}/validate`,
+    {
+      strictV1Ready: input.strictV1Ready
+    }
+  );
 }
 
 function ensureConfig(config: CliConfig | undefined): CliConfig {
@@ -544,16 +656,26 @@ async function pollKernelRun(input: {
     const detail = await input.client.requestOk<KernelRunDetail>("GET", `/api/projects/${input.projectId}/agent/runs/${input.runId}`);
 
     const run = detail.run;
-    const signature = `${run.status}|${run.currentStepIndex}|${detail.steps.length}`;
+    const correctionCount = detail.telemetry?.corrections.length || 0;
+    const signature = `${run.status}|${run.currentStepIndex}|${detail.steps.length}|${correctionCount}`;
 
     if (signature !== lastSignature) {
-      process.stdout.write(`kernel status=${run.status} stepIndex=${run.currentStepIndex} steps=${detail.steps.length}\n`);
+      process.stdout.write(
+        `kernel status=${run.status} stepIndex=${run.currentStepIndex} steps=${detail.steps.length} corrections=${correctionCount}\n`
+      );
 
       if (input.verbose && detail.steps.length > 0) {
         const lastStep = detail.steps[detail.steps.length - 1];
         process.stdout.write(
           `  last-step id=${lastStep.stepId} idx=${lastStep.stepIndex} attempt=${lastStep.attempt} status=${lastStep.status} tool=${lastStep.tool}\n`
         );
+
+        const lastCorrection = correctionCount ? detail.telemetry?.corrections[correctionCount - 1] : null;
+        if (lastCorrection) {
+          process.stdout.write(
+            `  correction intent=${lastCorrection.telemetry.classification.intent} phase=${lastCorrection.telemetry.phase} step=${lastCorrection.stepId} status=${lastCorrection.status}\n`
+          );
+        }
       }
 
       lastSignature = signature;
@@ -922,6 +1044,30 @@ async function handleStatus(input: {
   process.stdout.write(`RUN_STATUS=${detail.run.status}\n`);
   process.stdout.write(`STEP_INDEX=${detail.run.currentStepIndex}\n`);
   process.stdout.write(`STEP_COUNT=${detail.steps.length}\n`);
+  const corrections = detail.telemetry?.corrections || [];
+  const correctionPolicies = detail.telemetry?.correctionPolicies || [];
+  const completedCorrections = corrections.filter((entry) => entry.status === "completed").length;
+  const failedCorrections = corrections.filter((entry) => entry.status === "failed").length;
+  const passedCorrectionPolicies = correctionPolicies.filter((entry) => entry.policy.ok).length;
+  const failedCorrectionPolicies = correctionPolicies.length - passedCorrectionPolicies;
+  process.stdout.write(`CORRECTION_ATTEMPTS=${corrections.length}\n`);
+  process.stdout.write(`CORRECTION_COMPLETED=${completedCorrections}\n`);
+  process.stdout.write(`CORRECTION_FAILED=${failedCorrections}\n`);
+  process.stdout.write(`CORRECTION_POLICY_ATTEMPTS=${correctionPolicies.length}\n`);
+  process.stdout.write(`CORRECTION_POLICY_PASSED=${passedCorrectionPolicies}\n`);
+  process.stdout.write(`CORRECTION_POLICY_FAILED=${failedCorrectionPolicies}\n`);
+  if (corrections.length > 0) {
+    const last = corrections[corrections.length - 1];
+    process.stdout.write(`LAST_CORRECTION_STEP_ID=${last.stepId}\n`);
+    process.stdout.write(`LAST_CORRECTION_PHASE=${last.telemetry.phase}\n`);
+    process.stdout.write(`LAST_CORRECTION_INTENT=${last.telemetry.classification.intent}\n`);
+  }
+  if (correctionPolicies.length > 0) {
+    const lastPolicy = correctionPolicies[correctionPolicies.length - 1];
+    process.stdout.write(`LAST_CORRECTION_POLICY_STEP_ID=${lastPolicy.stepId}\n`);
+    process.stdout.write(`LAST_CORRECTION_POLICY_OK=${String(lastPolicy.policy.ok)}\n`);
+    process.stdout.write(`LAST_CORRECTION_POLICY_SUMMARY=${lastPolicy.policy.summary}\n`);
+  }
 
   if (detail.run.errorMessage) {
     process.stdout.write(`RUN_ERROR=${detail.run.errorMessage}\n`);
@@ -976,7 +1122,11 @@ async function handleLogs(input: {
 
   const detail = await client.requestOk<KernelRunDetail>("GET", `/api/projects/${projectId}/agent/runs/${runId}`);
 
-  process.stdout.write(`KERNEL_RUN_LOGS run=${runId} status=${detail.run.status}\n`);
+  const corrections = detail.telemetry?.corrections || [];
+  const correctionPolicies = detail.telemetry?.correctionPolicies || [];
+  process.stdout.write(
+    `KERNEL_RUN_LOGS run=${runId} status=${detail.run.status} corrections=${corrections.length} correctionPolicies=${correctionPolicies.length}\n`
+  );
 
   for (const step of detail.steps) {
     const line =
@@ -985,7 +1135,28 @@ async function handleLogs(input: {
       `${step.errorMessage ? ` error=${step.errorMessage}` : ""}`;
     process.stdout.write(`${line}\n`);
 
+    if (step.correctionTelemetry) {
+      process.stdout.write(
+        `  correction phase=${step.correctionTelemetry.phase} intent=${step.correctionTelemetry.classification.intent}` +
+          ` correctionAttempt=${step.correctionTelemetry.attempt} failedStep=${step.correctionTelemetry.failedStepId}` +
+          ` files<=${step.correctionTelemetry.constraint.maxFiles} diffBytes<=${step.correctionTelemetry.constraint.maxTotalDiffBytes}\n`
+      );
+    }
+
+    if (step.correctionPolicy) {
+      process.stdout.write(
+        `  correction-policy ok=${String(step.correctionPolicy.ok)} blocking=${step.correctionPolicy.blockingCount}` +
+          ` warning=${step.correctionPolicy.warningCount} summary=${step.correctionPolicy.summary}\n`
+      );
+    }
+
     if (input.verbose) {
+      if (step.correctionTelemetry) {
+        process.stdout.write(`${JSON.stringify(step.correctionTelemetry, null, 2)}\n`);
+      }
+      if (step.correctionPolicy) {
+        process.stdout.write(`${JSON.stringify(step.correctionPolicy, null, 2)}\n`);
+      }
       process.stdout.write(`${JSON.stringify(step.outputPayload || {}, null, 2)}\n`);
     }
   }
@@ -1072,6 +1243,7 @@ async function handleValidate(input: {
   options: Record<string, string | boolean>;
   verbose: boolean;
 }): Promise<number> {
+  const strictV1Ready = optionFlag(input.options, "strict-v1-ready");
   const { projectId, runId } = resolveProjectAndRunId({
     config: input.config,
     options: input.options,
@@ -1080,22 +1252,12 @@ async function handleValidate(input: {
 
   const jar = new CookieJar(input.config.cookies);
   const client = new ApiClient(input.config.apiBaseUrl, jar, input.verbose);
-
-  const result = await client.requestOk<{
-    run: { id: string };
-    targetPath: string;
-    validation: {
-      ok: boolean;
-      blockingCount: number;
-      warningCount: number;
-      summary: string;
-      checks: Array<{
-        id: string;
-        status: "pass" | "fail" | "skip";
-        message: string;
-      }>;
-    };
-  }>("POST", `/api/projects/${projectId}/agent/runs/${runId}/validate`);
+  const result = await runKernelValidation({
+    client,
+    projectId,
+    runId,
+    strictV1Ready
+  });
 
   await writeConfig(input.configPath, {
     ...input.config,
@@ -1110,14 +1272,33 @@ async function handleValidate(input: {
   process.stdout.write(`BLOCKING_COUNT=${result.validation.blockingCount}\n`);
   process.stdout.write(`WARNING_COUNT=${result.validation.warningCount}\n`);
   process.stdout.write(`VALIDATION_SUMMARY=${result.validation.summary}\n`);
+  if (result.v1Ready) {
+    process.stdout.write(`V1_READY_OK=${String(result.v1Ready.ok)}\n`);
+    process.stdout.write(`V1_READY_VERDICT=${result.v1Ready.verdict}\n`);
+    process.stdout.write(`V1_READY_TARGET=${result.v1Ready.target}\n`);
+    process.stdout.write(`V1_READY_GENERATED_AT=${result.v1Ready.generatedAt}\n`);
+  }
 
   if (input.verbose) {
     for (const check of result.validation.checks) {
       process.stdout.write(`check id=${check.id} status=${check.status} message=${check.message}\n`);
     }
+    if (result.v1Ready) {
+      for (const check of result.v1Ready.checks) {
+        process.stdout.write(`v1-ready check id=${check.id} status=${check.status} message=${check.message}\n`);
+      }
+    }
   }
 
-  return result.validation.ok ? 0 : 1;
+  if (!result.validation.ok) {
+    return 1;
+  }
+
+  if (strictV1Ready) {
+    return result.v1Ready?.ok ? 0 : 1;
+  }
+
+  return 0;
 }
 
 async function handleBranch(input: {
@@ -1206,9 +1387,51 @@ async function handlePromote(input: {
 
   const customDomain = optionString(input.options, "custom-domain");
   const containerPort = optionInt(input.options, "container-port");
+  const strictV1Ready = optionFlag(input.options, "strict-v1-ready");
+  const runId = optionString(input.options, "run") || input.config.lastKernelRunId;
 
   const jar = new CookieJar(input.config.cookies);
   const client = new ApiClient(input.config.apiBaseUrl, jar, input.verbose);
+
+  if (strictV1Ready) {
+    if (!runId) {
+      throw new Error("promote --strict-v1-ready requires --run <runId> or a previously used kernel run.");
+    }
+
+    const validation = await runKernelValidation({
+      client,
+      projectId,
+      runId,
+      strictV1Ready: true
+    });
+
+    process.stdout.write(`PROMOTE_PREFLIGHT_PROJECT_ID=${projectId}\n`);
+    process.stdout.write(`PROMOTE_PREFLIGHT_RUN_ID=${runId}\n`);
+    process.stdout.write(`PROMOTE_PREFLIGHT_VALIDATION_OK=${String(validation.validation.ok)}\n`);
+    process.stdout.write(`PROMOTE_PREFLIGHT_BLOCKING_COUNT=${validation.validation.blockingCount}\n`);
+    process.stdout.write(`PROMOTE_PREFLIGHT_WARNING_COUNT=${validation.validation.warningCount}\n`);
+    process.stdout.write(`PROMOTE_PREFLIGHT_VALIDATION_SUMMARY=${validation.validation.summary}\n`);
+    process.stdout.write(`PROMOTE_PREFLIGHT_V1_READY_OK=${String(validation.v1Ready?.ok || false)}\n`);
+    process.stdout.write(`PROMOTE_PREFLIGHT_V1_READY_VERDICT=${validation.v1Ready?.verdict || "NO"}\n`);
+
+    if (input.verbose) {
+      for (const check of validation.validation.checks) {
+        process.stdout.write(`preflight check id=${check.id} status=${check.status} message=${check.message}\n`);
+      }
+      if (validation.v1Ready) {
+        for (const check of validation.v1Ready.checks) {
+          process.stdout.write(`preflight v1-ready check id=${check.id} status=${check.status} message=${check.message}\n`);
+        }
+      }
+    }
+
+    if (!validation.validation.ok || !validation.v1Ready?.ok) {
+      process.stderr.write(
+        `strict v1-ready preflight failed. Run 'deeprun validate --project ${projectId} --run ${runId} --strict-v1-ready' and resolve blockers before promote.\n`
+      );
+      return 1;
+    }
+  }
 
   const result = await client.requestOk<{
     deployment: {
@@ -1226,7 +1449,8 @@ async function handlePromote(input: {
   await writeConfig(input.configPath, {
     ...input.config,
     cookies: jar.toObject(),
-    lastProjectId: projectId
+    lastProjectId: projectId,
+    ...(runId ? { lastKernelRunId: runId } : {})
   });
 
   process.stdout.write(`PROJECT_ID=${projectId}\n`);

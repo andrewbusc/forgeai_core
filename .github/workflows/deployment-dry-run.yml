@@ -1,10 +1,10 @@
-name: V1 Ready Gate
+name: Deployment Dry Run
 
 on:
   workflow_call:
     inputs:
       target_path:
-        description: "Project path to validate"
+        description: "Project path to validate (optional; defaults to canonical scaffold)"
         required: false
         type: string
         default: ""
@@ -13,10 +13,12 @@ on:
         required: false
         type: string
         default: "canonical-backend"
+  schedule:
+    - cron: "0 7 * * *"
   workflow_dispatch:
     inputs:
       target_path:
-        description: "Project path to validate"
+        description: "Project path to validate (optional; defaults to canonical scaffold)"
         required: false
         default: ""
       template_id:
@@ -28,7 +30,7 @@ permissions:
   contents: read
 
 jobs:
-  v1_ready:
+  deployment_dry_run:
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
@@ -53,8 +55,8 @@ jobs:
       NODE_ENV: test
       V1_DOCKER_BIN: docker
       V1_DOCKER_RUN_MIGRATION: "true"
-      V1_TARGET_INPUT: ${{ inputs.target_path || github.event.inputs.target_path }}
-      V1_TEMPLATE_INPUT: ${{ inputs.template_id || github.event.inputs.template_id || 'canonical-backend' }}
+      DRY_RUN_TARGET_INPUT: ${{ inputs.target_path || github.event.inputs.target_path }}
+      DRY_RUN_TEMPLATE_INPUT: ${{ inputs.template_id || github.event.inputs.template_id || 'canonical-backend' }}
 
     steps:
       - name: Checkout
@@ -69,34 +71,35 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Resolve v1 readiness target
+      - name: Resolve deployment dry-run target
         id: target
         run: |
           mkdir -p .deeprun
-          target_input="${V1_TARGET_INPUT:-}"
-          template_input="${V1_TEMPLATE_INPUT:-canonical-backend}"
+          target_input="${DRY_RUN_TARGET_INPUT:-}"
+          template_input="${DRY_RUN_TEMPLATE_INPUT:-canonical-backend}"
 
           if [ -n "${target_input}" ]; then
             target_path="${target_input}"
             echo "Using provided target path: ${target_path}"
           else
-            target_path="$(npm run --silent prepare:v1-ready-target -- --output .deeprun/v1-ready-target --template "${template_input}")"
+            target_path="$(npm run --silent prepare:v1-ready-target -- --output .deeprun/deployment-dry-run-target --template "${template_input}")"
             echo "Scaffolded '${template_input}' target at: ${target_path}"
           fi
 
           echo "target_path=${target_path}" >> "${GITHUB_OUTPUT}"
 
-      - name: Run v1 readiness gate
+      - name: Run deployment dry-run (docker build + migration + prod boot health)
         run: |
           mkdir -p .deeprun
           set -o pipefail
-          npm run check:v1-ready -- "${{ steps.target.outputs.target_path }}" | tee .deeprun/v1-ready-report.json
+          npm run check:v1-ready -- "${{ steps.target.outputs.target_path }}" | tee .deeprun/deployment-dry-run-report.json
 
-      - name: Upload v1 readiness artifacts
+      - name: Upload deployment dry-run artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: v1-ready-${{ github.run_id }}-${{ github.run_attempt }}
+          name: deployment-dry-run-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: warn
           path: |
-            .deeprun/v1-ready-report.json
+            .deeprun/deployment-dry-run-report.json
+            .deeprun/deployment-dry-run-target

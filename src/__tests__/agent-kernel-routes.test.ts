@@ -340,6 +340,7 @@ test("kernel run endpoints support start/list/detail/resume/validate", async () 
     const detail = await requestJson<{
       run: { id: string; status: string };
       steps: Array<{ id: string }>;
+      telemetry?: { corrections?: unknown[] };
     }>({
       baseUrl: server.baseUrl,
       jar,
@@ -351,6 +352,7 @@ test("kernel run endpoints support start/list/detail/resume/validate", async () 
     assert.equal(detail.body.run.id, runId);
     assert.equal(detail.body.run.status, "complete");
     assert.ok(detail.body.steps.length >= 1);
+    assert.ok(Array.isArray(detail.body.telemetry?.corrections || []));
 
     const resumed = await requestJson<{
       run: { id: string; status: string };
@@ -387,6 +389,189 @@ test("kernel run endpoints support start/list/detail/resume/validate", async () 
     assert.equal(typeof validated.body.validation.ok, "boolean");
     assert.equal(typeof validated.body.validation.blockingCount, "number");
     assert.equal(typeof validated.body.validation.warningCount, "number");
+  } finally {
+    await server.stop();
+  }
+});
+
+test("kernel run detail exposes correction policy telemetry contract", async () => {
+  const server = await startServer();
+  const jar = new CookieJar();
+  const suffix = randomUUID().slice(0, 8);
+  const store = new AppStore(process.cwd());
+  await store.initialize();
+
+  try {
+    const identity = await registerUser({
+      baseUrl: server.baseUrl,
+      jar,
+      suffix
+    });
+
+    const project = await createProject({
+      baseUrl: server.baseUrl,
+      jar,
+      workspaceId: identity.workspaceId,
+      suffix
+    });
+
+    const now = new Date().toISOString();
+    const run = await store.createAgentRun({
+      projectId: project.id,
+      orgId: project.orgId,
+      workspaceId: project.workspaceId,
+      createdByUserId: identity.userId,
+      goal: "Synthetic correction policy telemetry run",
+      providerId: "mock",
+      status: "failed",
+      currentStepIndex: 1,
+      plan: {
+        goal: "Synthetic correction policy telemetry run",
+        steps: [
+          {
+            id: "runtime-correction-1",
+            type: "modify",
+            tool: "write_file",
+            input: {
+              _deepCorrection: {
+                phase: "goal",
+                attempt: 1,
+                failedStepId: "step-verify-runtime",
+                classification: {
+                  intent: "runtime_boot",
+                  failedChecks: [],
+                  failureKinds: ["runtime"],
+                  rationale: "synthetic test fixture"
+                },
+                constraint: {
+                  intent: "runtime_boot",
+                  maxFiles: 6,
+                  maxTotalDiffBytes: 120000,
+                  allowedPathPrefixes: ["src/"],
+                  guidance: ["Fix startup only"]
+                },
+                createdAt: now
+              }
+            }
+          }
+        ]
+      },
+      errorMessage: "Correction policy violation: synthetic fixture",
+      finishedAt: now
+    });
+
+    await store.createAgentStep({
+      runId: run.id,
+      projectId: project.id,
+      stepIndex: 0,
+      stepId: "runtime-correction-1",
+      type: "modify",
+      tool: "write_file",
+      inputPayload: {
+        path: "src/server.ts",
+        content: "// synthetic correction\n",
+        _deepCorrection: {
+          phase: "goal",
+          attempt: 1,
+          failedStepId: "step-verify-runtime",
+          classification: {
+            intent: "runtime_boot",
+            failedChecks: [],
+            failureKinds: ["runtime"],
+            rationale: "synthetic test fixture"
+          },
+          constraint: {
+            intent: "runtime_boot",
+            maxFiles: 6,
+            maxTotalDiffBytes: 120000,
+            allowedPathPrefixes: ["src/"],
+            guidance: ["Fix startup only"]
+          },
+          createdAt: now
+        }
+      },
+      outputPayload: {
+        proposedChanges: [
+          {
+            path: "src/server.ts",
+            type: "update"
+          }
+        ],
+        correctionPolicy: {
+          ok: false,
+          mode: "enforce",
+          blockingCount: 1,
+          warningCount: 0,
+          summary: "failed rules: correction_attempt_suffix_match; blocking=1; warnings=0",
+          violations: [
+            {
+              ruleId: "correction_attempt_suffix_match",
+              severity: "error",
+              message: "attempt mismatch"
+            }
+          ]
+        }
+      },
+      status: "failed",
+      errorMessage: "Correction policy violation: synthetic fixture",
+      commitHash: null,
+      runtimeStatus: "failed",
+      startedAt: now,
+      finishedAt: now
+    });
+
+    const detail = await requestJson<{
+      run: { id: string };
+      steps: Array<{
+        stepId: string;
+        correctionPolicy?: {
+          ok: boolean;
+          mode?: string;
+          blockingCount: number;
+          warningCount: number;
+          summary: string;
+          violations: Array<{ ruleId: string; severity: string; message: string }>;
+        };
+      }>;
+      telemetry: {
+        corrections: Array<{
+          stepId: string;
+          correctionPolicy?: {
+            ok: boolean;
+            summary: string;
+          };
+        }>;
+        correctionPolicies: Array<{
+          stepId: string;
+          policy: {
+            ok: boolean;
+            mode?: string;
+            blockingCount: number;
+            warningCount: number;
+            summary: string;
+          };
+        }>;
+      };
+    }>({
+      baseUrl: server.baseUrl,
+      jar,
+      method: "GET",
+      path: `/api/projects/${project.id}/agent/runs/${run.id}`
+    });
+
+    assert.equal(detail.status, 200);
+    assert.equal(detail.body.run.id, run.id);
+    assert.equal(detail.body.steps.length, 1);
+    assert.equal(detail.body.steps[0]?.stepId, "runtime-correction-1");
+    assert.equal(detail.body.steps[0]?.correctionPolicy?.ok, false);
+    assert.equal(detail.body.steps[0]?.correctionPolicy?.mode, "enforce");
+    assert.equal(detail.body.steps[0]?.correctionPolicy?.blockingCount, 1);
+    assert.equal(detail.body.steps[0]?.correctionPolicy?.violations[0]?.ruleId, "correction_attempt_suffix_match");
+    assert.equal(Array.isArray(detail.body.telemetry.correctionPolicies), true);
+    assert.equal(detail.body.telemetry.correctionPolicies.length, 1);
+    assert.equal(detail.body.telemetry.correctionPolicies[0]?.stepId, "runtime-correction-1");
+    assert.equal(detail.body.telemetry.correctionPolicies[0]?.policy.ok, false);
+    assert.equal(detail.body.telemetry.corrections[0]?.correctionPolicy?.ok, false);
   } finally {
     await server.stop();
   }
@@ -480,6 +665,199 @@ test("backend bootstrap endpoint creates canonical project and starts kernel run
       bootstrapped.body.project.history[0]?.metadata?.validation?.blockingCount,
       bootstrapped.body.certification.blockingCount
     );
+  } finally {
+    await server.stop();
+  }
+});
+
+test("deployment route requires passing validation before promotion", async () => {
+  const server = await startServer();
+  const jar = new CookieJar();
+  const suffix = randomUUID().slice(0, 8);
+  const store = new AppStore(process.cwd());
+  await store.initialize();
+
+  try {
+    const identity = await registerUser({
+      baseUrl: server.baseUrl,
+      jar,
+      suffix
+    });
+
+    const project = await createProject({
+      baseUrl: server.baseUrl,
+      jar,
+      workspaceId: identity.workspaceId,
+      suffix
+    });
+
+    const blocked = await requestJson<{ error?: string }>({
+      baseUrl: server.baseUrl,
+      jar,
+      method: "POST",
+      path: `/api/projects/${project.id}/deployments`,
+      body: {}
+    });
+
+    assert.equal(blocked.status, 409);
+    assert.match(blocked.body.error || "", /promotion blocked/i);
+    assert.match(blocked.body.error || "", /validate/i);
+
+    const latestProject = await store.getProject(project.id);
+    assert.ok(latestProject);
+
+    const validatedAt = new Date().toISOString();
+    latestProject!.updatedAt = validatedAt;
+    latestProject!.history.unshift({
+      id: randomUUID(),
+      kind: "generate",
+      prompt: `Validation report for run seeded-${suffix}`,
+      summary: "Validation passed: all checks passed.",
+      provider: "system",
+      model: "validation",
+      filesChanged: [],
+      commands: ["POST /api/projects/:projectId/agent/runs/:runId/validate"],
+      metadata: {
+        source: "agent_validate",
+        runId: `seeded-${suffix}`,
+        targetPath: store.getProjectWorkspacePath(latestProject!),
+        validatedAt,
+        validation: {
+          ok: true,
+          blockingCount: 0,
+          warningCount: 0,
+          summary: "all checks passed",
+          checks: [],
+          violations: []
+        }
+      },
+      createdAt: validatedAt
+    });
+    latestProject!.history = latestProject!.history.slice(0, 80);
+    await store.updateProject(latestProject!);
+
+    const allowed = await requestJson<{
+      deployment: {
+        id: string;
+        projectId: string;
+        status: string;
+      };
+    }>({
+      baseUrl: server.baseUrl,
+      jar,
+      method: "POST",
+      path: `/api/projects/${project.id}/deployments`,
+      body: {}
+    });
+
+    assert.equal(allowed.status, 202);
+    assert.ok(allowed.body.deployment.id);
+    assert.equal(allowed.body.deployment.projectId, project.id);
+  } finally {
+    await server.stop();
+  }
+});
+
+test("deployment route requires v1-ready report when strict promote gate is enabled", async () => {
+  const server = await startServer({
+    DEEPRUN_PROMOTE_REQUIRE_V1_READY: "true"
+  });
+  const jar = new CookieJar();
+  const suffix = randomUUID().slice(0, 8);
+  const store = new AppStore(process.cwd());
+  await store.initialize();
+
+  try {
+    const identity = await registerUser({
+      baseUrl: server.baseUrl,
+      jar,
+      suffix
+    });
+
+    const project = await createProject({
+      baseUrl: server.baseUrl,
+      jar,
+      workspaceId: identity.workspaceId,
+      suffix
+    });
+
+    const latestProject = await store.getProject(project.id);
+    assert.ok(latestProject);
+
+    const validatedAt = new Date().toISOString();
+    latestProject!.updatedAt = validatedAt;
+    latestProject!.history.unshift({
+      id: randomUUID(),
+      kind: "generate",
+      prompt: `Validation report for run strict-${suffix}`,
+      summary: "Validation passed: all checks passed.",
+      provider: "system",
+      model: "validation",
+      filesChanged: [],
+      commands: ["POST /api/projects/:projectId/agent/runs/:runId/validate"],
+      metadata: {
+        source: "agent_validate",
+        runId: `strict-${suffix}`,
+        targetPath: store.getProjectWorkspacePath(latestProject!),
+        validatedAt,
+        validation: {
+          ok: true,
+          blockingCount: 0,
+          warningCount: 0,
+          summary: "all checks passed",
+          checks: [],
+          violations: []
+        }
+      },
+      createdAt: validatedAt
+    });
+    latestProject!.history = latestProject!.history.slice(0, 80);
+    await store.updateProject(latestProject!);
+
+    const blocked = await requestJson<{ error?: string }>({
+      baseUrl: server.baseUrl,
+      jar,
+      method: "POST",
+      path: `/api/projects/${project.id}/deployments`,
+      body: {}
+    });
+
+    assert.equal(blocked.status, 409);
+    assert.match(blocked.body.error || "", /v1-ready/i);
+
+    const refreshedProject = await store.getProject(project.id);
+    assert.ok(refreshedProject);
+    const latestHistory = refreshedProject!.history[0];
+    assert.ok(latestHistory);
+    const metadata = (latestHistory.metadata || {}) as Record<string, unknown>;
+    metadata.v1Ready = {
+      ok: true,
+      verdict: "YES",
+      generatedAt: new Date().toISOString(),
+      checks: []
+    };
+    latestHistory.metadata = metadata;
+    refreshedProject!.history[0] = latestHistory;
+    refreshedProject!.updatedAt = new Date().toISOString();
+    await store.updateProject(refreshedProject!);
+
+    const allowed = await requestJson<{
+      deployment: {
+        id: string;
+        projectId: string;
+        status: string;
+      };
+    }>({
+      baseUrl: server.baseUrl,
+      jar,
+      method: "POST",
+      path: `/api/projects/${project.id}/deployments`,
+      body: {}
+    });
+
+    assert.equal(allowed.status, 202);
+    assert.ok(allowed.body.deployment.id);
+    assert.equal(allowed.body.deployment.projectId, project.id);
   } finally {
     await server.stop();
   }

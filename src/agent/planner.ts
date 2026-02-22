@@ -2,6 +2,7 @@ import { collectFiles } from "../lib/fs-utils.js";
 import {
   AgentPlan,
   AgentStep,
+  PlannerCorrectionConstraint,
   PlannerMemoryContext,
   agentPlanSchema,
   agentStepSchema,
@@ -141,6 +142,18 @@ function buildFailureReportBlock(input: PlannerRuntimeCorrectionInput["failureRe
   }
 }
 
+function buildCorrectionConstraintBlock(input: PlannerCorrectionConstraint | undefined): string {
+  if (!input) {
+    return "No explicit correction constraint provided.";
+  }
+
+  try {
+    return JSON.stringify(input, null, 2);
+  } catch {
+    return "Correction constraint present but could not be serialized.";
+  }
+}
+
 export class AgentPlanner {
   private async requestPlannerJson(input: {
     providerId: string;
@@ -259,17 +272,21 @@ export class AgentPlanner {
       "- Prefer apply_patch when possible over write_file.",
       "- Use project memory context when choosing fixes.",
       "- Prefer structured failure diagnostics over raw logs when both are provided.",
+      "- Respect correction constraint limits exactly (allowedPathPrefixes, maxFiles, maxTotalDiffBytes, intent guidance).",
       "- Do not emit analyze/verify tools.",
       "If you cannot produce a valid correction step, return {}."
     ].join("\n");
 
     const memoryBlock = buildMemoryContextBlock(input.memory);
     const failureReportBlock = buildFailureReportBlock(input.failureReport);
+    const constraintBlock = buildCorrectionConstraintBlock(input.correctionConstraint);
     const userPrompt = [
       `Goal: ${input.goal}`,
       `Project: ${input.project.name}`,
       `Correction attempt: ${input.attempt}`,
       `Failed verify step id: ${input.failedStepId}`,
+      "Correction constraint:",
+      constraintBlock,
       "Structured failure report:",
       failureReportBlock,
       "Recent runtime logs (tail):",

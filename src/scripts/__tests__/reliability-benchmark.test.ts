@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  isExistingUserRegisterConflict,
   parseReliabilityBenchmarkOptions,
   summarizeReliabilityRuns,
   type ReliabilityBenchmarkOptions,
@@ -101,4 +102,11 @@ test("summarizeReliabilityRuns leaves thresholdMet null when no threshold is set
   });
 
   assert.equal(report.thresholdMet, null);
+});
+
+test("isExistingUserRegisterConflict accepts duplicate-user conflict and duplicate-key fallback", () => {
+  assert.equal(isExistingUserRegisterConflict(409, { error: "User already exists." }), true);
+  assert.equal(isExistingUserRegisterConflict(500, { error: 'duplicate key value violates unique constraint "users_email_key"' }), true);
+  assert.equal(isExistingUserRegisterConflict(500, { error: "internal error" }), false);
+  assert.equal(isExistingUserRegisterConflict(401, { error: "unauthorized" }), false);
 });

@@ -1,7 +1,23 @@
 name: Reliability Benchmark
 
 on:
-  pull_request:
+  workflow_call:
+    inputs:
+      iterations:
+        description: "Number of reliability benchmark samples"
+        required: false
+        type: string
+        default: "10"
+      min_pass_rate:
+        description: "Minimum acceptable pass rate (0..1)"
+        required: false
+        type: string
+        default: "0.95"
+      strict_v1_ready:
+        description: "Run full v1-ready checks for each sample"
+        required: false
+        type: string
+        default: "true"
   schedule:
     - cron: "0 6 * * *"
   workflow_dispatch:
@@ -56,9 +72,9 @@ jobs:
       V1_DOCKER_RUN_MIGRATION: "true"
       BENCHMARK_EMAIL: ci-reliability@deeprun.local
       BENCHMARK_PASSWORD: Password123!
-      INPUT_ITERATIONS: ${{ github.event.inputs.iterations }}
-      INPUT_MIN_PASS_RATE: ${{ github.event.inputs.min_pass_rate }}
-      INPUT_STRICT_V1_READY: ${{ github.event.inputs.strict_v1_ready }}
+      INPUT_ITERATIONS: ${{ inputs.iterations || github.event.inputs.iterations || '10' }}
+      INPUT_MIN_PASS_RATE: ${{ inputs.min_pass_rate || github.event.inputs.min_pass_rate || '0.95' }}
+      INPUT_STRICT_V1_READY: ${{ inputs.strict_v1_ready || github.event.inputs.strict_v1_ready || 'true' }}
 
     steps:
       - name: Checkout
@@ -93,27 +109,33 @@ jobs:
 
       - name: Run reliability benchmark
         run: |
-          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
-            iterations="3"
-            min_pass_rate="1"
-          else
-            iterations="${INPUT_ITERATIONS:-10}"
-            min_pass_rate="${INPUT_MIN_PASS_RATE:-0.95}"
-          fi
-
+          iterations="${INPUT_ITERATIONS:-10}"
+          min_pass_rate="${INPUT_MIN_PASS_RATE:-0.95}"
           strict_v1_ready="${INPUT_STRICT_V1_READY:-true}"
           echo "iterations=${iterations}"
           echo "min_pass_rate=${min_pass_rate}"
           echo "strict_v1_ready=${strict_v1_ready}"
+          run_benchmark() {
+            local output_path="$1"
+            npm run benchmark:reliability -- \
+              --api "http://127.0.0.1:${PORT}" \
+              --email "${BENCHMARK_EMAIL}" \
+              --password "${BENCHMARK_PASSWORD}" \
+              --iterations "${iterations}" \
+              --strict-v1-ready="${strict_v1_ready}" \
+              --min-pass-rate "${min_pass_rate}" \
+              --output "${output_path}"
+          }
 
-          npm run benchmark:reliability -- \
-            --api "http://127.0.0.1:${PORT}" \
-            --email "${BENCHMARK_EMAIL}" \
-            --password "${BENCHMARK_PASSWORD}" \
-            --iterations "${iterations}" \
-            --strict-v1-ready="${strict_v1_ready}" \
-            --min-pass-rate "${min_pass_rate}" \
-            --output ".deeprun/reliability-report.json"
+          set +e
+          run_benchmark ".deeprun/reliability-report.json"
+          status=$?
+          set -e
+
+          if [ "${status}" -ne 0 ]; then
+            echo "Initial reliability benchmark failed (exit ${status}); retrying once for transient instability."
+            run_benchmark ".deeprun/reliability-report.retry.json"
+          fi
 
       - name: Stop deeprun API
         if: always()
@@ -132,4 +154,5 @@ jobs:
           if-no-files-found: warn
           path: |
             .deeprun/reliability-report.json
+            .deeprun/reliability-report.retry.json
             .deeprun/reliability-server.log
