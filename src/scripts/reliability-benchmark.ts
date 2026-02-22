@@ -215,6 +215,33 @@ export function isExistingUserRegisterConflict(status: number, body: unknown): b
   );
 }
 
+export function buildIterationScopedMigrationDatabaseUrl(
+  baseUrl: string | undefined,
+  iteration: number,
+  uniqueToken: string = randomUUID()
+): string | undefined {
+  const raw = (baseUrl || "").trim();
+  if (!raw) {
+    return undefined;
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return raw;
+  }
+
+  if (parsed.protocol !== "postgres:" && parsed.protocol !== "postgresql:") {
+    return raw;
+  }
+
+  const token = uniqueToken.replace(/[^a-zA-Z0-9]/g, "").toLowerCase().slice(0, 16) || "bench";
+  const schemaName = `deeprun_bench_${iteration}_${token}`.slice(0, 63);
+  parsed.searchParams.set("schema", schemaName);
+  return parsed.toString();
+}
+
 function parseArgs(argv: string[]): ParsedArgs {
   const options: OptionMap = {};
 
@@ -551,15 +578,34 @@ async function runSingleIteration(
       if (!targetPath) {
         failureReason = failureReason || "Bootstrap response did not include certification targetPath.";
       } else {
-        const v1Report = await runV1ReadinessCheck(targetPath);
-        v1Ready = {
-          ok: v1Report.ok,
-          verdict: v1Report.verdict,
-          generatedAt: v1Report.generatedAt
-        };
+        const previousV1DockerMigrationDatabaseUrl = process.env.V1_DOCKER_MIGRATION_DATABASE_URL;
+        const iterationScopedMigrationDatabaseUrl = buildIterationScopedMigrationDatabaseUrl(
+          previousV1DockerMigrationDatabaseUrl || process.env.DATABASE_URL,
+          index
+        );
 
-        if (!v1Report.ok) {
-          failureReason = failureReason || "Full v1-ready check failed.";
+        try {
+          if (iterationScopedMigrationDatabaseUrl) {
+            // Prevent generated-backend migration dry-run from colliding with the control-plane API DB schema.
+            process.env.V1_DOCKER_MIGRATION_DATABASE_URL = iterationScopedMigrationDatabaseUrl;
+          }
+
+          const v1Report = await runV1ReadinessCheck(targetPath);
+          v1Ready = {
+            ok: v1Report.ok,
+            verdict: v1Report.verdict,
+            generatedAt: v1Report.generatedAt
+          };
+
+          if (!v1Report.ok) {
+            failureReason = failureReason || "Full v1-ready check failed.";
+          }
+        } finally {
+          if (previousV1DockerMigrationDatabaseUrl === undefined) {
+            delete process.env.V1_DOCKER_MIGRATION_DATABASE_URL;
+          } else {
+            process.env.V1_DOCKER_MIGRATION_DATABASE_URL = previousV1DockerMigrationDatabaseUrl;
+          }
         }
       }
     }

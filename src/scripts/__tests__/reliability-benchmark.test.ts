@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  buildIterationScopedMigrationDatabaseUrl,
   isExistingUserRegisterConflict,
   parseReliabilityBenchmarkOptions,
   summarizeReliabilityRuns,
@@ -109,4 +110,17 @@ test("isExistingUserRegisterConflict accepts duplicate-user conflict and duplica
   assert.equal(isExistingUserRegisterConflict(500, { error: 'duplicate key value violates unique constraint "users_email_key"' }), true);
   assert.equal(isExistingUserRegisterConflict(500, { error: "internal error" }), false);
   assert.equal(isExistingUserRegisterConflict(401, { error: "unauthorized" }), false);
+});
+
+test("buildIterationScopedMigrationDatabaseUrl isolates postgres schema per iteration", () => {
+  const base =
+    "postgresql://postgres:postgres@127.0.0.1:5432/deeprun_test?schema=public&connection_limit=1";
+  const scoped = buildIterationScopedMigrationDatabaseUrl(base, 3, "abc-123");
+
+  assert.ok(scoped);
+  const parsed = new URL(scoped as string);
+  assert.equal(parsed.protocol, "postgresql:");
+  assert.equal(parsed.pathname, "/deeprun_test");
+  assert.equal(parsed.searchParams.get("connection_limit"), "1");
+  assert.equal(parsed.searchParams.get("schema"), "deeprun_bench_3_abc123");
 });
