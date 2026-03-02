@@ -29,6 +29,11 @@ export const architectureContractV1 = {
             enabled: true,
             severity: "error"
         },
+        pathAliasConfig: {
+            id: "IMPORT.PATH_ALIAS_CONFIG",
+            enabled: true,
+            severity: "error"
+        },
         nonRelativeImport: {
             id: "IMPORT.NON_RELATIVE",
             enabled: true,

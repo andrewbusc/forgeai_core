@@ -2,6 +2,8 @@ import { GraphBuilder } from "./graph-builder.js";
 import { runStructuralValidation } from "./structural-validator.js";
 import { runAstValidation } from "./ast-validator.js";
 import { runSecurityBaselineValidation } from "./security-validator.js";
+import { runModuleTestContractValidation } from "./test-contract-validator.js";
+import { sortValidationViolations } from "./violation-utils.js";
 function toValidationPassResult(violations) {
     let blockingCount = 0;
     let warningCount = 0;
@@ -25,5 +27,13 @@ export async function runLightProjectValidation(projectRoot) {
     const structuralViolations = await runStructuralValidation(projectRoot);
     const astViolations = await runAstValidation(projectRoot);
     const securityViolations = await runSecurityBaselineValidation(projectRoot);
-    return toValidationPassResult([...structuralViolations, ...graph.violations, ...astViolations, ...securityViolations]);
+    const testContractViolations = await runModuleTestContractValidation(projectRoot);
+    const merged = sortValidationViolations([
+        ...structuralViolations,
+        ...graph.violations,
+        ...astViolations,
+        ...securityViolations,
+        ...testContractViolations
+    ]);
+    return toValidationPassResult(merged);
 }

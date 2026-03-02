@@ -1,4 +1,5 @@
 export type ProjectTemplateId = "canonical-backend" | "saas-web-app" | "agent-workflow" | "chatbot";
+export type ProjectTemplateType = "backend" | "web-app" | "workflow";
 
 export type ChangeKind = "generate" | "chat" | "manual-edit";
 export type BuilderRole = "system" | "user" | "assistant";
@@ -46,6 +47,8 @@ export interface Deployment {
   orgId: string;
   workspaceId: string;
   createdByUserId: string;
+  runId: string | null;
+  commitHash: string | null;
   status: DeploymentStatus;
   imageRepository: string | null;
   imageTag: string | null;
@@ -70,6 +73,7 @@ export interface Deployment {
 
 export interface ProjectTemplate {
   id: ProjectTemplateId;
+  type: ProjectTemplateType;
   name: string;
   description: string;
   recommendedPrompt: string;

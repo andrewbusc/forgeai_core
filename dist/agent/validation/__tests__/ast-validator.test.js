@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { runAstValidation } from "../ast-validator.js";
 async function createProject(files) {
-    const root = await mkdtemp(path.join(os.tmpdir(), "forgeai-ast-validation-"));
+    const root = await mkdtemp(path.join(os.tmpdir(), "deeprun-ast-validation-"));
     for (const [relativePath, content] of Object.entries(files)) {
         const absolute = path.join(root, relativePath);
         await mkdir(path.dirname(absolute), { recursive: true });

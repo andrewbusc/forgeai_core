@@ -517,9 +517,15 @@ export async function runHeavyProjectValidation(input: HeavyValidationInput): Pr
           const install = await runCommand({
             cwd: isolatedRoot,
             command: npmBin,
-            args: ["install", "--no-audit", "--no-fund"],
+            // Validation is CI-like and must include devDependencies (tsx, vitest, etc.).
+            args: ["ci", "--include=dev", "--no-audit", "--no-fund"],
             timeoutMs: Number(process.env.AGENT_HEAVY_INSTALL_TIMEOUT_MS || 300_000),
-            allowFailure: true
+            allowFailure: true,
+            env: {
+              NODE_ENV: "development",
+              NPM_CONFIG_PRODUCTION: "false",
+              npm_config_production: "false"
+            }
           });
 
           logs.push(install.combined);

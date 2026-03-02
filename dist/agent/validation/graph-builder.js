@@ -1,5 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import ts from "typescript";
 import { architectureContractV1 } from "./contract.js";
 import { collectProductionFiles } from "./collect-files.js";
 import { detectLayer, resolveRelativeImportTarget } from "./path-utils.js";
@@ -42,6 +43,119 @@ function isPathAliasLike(specifier, sourceRoot) {
     }
     return specifier.startsWith(`${sourceRoot}/`);
 }
+function normalizeAliasPrefix(candidate) {
+    const normalized = candidate.trim().replaceAll("\\", "/");
+    if (!normalized) {
+        return null;
+    }
+    if (normalized.endsWith("/*")) {
+        return normalized.slice(0, -1);
+    }
+    if (normalized.endsWith("*")) {
+        return normalized.slice(0, -1);
+    }
+    return normalized;
+}
+function matchesAnyAliasPrefix(specifier, prefixes) {
+    for (const prefix of prefixes) {
+        if (!prefix) {
+            continue;
+        }
+        if (prefix.endsWith("/")) {
+            if (specifier.startsWith(prefix)) {
+                return true;
+            }
+            continue;
+        }
+        if (specifier === prefix || specifier.startsWith(`${prefix}/`)) {
+            return true;
+        }
+    }
+    return false;
+}
+async function readAliasConfig(projectRoot, sourceRoot) {
+    const tsconfigPath = path.join(projectRoot, "tsconfig.json");
+    const aliasPrefixes = new Set(["@/", "~/", `${sourceRoot}/`]);
+    const details = [];
+    let hasAliasConfig = false;
+    try {
+        await fs.access(tsconfigPath);
+    }
+    catch {
+        return {
+            hasAliasConfig,
+            aliasPrefixes: Array.from(aliasPrefixes).sort((a, b) => a.localeCompare(b)),
+            details
+        };
+    }
+    const readResult = ts.readConfigFile(tsconfigPath, ts.sys.readFile);
+    if (readResult.error || !readResult.config || typeof readResult.config !== "object") {
+        return {
+            hasAliasConfig,
+            aliasPrefixes: Array.from(aliasPrefixes).sort((a, b) => a.localeCompare(b)),
+            details
+        };
+    }
+    const compilerOptions = readResult.config.compilerOptions || {};
+    const baseUrlRaw = compilerOptions.baseUrl;
+    const baseUrl = typeof baseUrlRaw === "string" ? baseUrlRaw.trim() : "";
+    if (baseUrl.length > 0) {
+        hasAliasConfig = true;
+        details.push(`baseUrl=${baseUrl}`);
+    }
+    const paths = compilerOptions.paths;
+    if (paths && typeof paths === "object" && !Array.isArray(paths)) {
+        const keys = Object.keys(paths).filter((entry) => entry.trim().length > 0);
+        if (keys.length > 0) {
+            hasAliasConfig = true;
+            details.push(`paths=${keys.sort((a, b) => a.localeCompare(b)).join(",")}`);
+            for (const key of keys) {
+                const normalized = normalizeAliasPrefix(key);
+                if (normalized) {
+                    aliasPrefixes.add(normalized);
+                }
+            }
+        }
+    }
+    return {
+        hasAliasConfig,
+        aliasPrefixes: Array.from(aliasPrefixes).sort((a, b) => a.localeCompare(b)),
+        details
+    };
+}
+function compareViolations(a, b) {
+    return (a.ruleId.localeCompare(b.ruleId) ||
+        a.severity.localeCompare(b.severity) ||
+        a.file.localeCompare(b.file) ||
+        (a.target || "").localeCompare(b.target || "") ||
+        a.message.localeCompare(b.message));
+}
+function normalizeCycleNodes(cycle) {
+    if (cycle.length > 1 && cycle[0] === cycle[cycle.length - 1]) {
+        return cycle.slice(0, -1);
+    }
+    return cycle.slice();
+}
+function rotateCycle(base, offset) {
+    return base.slice(offset).concat(base.slice(0, offset));
+}
+function canonicalizeCycle(cycle) {
+    const base = normalizeCycleNodes(cycle);
+    if (!base.length) {
+        return [];
+    }
+    let best = base;
+    let bestKey = best.join(" -> ");
+    for (let index = 1; index < base.length; index += 1) {
+        const rotated = rotateCycle(base, index);
+        const key = rotated.join(" -> ");
+        if (key.localeCompare(bestKey) < 0) {
+            best = rotated;
+            bestKey = key;
+        }
+    }
+    return [...best, best[0]];
+}
 function summarizeCycle(cycle) {
     return cycle.join(" -> ");
 }
@@ -57,6 +171,9 @@ function detectCycles(nodes, edges) {
         }
         adjacency.get(edge.from)?.push(edge.to);
     }
+    for (const list of adjacency.values()) {
+        list.sort((a, b) => a.localeCompare(b));
+    }
     const visiting = new Set();
     const visited = new Set();
     const stack = [];
@@ -69,11 +186,12 @@ function detectCycles(nodes, edges) {
             if (visiting.has(next)) {
                 const startIndex = stack.lastIndexOf(next);
                 if (startIndex >= 0) {
-                    const cycle = stack.slice(startIndex).concat(next);
-                    const key = summarizeCycle(cycle);
+                    const rawCycle = stack.slice(startIndex).concat(next);
+                    const canonical = canonicalizeCycle(rawCycle);
+                    const key = summarizeCycle(canonical);
                     if (!dedupe.has(key)) {
                         dedupe.add(key);
-                        cycles.push(cycle);
+                        cycles.push(canonical);
                     }
                 }
                 continue;
@@ -91,6 +209,7 @@ function detectCycles(nodes, edges) {
             dfs(node.id);
         }
     }
+    cycles.sort((a, b) => summarizeCycle(a).localeCompare(summarizeCycle(b)));
     return cycles;
 }
 export class GraphBuilder {
@@ -107,6 +226,15 @@ export class GraphBuilder {
         const absoluteToRelative = new Map();
         for (const file of files) {
             absoluteToRelative.set(path.resolve(file.absolutePath), file.relativePath);
+        }
+        const aliasConfig = await readAliasConfig(this.projectRoot, this.contract.sourceRoot);
+        if (aliasConfig.hasAliasConfig && this.contract.rules.pathAliasConfig.enabled) {
+            violations.push({
+                ruleId: this.contract.rules.pathAliasConfig.id,
+                severity: this.contract.rules.pathAliasConfig.severity,
+                file: "tsconfig.json",
+                message: `tsconfig compilerOptions.baseUrl/paths are not allowed by contract. ${aliasConfig.details.join("; ")}`
+            });
         }
         const nodes = [];
         const nodeById = new Map();
@@ -148,7 +276,8 @@ export class GraphBuilder {
             const imports = collectImportSpecifiers(source);
             for (const importPath of imports) {
                 if (this.contract.enforceRelativeImportsOnly && !importPath.startsWith(".")) {
-                    const aliasLike = isPathAliasLike(importPath, this.contract.sourceRoot);
+                    const aliasLike = isPathAliasLike(importPath, this.contract.sourceRoot) ||
+                        matchesAnyAliasPrefix(importPath, aliasConfig.aliasPrefixes);
                     if (aliasLike && this.contract.disallowPathAliases && this.contract.rules.nonRelativeImport.enabled) {
                         violations.push({
                             ruleId: this.contract.rules.nonRelativeImport.id,
@@ -230,6 +359,7 @@ export class GraphBuilder {
                 });
             }
         }
+        edges.sort((a, b) => a.from.localeCompare(b.from) || a.to.localeCompare(b.to) || a.importPath.localeCompare(b.importPath));
         const cycles = detectCycles(nodes, edges);
         if (this.contract.rules.cycleDependency.enabled) {
             for (const cycle of cycles) {
@@ -242,6 +372,8 @@ export class GraphBuilder {
                 });
             }
         }
+        nodes.sort((a, b) => a.id.localeCompare(b.id));
+        violations.sort(compareViolations);
         return {
             nodes,
             edges,

@@ -2,9 +2,17 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
+import { AgentKernel } from "../agent/kernel.js";
+import { RunWaitTimeoutError, waitForRunTerminal, type RunWaitMode } from "../agent/queue/run-wait.js";
+import { persistGovernanceDecision, type GovernanceDecisionPayload } from "../governance/decision.js";
+import { AppStore } from "../lib/project-store.js";
+import { ProviderRegistry } from "../lib/providers.js";
+import { workspacePath } from "../lib/workspace.js";
 
 type EngineMode = "state" | "kernel";
 type HttpMethod = "GET" | "POST" | "PUT";
+type RunProfile = "full" | "ci" | "smoke";
+type ExecutionValidationMode = "off" | "warn" | "enforce";
 
 type CliCommand =
   | "init"
@@ -16,6 +24,7 @@ type CliCommand =
   | "fork"
   | "continue"
   | "validate"
+  | "gate"
   | "promote"
   | "help";
 
@@ -117,11 +126,41 @@ interface KernelRunDetail {
     id: string;
     status: string;
     currentStepIndex: number;
+    validationStatus?: "passed" | "failed" | null;
+    validationResult?: Record<string, unknown> | null;
     runBranch?: string | null;
     worktreePath?: string | null;
     baseCommitHash?: string | null;
     currentCommitHash?: string | null;
     errorMessage?: string | null;
+  };
+  executionConfigSummary?: {
+    schemaVersion: number;
+    profile: string;
+    lightValidationMode: string;
+    heavyValidationMode: string;
+    maxRuntimeCorrectionAttempts: number;
+    maxHeavyCorrectionAttempts: number;
+    correctionPolicyMode: string;
+    correctionConvergenceMode: string;
+    plannerTimeoutMs: number;
+    maxFilesPerStep: number;
+    maxTotalDiffBytes: number;
+    maxFileBytes: number;
+    allowEnvMutation: boolean;
+  };
+  contract?: {
+    schemaVersion: number;
+    hash: string;
+    material: {
+      determinismPolicyVersion: number;
+      plannerPolicyVersion: number;
+      correctionRecipeVersion: number;
+      validationPolicyVersion: number;
+      randomnessSeed: string;
+    };
+    fallbackUsed: boolean;
+    fallbackFields: string[];
   };
   steps: Array<{
     id: string;
@@ -164,6 +203,16 @@ interface KernelRunDetail {
       createdAt: string;
       policy: KernelCorrectionPolicyTelemetry;
     }>;
+  };
+  stubDebt?: {
+    markerCount: number;
+    markerPaths: string[];
+    openCount: number;
+    openTargets: string[];
+    lastStubPath: string | null;
+    lastPaydownAction: string | null;
+    lastPaydownStatus: "open" | "closed" | null;
+    lastPaydownAt: string | null;
   };
 }
 
@@ -242,6 +291,18 @@ class CookieJar {
   }
 }
 
+class ApiError extends Error {
+  readonly status: number;
+  readonly details?: unknown;
+
+  constructor(status: number, message: string, details?: unknown) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.details = details;
+  }
+}
+
 class ApiClient {
   private readonly baseUrl: string;
   private readonly jar: CookieJar;
@@ -310,9 +371,7 @@ class ApiClient {
         typeof candidate?.error === "string" && candidate.error.trim()
           ? candidate.error
           : `Request failed with HTTP ${response.status}.`;
-
-      const details = candidate?.details ? ` Details: ${JSON.stringify(candidate.details)}` : "";
-      throw new Error(`${message}${details}`);
+      throw new ApiError(response.status, message, candidate?.details);
     }
 
     return response.body as T;
@@ -325,7 +384,7 @@ function resolveConfigPath(): string {
     return path.resolve(override);
   }
 
-  return path.resolve(process.cwd(), ".deeprun", "cli.json");
+  return workspacePath(".deeprun", "cli.json");
 }
 
 async function readConfig(configPath: string): Promise<CliConfig | undefined> {
@@ -407,6 +466,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     "fork",
     "continue",
     "validate",
+    "gate",
     "promote",
     "help"
   ];
@@ -458,6 +518,85 @@ function optionFlag(options: Record<string, string | boolean>, key: string): boo
   return false;
 }
 
+function parseWaitMode(options: Record<string, string | boolean>): RunWaitMode {
+  const raw = optionString(options, "wait-mode");
+  if (!raw) {
+    return "local";
+  }
+
+  if (raw === "local" || raw === "remote") {
+    return raw;
+  }
+
+  throw new Error("Option --wait-mode must be either 'local' or 'remote'.");
+}
+
+function parseRunProfile(options: Record<string, string | boolean>): RunProfile {
+  const raw = optionString(options, "profile");
+  if (!raw) {
+    return "full";
+  }
+
+  if (raw === "full" || raw === "ci" || raw === "smoke") {
+    return raw;
+  }
+
+  throw new Error("Option --profile must be one of 'full', 'ci', or 'smoke'.");
+}
+
+function parseOptionalRunProfile(options: Record<string, string | boolean>): RunProfile | undefined {
+  const raw = optionString(options, "profile");
+  if (!raw) {
+    return undefined;
+  }
+
+  if (raw === "full" || raw === "ci" || raw === "smoke") {
+    return raw;
+  }
+
+  throw new Error("Option --profile must be one of 'full', 'ci', or 'smoke'.");
+}
+
+function parseExecutionValidationModeOption(
+  options: Record<string, string | boolean>,
+  key: string
+): ExecutionValidationMode | undefined {
+  const raw = optionString(options, key);
+  if (!raw) {
+    return undefined;
+  }
+
+  if (raw === "off" || raw === "warn" || raw === "enforce") {
+    return raw;
+  }
+
+  throw new Error(`Option --${key} must be one of 'off', 'warn', or 'enforce'.`);
+}
+
+function buildExecutionConfigPayload(input: {
+  profile?: RunProfile;
+  options: Record<string, string | boolean>;
+}): Record<string, unknown> {
+  const lightValidationMode = parseExecutionValidationModeOption(input.options, "light-validation");
+  const heavyValidationMode = parseExecutionValidationModeOption(input.options, "heavy-validation");
+  const correctionPolicyMode = parseExecutionValidationModeOption(input.options, "correction-policy-mode");
+  const correctionConvergenceMode = parseExecutionValidationModeOption(input.options, "correction-convergence-mode");
+  const maxRuntimeCorrectionAttempts = optionInt(input.options, "max-runtime-corrections");
+  const maxHeavyCorrectionAttempts = optionInt(input.options, "max-heavy-corrections");
+  const plannerTimeoutMs = optionInt(input.options, "planner-timeout-ms");
+
+  return {
+    ...(input.profile ? { profile: input.profile } : {}),
+    ...(lightValidationMode ? { lightValidationMode } : {}),
+    ...(heavyValidationMode ? { heavyValidationMode } : {}),
+    ...(typeof maxRuntimeCorrectionAttempts === "number" ? { maxRuntimeCorrectionAttempts } : {}),
+    ...(typeof maxHeavyCorrectionAttempts === "number" ? { maxHeavyCorrectionAttempts } : {}),
+    ...(correctionPolicyMode ? { correctionPolicyMode } : {}),
+    ...(correctionConvergenceMode ? { correctionConvergenceMode } : {}),
+    ...(typeof plannerTimeoutMs === "number" ? { plannerTimeoutMs } : {})
+  };
+}
+
 function commandUsage(): string {
   return [
     "deeprun CLI",
@@ -465,18 +604,20 @@ function commandUsage(): string {
     "Commands:",
     "  init --api <url> --email <email> --password <password> [--name <name>] [--org <name>] [--workspace <name>]",
     "  bootstrap <goal> [--workspace <workspaceId>] [--project-name <name>] [--description <text>] [--provider <id>] [--model <id>]",
-    "  run <goal> [--engine state|kernel] [--project <projectId>] [--workspace <workspaceId>] [--project-name <name>] [--template <templateId>] [--provider <id>] [--model <id>]",
+    "  run <goal> [--engine state|kernel] [--project <projectId>] [--workspace <workspaceId>] [--project-name <name>] [--template <templateId>] [--provider <id>] [--model <id>] [--profile full|ci|smoke] [--light-validation off|warn|enforce] [--heavy-validation off|warn|enforce] [--max-runtime-corrections <n>] [--max-heavy-corrections <n>] [--correction-policy-mode off|warn|enforce] [--correction-convergence-mode off|warn|enforce] [--planner-timeout-ms <ms>] [--wait] [--wait-mode local|remote] [--wait-timeout-ms <ms>]",
     "  status [--engine state|kernel] [--project <projectId>] [--run <runId>] [--watch] [--timeout-ms <ms>] [--verbose]",
     "  logs [--engine state|kernel] [--project <projectId>] [--run <runId>] [--verbose]",
-    "  continue [--engine state|kernel] [--project <projectId>] [--run <runId>]",
+    "  continue [--engine state|kernel] [--project <projectId>] [--run <runId>] [--profile full|ci|smoke] [--light-validation off|warn|enforce] [--heavy-validation off|warn|enforce] [--max-runtime-corrections <n>] [--max-heavy-corrections <n>] [--correction-policy-mode off|warn|enforce] [--correction-convergence-mode off|warn|enforce] [--planner-timeout-ms <ms>] [--override-execution-config] [--fork]",
     "  validate [--project <projectId>] [--run <runId>] [--strict-v1-ready]",
+    "  gate [--project <projectId>] [--run <runId>] [--strict-v1-ready] [--output <path>]",
     "  branch [--project <projectId>] [--run <runId>]",
     "  fork <stepId> [--project <projectId>] [--run <runId>]",
     "  promote [--project <projectId>] [--run <runId>] [--custom-domain <domain>] [--container-port <port>] [--strict-v1-ready]",
     "",
     "Notes:",
-    "  - Session state is persisted in .deeprun/cli.json (or DEEPRUN_CLI_CONFIG).",
+    "  - Session state is persisted in DEEPRUN_WORKSPACE_ROOT/.deeprun/cli.json (or DEEPRUN_CLI_CONFIG).",
     "  - If --provider is omitted, server-side default provider selection is used.",
+    "  - Kernel run --wait defaults to local durable-queue execution and requires DATABASE_URL.",
     "  - Use --verbose to include request tracing and expanded step output."
   ].join("\n");
 }
@@ -508,6 +649,132 @@ interface KernelRunValidationResult {
   };
 }
 
+function writeKernelRunProgress(detail: KernelRunDetail, verbose: boolean): void {
+  const run = detail.run;
+  const correctionCount = detail.telemetry?.corrections.length || 0;
+  process.stdout.write(
+    `kernel status=${run.status} stepIndex=${run.currentStepIndex} steps=${detail.steps.length} corrections=${correctionCount}\n`
+  );
+
+  if (!verbose || detail.steps.length === 0) {
+    return;
+  }
+
+  const lastStep = detail.steps[detail.steps.length - 1];
+  process.stdout.write(
+    `  last-step id=${lastStep.stepId} idx=${lastStep.stepIndex} attempt=${lastStep.attempt} status=${lastStep.status} tool=${lastStep.tool}\n`
+  );
+
+  const lastCorrection = correctionCount ? detail.telemetry?.corrections[correctionCount - 1] : null;
+  if (lastCorrection) {
+    process.stdout.write(
+      `  correction intent=${lastCorrection.telemetry.classification.intent} phase=${lastCorrection.telemetry.phase} step=${lastCorrection.stepId} status=${lastCorrection.status}\n`
+    );
+  }
+}
+
+function writeKernelRunStatus(input: { projectId: string; runId: string; detail: KernelRunDetail }): void {
+  const { projectId, runId, detail } = input;
+  process.stdout.write(`PROJECT_ID=${projectId}\n`);
+  process.stdout.write(`RUN_ID=${runId}\n`);
+  process.stdout.write(`ENGINE=kernel\n`);
+  process.stdout.write(`RUN_STATUS=${detail.run.status}\n`);
+  process.stdout.write(`STEP_INDEX=${detail.run.currentStepIndex}\n`);
+  process.stdout.write(`STEP_COUNT=${detail.steps.length}\n`);
+  const corrections = detail.telemetry?.corrections || [];
+  const correctionPolicies = detail.telemetry?.correctionPolicies || [];
+  const completedCorrections = corrections.filter((entry) => entry.status === "completed").length;
+  const failedCorrections = corrections.filter((entry) => entry.status === "failed").length;
+  const passedCorrectionPolicies = correctionPolicies.filter((entry) => entry.policy.ok).length;
+  const failedCorrectionPolicies = correctionPolicies.length - passedCorrectionPolicies;
+  process.stdout.write(`CORRECTION_ATTEMPTS=${corrections.length}\n`);
+  process.stdout.write(`CORRECTION_COMPLETED=${completedCorrections}\n`);
+  process.stdout.write(`CORRECTION_FAILED=${failedCorrections}\n`);
+  process.stdout.write(`CORRECTION_POLICY_ATTEMPTS=${correctionPolicies.length}\n`);
+  process.stdout.write(`CORRECTION_POLICY_PASSED=${passedCorrectionPolicies}\n`);
+  process.stdout.write(`CORRECTION_POLICY_FAILED=${failedCorrectionPolicies}\n`);
+  process.stdout.write(`OPEN_STUB_DEBT_COUNT=${detail.stubDebt?.openCount ?? 0}\n`);
+  process.stdout.write(`STUB_MARKER_COUNT=${detail.stubDebt?.markerCount ?? 0}\n`);
+  process.stdout.write(`LAST_STUB_PATH=${detail.stubDebt?.lastStubPath || ""}\n`);
+  process.stdout.write(`LAST_STUB_PAYDOWN_ACTION=${detail.stubDebt?.lastPaydownAction || ""}\n`);
+  process.stdout.write(`LAST_STUB_PAYDOWN_STATUS=${detail.stubDebt?.lastPaydownStatus || ""}\n`);
+  process.stdout.write(`LAST_STUB_PAYDOWN_AT=${detail.stubDebt?.lastPaydownAt || ""}\n`);
+  if (detail.executionConfigSummary) {
+    process.stdout.write(`EXECUTION_PROFILE=${detail.executionConfigSummary.profile}\n`);
+    process.stdout.write(`EXECUTION_SCHEMA_VERSION=${detail.executionConfigSummary.schemaVersion}\n`);
+    process.stdout.write(`EXECUTION_LIGHT_VALIDATION_MODE=${detail.executionConfigSummary.lightValidationMode}\n`);
+    process.stdout.write(`EXECUTION_HEAVY_VALIDATION_MODE=${detail.executionConfigSummary.heavyValidationMode}\n`);
+    process.stdout.write(
+      `EXECUTION_MAX_RUNTIME_CORRECTION_ATTEMPTS=${detail.executionConfigSummary.maxRuntimeCorrectionAttempts}\n`
+    );
+    process.stdout.write(
+      `EXECUTION_MAX_HEAVY_CORRECTION_ATTEMPTS=${detail.executionConfigSummary.maxHeavyCorrectionAttempts}\n`
+    );
+    process.stdout.write(`EXECUTION_CORRECTION_POLICY_MODE=${detail.executionConfigSummary.correctionPolicyMode}\n`);
+    process.stdout.write(
+      `EXECUTION_CORRECTION_CONVERGENCE_MODE=${detail.executionConfigSummary.correctionConvergenceMode}\n`
+    );
+    process.stdout.write(`EXECUTION_PLANNER_TIMEOUT_MS=${detail.executionConfigSummary.plannerTimeoutMs}\n`);
+    process.stdout.write(`EXECUTION_MAX_FILES_PER_STEP=${detail.executionConfigSummary.maxFilesPerStep}\n`);
+    process.stdout.write(`EXECUTION_MAX_TOTAL_DIFF_BYTES=${detail.executionConfigSummary.maxTotalDiffBytes}\n`);
+    process.stdout.write(`EXECUTION_MAX_FILE_BYTES=${detail.executionConfigSummary.maxFileBytes}\n`);
+    process.stdout.write(`EXECUTION_ALLOW_ENV_MUTATION=${String(detail.executionConfigSummary.allowEnvMutation)}\n`);
+  }
+  if (detail.contract) {
+    process.stdout.write(`EXECUTION_CONTRACT_SCHEMA_VERSION=${detail.contract.schemaVersion}\n`);
+    process.stdout.write(`EXECUTION_CONTRACT_HASH=${detail.contract.hash}\n`);
+    process.stdout.write(
+      `EXECUTION_CONTRACT_DETERMINISM_POLICY_VERSION=${detail.contract.material.determinismPolicyVersion}\n`
+    );
+    process.stdout.write(`EXECUTION_CONTRACT_PLANNER_POLICY_VERSION=${detail.contract.material.plannerPolicyVersion}\n`);
+    process.stdout.write(
+      `EXECUTION_CONTRACT_CORRECTION_RECIPE_VERSION=${detail.contract.material.correctionRecipeVersion}\n`
+    );
+    process.stdout.write(
+      `EXECUTION_CONTRACT_VALIDATION_POLICY_VERSION=${detail.contract.material.validationPolicyVersion}\n`
+    );
+    process.stdout.write(`EXECUTION_CONTRACT_RANDOMNESS_SEED=${detail.contract.material.randomnessSeed}\n`);
+    process.stdout.write(`EXECUTION_CONTRACT_FALLBACK_USED=${String(detail.contract.fallbackUsed)}\n`);
+    process.stdout.write(`EXECUTION_CONTRACT_FALLBACK_FIELDS=${detail.contract.fallbackFields.join(",")}\n`);
+  }
+  if (corrections.length > 0) {
+    const last = corrections[corrections.length - 1];
+    process.stdout.write(`LAST_CORRECTION_STEP_ID=${last.stepId}\n`);
+    process.stdout.write(`LAST_CORRECTION_PHASE=${last.telemetry.phase}\n`);
+    process.stdout.write(`LAST_CORRECTION_INTENT=${last.telemetry.classification.intent}\n`);
+  }
+  if (correctionPolicies.length > 0) {
+    const lastPolicy = correctionPolicies[correctionPolicies.length - 1];
+    process.stdout.write(`LAST_CORRECTION_POLICY_STEP_ID=${lastPolicy.stepId}\n`);
+    process.stdout.write(`LAST_CORRECTION_POLICY_OK=${String(lastPolicy.policy.ok)}\n`);
+    process.stdout.write(`LAST_CORRECTION_POLICY_SUMMARY=${lastPolicy.policy.summary}\n`);
+  }
+
+  if (detail.run.errorMessage) {
+    process.stdout.write(`RUN_ERROR=${detail.run.errorMessage}\n`);
+  }
+}
+
+function writeExecutionConfigMismatchSummary(details: unknown): boolean {
+  if (!details || typeof details !== "object" || !("diff" in details) || !Array.isArray((details as { diff?: unknown }).diff)) {
+    return false;
+  }
+
+  const diff = (details as { diff: Array<{ field?: unknown; persisted?: unknown; requested?: unknown }> }).diff;
+  if (!diff.length) {
+    return false;
+  }
+
+  process.stderr.write("Execution contract mismatch:\n");
+  for (const entry of diff) {
+    process.stderr.write(
+      `  - ${String(entry.field || "unknown")}: persisted=${String(entry.persisted)} requested=${String(entry.requested)}\n`
+    );
+  }
+
+  return true;
+}
+
 async function runKernelValidation(input: {
   client: ApiClient;
   projectId: string;
@@ -521,6 +788,38 @@ async function runKernelValidation(input: {
       strictV1Ready: input.strictV1Ready
     }
   );
+}
+
+async function requestGovernanceDecision(input: {
+  client: ApiClient;
+  projectId: string;
+  runId: string;
+  strictV1Ready: boolean;
+}): Promise<GovernanceDecisionPayload> {
+  return input.client.requestOk<GovernanceDecisionPayload>(
+    "POST",
+    `/api/projects/${input.projectId}/governance/decision`,
+    {
+      runId: input.runId,
+      strictV1Ready: input.strictV1Ready
+    }
+  );
+}
+
+function kernelRunHasStrictV1Ready(detail: KernelRunDetail): boolean {
+  const validationResult =
+    detail.run.validationResult && typeof detail.run.validationResult === "object" && !Array.isArray(detail.run.validationResult)
+      ? detail.run.validationResult
+      : null;
+  const v1Ready =
+    validationResult &&
+    typeof validationResult.v1Ready === "object" &&
+    validationResult.v1Ready !== null &&
+    !Array.isArray(validationResult.v1Ready)
+      ? (validationResult.v1Ready as Record<string, unknown>)
+      : null;
+
+  return typeof v1Ready?.ok === "boolean";
 }
 
 function ensureConfig(config: CliConfig | undefined): CliConfig {
@@ -648,7 +947,7 @@ async function pollKernelRun(input: {
   verbose: boolean;
   timeoutMs?: number;
 }): Promise<KernelRunDetail> {
-  const timeoutMs = input.timeoutMs || 180_000;
+  const timeoutMs = typeof input.timeoutMs === "number" && input.timeoutMs > 0 ? input.timeoutMs : 180_000;
   const startedAt = Date.now();
   let lastSignature = "";
 
@@ -660,24 +959,7 @@ async function pollKernelRun(input: {
     const signature = `${run.status}|${run.currentStepIndex}|${detail.steps.length}|${correctionCount}`;
 
     if (signature !== lastSignature) {
-      process.stdout.write(
-        `kernel status=${run.status} stepIndex=${run.currentStepIndex} steps=${detail.steps.length} corrections=${correctionCount}\n`
-      );
-
-      if (input.verbose && detail.steps.length > 0) {
-        const lastStep = detail.steps[detail.steps.length - 1];
-        process.stdout.write(
-          `  last-step id=${lastStep.stepId} idx=${lastStep.stepIndex} attempt=${lastStep.attempt} status=${lastStep.status} tool=${lastStep.tool}\n`
-        );
-
-        const lastCorrection = correctionCount ? detail.telemetry?.corrections[correctionCount - 1] : null;
-        if (lastCorrection) {
-          process.stdout.write(
-            `  correction intent=${lastCorrection.telemetry.classification.intent} phase=${lastCorrection.telemetry.phase} step=${lastCorrection.stepId} status=${lastCorrection.status}\n`
-          );
-        }
-      }
-
+      writeKernelRunProgress(detail, input.verbose);
       lastSignature = signature;
     }
 
@@ -688,7 +970,7 @@ async function pollKernelRun(input: {
     await new Promise((resolve) => setTimeout(resolve, 750));
   }
 
-  throw new Error(`Timed out waiting for kernel run ${input.runId} to reach terminal status.`);
+  throw new RunWaitTimeoutError(`Timed out waiting for kernel run ${input.runId} to reach terminal status.`, timeoutMs);
 }
 
 function resolveProjectAndRunId(input: {
@@ -888,10 +1170,19 @@ async function handleRun(input: {
   }
 
   const engine = resolveEngine(input.options, "state");
+  const wait = optionFlag(input.options, "wait");
+  const waitMode = parseWaitMode(input.options);
+  const waitTimeoutMs = optionInt(input.options, "wait-timeout-ms");
+  const waitNodeId = optionString(input.options, "wait-node-id");
+  const profile = parseRunProfile(input.options);
   const jar = new CookieJar(input.config.cookies);
   const client = new ApiClient(input.config.apiBaseUrl, jar, input.verbose);
   const provider = optionString(input.options, "provider");
   const model = optionString(input.options, "model");
+  const executionConfigPayload = buildExecutionConfigPayload({
+    profile,
+    options: input.options
+  });
 
   const projectContext = await createProjectIfNeeded({
     client,
@@ -944,7 +1235,8 @@ async function handleRun(input: {
   const started = await client.requestOk<KernelRunDetail>("POST", `/api/projects/${projectContext.projectId}/agent/runs`, {
     goal,
     ...(provider ? { provider } : {}),
-    ...(model ? { model } : {})
+    ...(model ? { model } : {}),
+    ...executionConfigPayload
   });
 
   nextConfig.lastKernelRunId = started.run.id;
@@ -965,7 +1257,72 @@ async function handleRun(input: {
     }
   }
 
-  return started.run.status === "complete" ? 0 : 1;
+  if (!wait) {
+    return started.run.status === "failed" || started.run.status === "cancelled" ? 1 : 0;
+  }
+
+  try {
+    let finalDetail: KernelRunDetail;
+
+    if (waitMode === "remote") {
+      finalDetail = await pollKernelRun({
+        client,
+        projectId: projectContext.projectId,
+        runId: started.run.id,
+        verbose: input.verbose,
+        timeoutMs: waitTimeoutMs
+      });
+    } else {
+      if (!process.env.DATABASE_URL) {
+        throw new Error("--wait-mode local requires DATABASE_URL. Set DATABASE_URL or use --wait-mode remote.");
+      }
+
+      const store = new AppStore();
+      await store.initialize();
+
+      try {
+        const project = await store.getProject(projectContext.projectId);
+        if (!project) {
+          throw new Error(`Project not found: ${projectContext.projectId}`);
+        }
+
+        const kernel = new AgentKernel({
+          store,
+          providers: new ProviderRegistry()
+        });
+
+        const detail = await waitForRunTerminal({
+          kernel,
+          store,
+          projectId: projectContext.projectId,
+          runId: started.run.id,
+          project,
+          requestId: `cli-run-wait:${randomUUID().slice(0, 8)}`,
+          mode: "local",
+          nodeId: waitNodeId,
+          timeoutMs: waitTimeoutMs,
+          onUpdate: (nextDetail) => writeKernelRunProgress(nextDetail as KernelRunDetail, input.verbose)
+        });
+        finalDetail = detail as KernelRunDetail;
+      } finally {
+        await store.close();
+      }
+    }
+
+    writeKernelRunStatus({
+      projectId: projectContext.projectId,
+      runId: started.run.id,
+      detail: finalDetail
+    });
+    return finalDetail.run.status === "complete" ? 0 : 1;
+  } catch (error) {
+    if (error instanceof RunWaitTimeoutError) {
+      process.stderr.write(`${error.message}\n`);
+      return 2;
+    }
+    throw error;
+  }
+
 }
 
 async function handleStatus(input: {
@@ -1038,40 +1395,7 @@ async function handleStatus(input: {
   };
   await writeConfig(input.configPath, nextConfig);
 
-  process.stdout.write(`PROJECT_ID=${projectId}\n`);
-  process.stdout.write(`RUN_ID=${runId}\n`);
-  process.stdout.write(`ENGINE=kernel\n`);
-  process.stdout.write(`RUN_STATUS=${detail.run.status}\n`);
-  process.stdout.write(`STEP_INDEX=${detail.run.currentStepIndex}\n`);
-  process.stdout.write(`STEP_COUNT=${detail.steps.length}\n`);
-  const corrections = detail.telemetry?.corrections || [];
-  const correctionPolicies = detail.telemetry?.correctionPolicies || [];
-  const completedCorrections = corrections.filter((entry) => entry.status === "completed").length;
-  const failedCorrections = corrections.filter((entry) => entry.status === "failed").length;
-  const passedCorrectionPolicies = correctionPolicies.filter((entry) => entry.policy.ok).length;
-  const failedCorrectionPolicies = correctionPolicies.length - passedCorrectionPolicies;
-  process.stdout.write(`CORRECTION_ATTEMPTS=${corrections.length}\n`);
-  process.stdout.write(`CORRECTION_COMPLETED=${completedCorrections}\n`);
-  process.stdout.write(`CORRECTION_FAILED=${failedCorrections}\n`);
-  process.stdout.write(`CORRECTION_POLICY_ATTEMPTS=${correctionPolicies.length}\n`);
-  process.stdout.write(`CORRECTION_POLICY_PASSED=${passedCorrectionPolicies}\n`);
-  process.stdout.write(`CORRECTION_POLICY_FAILED=${failedCorrectionPolicies}\n`);
-  if (corrections.length > 0) {
-    const last = corrections[corrections.length - 1];
-    process.stdout.write(`LAST_CORRECTION_STEP_ID=${last.stepId}\n`);
-    process.stdout.write(`LAST_CORRECTION_PHASE=${last.telemetry.phase}\n`);
-    process.stdout.write(`LAST_CORRECTION_INTENT=${last.telemetry.classification.intent}\n`);
-  }
-  if (correctionPolicies.length > 0) {
-    const lastPolicy = correctionPolicies[correctionPolicies.length - 1];
-    process.stdout.write(`LAST_CORRECTION_POLICY_STEP_ID=${lastPolicy.stepId}\n`);
-    process.stdout.write(`LAST_CORRECTION_POLICY_OK=${String(lastPolicy.policy.ok)}\n`);
-    process.stdout.write(`LAST_CORRECTION_POLICY_SUMMARY=${lastPolicy.policy.summary}\n`);
-  }
-
-  if (detail.run.errorMessage) {
-    process.stdout.write(`RUN_ERROR=${detail.run.errorMessage}\n`);
-  }
+  writeKernelRunStatus({ projectId, runId, detail });
 
   return detail.run.status === "complete" ? 0 : detail.run.status === "failed" ? 1 : 0;
 }
@@ -1219,17 +1543,32 @@ async function handleContinue(input: {
     return finalDetail.run.status === "complete" ? 0 : 1;
   }
 
-  const detail = await client.requestOk<KernelRunDetail>("POST", `/api/projects/${projectId}/agent/runs/${runId}/resume`);
+  const profile = parseOptionalRunProfile(input.options);
+  const overrideExecutionConfig = optionFlag(input.options, "override-execution-config");
+  const fork = optionFlag(input.options, "fork");
+  const executionConfigPayload = buildExecutionConfigPayload({
+    profile,
+    options: input.options
+  });
+
+  const detail = await client.requestOk<KernelRunDetail>("POST", `/api/projects/${projectId}/agent/runs/${runId}/resume`, {
+    ...executionConfigPayload,
+    ...(overrideExecutionConfig ? { overrideExecutionConfig: true } : {}),
+    ...(fork ? { fork: true } : {})
+  });
 
   await writeConfig(input.configPath, {
     ...input.config,
     cookies: jar.toObject(),
     lastProjectId: projectId,
-    lastKernelRunId: runId
+    lastKernelRunId: detail.run.id
   });
 
   process.stdout.write(`PROJECT_ID=${projectId}\n`);
-  process.stdout.write(`RUN_ID=${runId}\n`);
+  if (fork && detail.run.id !== runId) {
+    process.stdout.write(`SOURCE_RUN_ID=${runId}\n`);
+  }
+  process.stdout.write(`RUN_ID=${detail.run.id}\n`);
   process.stdout.write(`ENGINE=kernel\n`);
   process.stdout.write(`RUN_STATUS=${detail.run.status}\n`);
   process.stdout.write(`STEP_COUNT=${detail.steps.length}\n`);
@@ -1299,6 +1638,71 @@ async function handleValidate(input: {
   }
 
   return 0;
+}
+
+async function handleGate(input: {
+  configPath: string;
+  config: CliConfig;
+  options: Record<string, string | boolean>;
+  verbose: boolean;
+}): Promise<number> {
+  const strictV1Ready = optionFlag(input.options, "strict-v1-ready");
+  const outputPath = optionString(input.options, "output");
+  const { projectId, runId } = resolveProjectAndRunId({
+    config: input.config,
+    options: input.options,
+    engine: "kernel"
+  });
+
+  const jar = new CookieJar(input.config.cookies);
+  const client = new ApiClient(input.config.apiBaseUrl, jar, input.verbose);
+  const currentDetail = await client.requestOk<KernelRunDetail>("GET", `/api/projects/${projectId}/agent/runs/${runId}`);
+
+  const needsValidation =
+    currentDetail.run.validationStatus !== "passed" || (strictV1Ready && !kernelRunHasStrictV1Ready(currentDetail));
+
+  if (needsValidation) {
+    try {
+      await runKernelValidation({
+        client,
+        projectId,
+        runId,
+        strictV1Ready
+      });
+    } catch (error) {
+      if (!(error instanceof ApiError)) {
+        throw error;
+      }
+    }
+  }
+
+  const decision = await requestGovernanceDecision({
+    client,
+    projectId,
+    runId,
+    strictV1Ready
+  });
+  await persistGovernanceDecision({
+    decision
+  });
+
+  await writeConfig(input.configPath, {
+    ...input.config,
+    cookies: jar.toObject(),
+    lastProjectId: projectId,
+    lastKernelRunId: runId
+  });
+
+  const serialized = `${JSON.stringify(decision, null, 2)}\n`;
+  process.stdout.write(serialized);
+
+  if (outputPath) {
+    const resolvedOutputPath = path.resolve(outputPath);
+    await mkdir(path.dirname(resolvedOutputPath), { recursive: true });
+    await writeFile(resolvedOutputPath, serialized, "utf8");
+  }
+
+  return decision.decision === "PASS" ? 0 : 1;
 }
 
 async function handleBranch(input: {
@@ -1390,14 +1794,14 @@ async function handlePromote(input: {
   const strictV1Ready = optionFlag(input.options, "strict-v1-ready");
   const runId = optionString(input.options, "run") || input.config.lastKernelRunId;
 
+  if (!runId) {
+    throw new Error("promote requires --run <runId> or a previously used kernel run.");
+  }
+
   const jar = new CookieJar(input.config.cookies);
   const client = new ApiClient(input.config.apiBaseUrl, jar, input.verbose);
 
   if (strictV1Ready) {
-    if (!runId) {
-      throw new Error("promote --strict-v1-ready requires --run <runId> or a previously used kernel run.");
-    }
-
     const validation = await runKernelValidation({
       client,
       projectId,
@@ -1442,6 +1846,7 @@ async function handlePromote(input: {
       customDomain: string | null;
     };
   }>("POST", `/api/projects/${projectId}/deployments`, {
+    runId,
     customDomain,
     containerPort
   });
@@ -1544,6 +1949,16 @@ async function main(): Promise<void> {
         });
         return;
       }
+      case "gate": {
+        const config = ensureConfig(existingConfig);
+        process.exitCode = await handleGate({
+          configPath,
+          config,
+          options: parsed.options,
+          verbose: parsed.verbose
+        });
+        return;
+      }
       case "branch": {
         const config = ensureConfig(existingConfig);
         await handleBranch({
@@ -1579,6 +1994,15 @@ async function main(): Promise<void> {
         process.stdout.write(`${commandUsage()}\n`);
     }
   } catch (error) {
+    if (error instanceof ApiError && error.message.startsWith("Execution config mismatch.")) {
+      const wroteSummary = writeExecutionConfigMismatchSummary(error.details);
+      process.stderr.write(`${error.message}\n`);
+      if (error.details && !wroteSummary) {
+        process.stderr.write(`Details: ${JSON.stringify(error.details)}\n`);
+      }
+      process.exitCode = 1;
+      return;
+    }
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
     process.exitCode = 1;
   }

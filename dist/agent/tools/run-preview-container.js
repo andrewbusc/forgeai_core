@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { z } from "zod";
 import { ensureDir, pathExists, readTextFile } from "../../lib/fs-utils.js";
+import { workspacePath } from "../../lib/workspace.js";
 import { writeRuntimeLog } from "./runtime-log-store.js";
 const runPreviewContainerInputSchema = z.object({
     containerPort: z.number().int().min(1).max(65535).optional(),
@@ -164,7 +165,7 @@ ENV PORT=${input.containerPort}
 EXPOSE ${input.containerPort}
 CMD ["sh", "-lc", "${escapeDoubleQuotes(startCommand)}"]
 `;
-    const dockerfileDir = path.join(process.cwd(), ".data", "agent-runtime", "dockerfiles");
+    const dockerfileDir = workspacePath(".data", "agent-runtime", "dockerfiles");
     await ensureDir(dockerfileDir);
     const dockerfilePath = path.join(dockerfileDir, `${input.requestId}.Dockerfile`);
     await fs.writeFile(dockerfilePath, generatedDockerfile, "utf8");
@@ -195,8 +196,8 @@ export const runPreviewContainerTool = {
         const dockerBin = process.env.AGENT_RUNTIME_DOCKER_BIN || process.env.DEPLOY_DOCKER_BIN || "docker";
         const containerPort = resolveContainerPort(input.containerPort);
         const startupTimeoutMs = input.startupTimeoutMs ?? (Number(process.env.AGENT_RUNTIME_STARTUP_TIMEOUT_MS || 45_000) || 45_000);
-        const imageTag = `forgeai-agent-preview:${context.project.id.slice(0, 8)}-${Date.now().toString(36)}`;
-        const containerName = `forgeai-agent-preview-${context.project.id.slice(0, 8)}-${randomUUID().slice(0, 8)}`;
+        const imageTag = `deeprun-agent-preview:${context.project.id.slice(0, 8)}-${Date.now().toString(36)}`;
+        const containerName = `deeprun-agent-preview-${context.project.id.slice(0, 8)}-${randomUUID().slice(0, 8)}`;
         const hostPort = await acquireFreePort();
         let combinedLogs = "";
         let dockerfilePath = null;

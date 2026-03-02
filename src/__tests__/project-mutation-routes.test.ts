@@ -362,6 +362,32 @@ test("project scaffold + manual edit + generate + chat use transactional mutatio
     assert.deepEqual(historyAfterManual.body.history[0]?.filesChanged, [scaffoldPath]);
     assert.ok(historyAfterManual.body.history[0]?.commitHash);
 
+    const manualRuns = await requestJson<{
+      runs: Array<{ id: string; goal: string; status: string }>;
+    }>({
+      baseUrl: server.baseUrl,
+      jar,
+      method: "GET",
+      path: `/api/projects/${projectId}/agent/runs`
+    });
+    assert.equal(manualRuns.status, 200);
+    const manualRun = manualRuns.body.runs.find((run) => run.goal === `Manual file edit: ${scaffoldPath}`);
+    assert.ok(manualRun);
+    assert.equal(manualRun?.status, "complete");
+
+    const manualRunDetail = await requestJson<{
+      run: { id: string; status: string };
+      steps: Array<{ tool: string; status: string; commitHash?: string | null }>;
+    }>({
+      baseUrl: server.baseUrl,
+      jar,
+      method: "GET",
+      path: `/api/projects/${projectId}/agent/runs/${manualRun?.id}`
+    });
+    assert.equal(manualRunDetail.status, 200);
+    assert.equal(manualRunDetail.body.run.status, "complete");
+    assert.equal(manualRunDetail.body.steps.some((step) => step.tool === "manual_file_write"), true);
+
     const gitAfterManual = await requestJson<{ commits: Array<{ subject: string }> }>({
       baseUrl: server.baseUrl,
       jar,
@@ -369,7 +395,7 @@ test("project scaffold + manual edit + generate + chat use transactional mutatio
       path: `/api/projects/${projectId}/git/history`
     });
     assert.equal(gitAfterManual.status, 200);
-    expectCommitSubjectContains(gitAfterManual.body.commits, `agentRunId=manual-edit-${projectId}`);
+    expectCommitSubjectContains(gitAfterManual.body.commits, "step-1 (manual_file_write)");
 
     const fileAfterManual = await requestJson<{ content: string }>({
       baseUrl: server.baseUrl,
@@ -393,7 +419,7 @@ test("project scaffold + manual edit + generate + chat use transactional mutatio
         provider: "mock"
       }
     });
-    assert.equal(generateResponse.status, 200);
+    assert.equal(generateResponse.status, 200, JSON.stringify(generateResponse.body));
     assert.ok(generateResponse.body.result.commitHash);
     assert.ok(generateResponse.body.result.filesChanged.length > 0);
 
@@ -414,7 +440,7 @@ test("project scaffold + manual edit + generate + chat use transactional mutatio
       path: `/api/projects/${projectId}/git/history`
     });
     assert.equal(gitAfterGenerate.status, 200);
-    expectCommitSubjectContains(gitAfterGenerate.body.commits, `agentRunId=legacy-${projectId}-generate`);
+    expectCommitSubjectContains(gitAfterGenerate.body.commits, "step-1 (ai_mutation) ::");
 
     const chatPrompt = `Chat follow-up ${suffix} ${randomUUID().slice(0, 6)}`;
     const chatResponse = await requestJson<{
@@ -429,7 +455,7 @@ test("project scaffold + manual edit + generate + chat use transactional mutatio
         provider: "mock"
       }
     });
-    assert.equal(chatResponse.status, 200);
+    assert.equal(chatResponse.status, 200, JSON.stringify(chatResponse.body));
     assert.ok(chatResponse.body.result.commitHash);
     assert.ok(chatResponse.body.result.filesChanged.length > 0);
 
@@ -440,7 +466,203 @@ test("project scaffold + manual edit + generate + chat use transactional mutatio
       path: `/api/projects/${projectId}/git/history`
     });
     assert.equal(gitAfterChat.status, 200);
-    expectCommitSubjectContains(gitAfterChat.body.commits, `agentRunId=legacy-${projectId}-chat`);
+    expectCommitSubjectContains(gitAfterChat.body.commits, "step-1 (ai_mutation) ::");
+  } finally {
+    await server.stop();
+  }
+});
+
+test("manual save with syntax error validates as failed without mutating run state or commit pointers", async () => {
+  const server = await startServer();
+  const jar = new CookieJar();
+  const suffix = randomUUID().slice(0, 8);
+
+  try {
+    const { workspaceId } = await registerAndGetWorkspace({
+      baseUrl: server.baseUrl,
+      jar,
+      suffix
+    });
+
+    const createProject = await requestJson<{
+      project: {
+        id: string;
+      };
+    }>({
+      baseUrl: server.baseUrl,
+      jar,
+      method: "POST",
+      path: "/api/projects",
+      body: {
+        workspaceId,
+        name: `Validation Failure Project ${suffix}`,
+        description: "Manual save validation regression test",
+        templateId: "canonical-backend"
+      }
+    });
+
+    assert.equal(createProject.status, 201);
+    const projectId = createProject.body.project.id;
+    assert.ok(projectId);
+
+    const serverFile = await requestJson<{ content: string }>({
+      baseUrl: server.baseUrl,
+      jar,
+      method: "GET",
+      path: `/api/projects/${projectId}/file?path=${encodeURIComponent("src/server.ts")}`
+    });
+    assert.equal(serverFile.status, 200);
+
+    const brokenContent = `${serverFile.body.content}\n\nexport const __deeprunBroken = ;\n`;
+
+    const manualEdit = await requestJson<{ ok: boolean; commitHash: string | null }>({
+      baseUrl: server.baseUrl,
+      jar,
+      method: "PUT",
+      path: `/api/projects/${projectId}/file`,
+      body: {
+        path: "src/server.ts",
+        content: brokenContent
+      }
+    });
+    assert.equal(manualEdit.status, 200);
+    assert.equal(manualEdit.body.ok, true);
+    assert.ok(manualEdit.body.commitHash);
+
+    const manualRuns = await requestJson<{
+      runs: Array<{
+        id: string;
+        goal: string;
+        status: string;
+        currentCommitHash?: string | null;
+        lastValidCommitHash?: string | null;
+      }>;
+    }>({
+      baseUrl: server.baseUrl,
+      jar,
+      method: "GET",
+      path: `/api/projects/${projectId}/agent/runs`
+    });
+    assert.equal(manualRuns.status, 200);
+
+    const manualRun = manualRuns.body.runs.find((run) => run.goal === "Manual file edit: src/server.ts");
+    assert.ok(manualRun);
+    assert.equal(manualRun?.status, "complete");
+
+    const beforeValidate = await requestJson<{
+      run: {
+        id: string;
+        status: string;
+        currentCommitHash?: string | null;
+        lastValidCommitHash?: string | null;
+        validationStatus?: "passed" | "failed" | null;
+        validationResult?: Record<string, unknown> | null;
+        validatedAt?: string | null;
+      };
+      steps: Array<{
+        id: string;
+        stepId: string;
+        tool: string;
+        status: string;
+        commitHash?: string | null;
+      }>;
+      telemetry?: { corrections?: unknown[] };
+    }>({
+      baseUrl: server.baseUrl,
+      jar,
+      method: "GET",
+      path: `/api/projects/${projectId}/agent/runs/${manualRun?.id}`
+    });
+    assert.equal(beforeValidate.status, 200);
+    assert.equal(beforeValidate.body.run.status, "complete");
+    assert.equal(beforeValidate.body.run.validationStatus ?? null, null);
+    assert.equal(beforeValidate.body.run.validationResult ?? null, null);
+    assert.equal(beforeValidate.body.run.validatedAt ?? null, null);
+    const beforeStepCount = beforeValidate.body.steps.length;
+    const beforeCorrectionStepCount = beforeValidate.body.steps.filter(
+      (step) => step.stepId.startsWith("runtime-correction-") || step.stepId.startsWith("validation-correction-")
+    ).length;
+    const beforeStepIds = beforeValidate.body.steps.map((step) => step.id);
+    const beforeCurrentCommitHash = beforeValidate.body.run.currentCommitHash || null;
+    const beforeLastValidCommitHash = beforeValidate.body.run.lastValidCommitHash || null;
+    assert.ok(beforeCurrentCommitHash);
+
+    const validated = await requestJson<{
+      run: {
+        id: string;
+        status: string;
+        currentCommitHash?: string | null;
+        lastValidCommitHash?: string | null;
+        validationStatus?: "passed" | "failed" | null;
+        validationResult?: Record<string, unknown> | null;
+        validatedAt?: string | null;
+      };
+      validation: {
+        ok: boolean;
+        blockingCount: number;
+        warningCount: number;
+        summary: string;
+      };
+      targetPath: string;
+    }>({
+      baseUrl: server.baseUrl,
+      jar,
+      method: "POST",
+      path: `/api/projects/${projectId}/agent/runs/${manualRun?.id}/validate`,
+      body: {}
+    });
+    assert.equal(validated.status, 200, JSON.stringify(validated.body));
+    assert.equal(validated.body.run.id, manualRun?.id);
+    assert.equal(validated.body.validation.ok, false);
+    assert.ok(validated.body.validation.blockingCount >= 1);
+    assert.equal(validated.body.run.status, "complete");
+    assert.equal(validated.body.run.validationStatus, "failed");
+    assert.equal(typeof validated.body.run.validationResult, "object");
+    assert.equal(typeof validated.body.run.validatedAt, "string");
+
+    const afterValidate = await requestJson<{
+      run: {
+        id: string;
+        status: string;
+        currentCommitHash?: string | null;
+        lastValidCommitHash?: string | null;
+        validationStatus?: "passed" | "failed" | null;
+        validationResult?: Record<string, unknown> | null;
+        validatedAt?: string | null;
+      };
+      steps: Array<{
+        id: string;
+        stepId: string;
+        tool: string;
+        status: string;
+        commitHash?: string | null;
+      }>;
+      telemetry?: { corrections?: unknown[] };
+    }>({
+      baseUrl: server.baseUrl,
+      jar,
+      method: "GET",
+      path: `/api/projects/${projectId}/agent/runs/${manualRun?.id}`
+    });
+    assert.equal(afterValidate.status, 200);
+
+    assert.equal(afterValidate.body.run.status, "complete");
+    assert.equal(afterValidate.body.run.validationStatus, "failed");
+    assert.equal(typeof afterValidate.body.run.validationResult, "object");
+    assert.equal(typeof afterValidate.body.run.validatedAt, "string");
+    assert.equal(afterValidate.body.run.currentCommitHash || null, beforeCurrentCommitHash);
+    assert.equal(afterValidate.body.run.lastValidCommitHash || null, beforeLastValidCommitHash);
+    assert.equal(afterValidate.body.steps.length, beforeStepCount);
+    assert.deepEqual(
+      afterValidate.body.steps.map((step) => step.id),
+      beforeStepIds
+    );
+    assert.equal(
+      afterValidate.body.steps.filter(
+        (step) => step.stepId.startsWith("runtime-correction-") || step.stepId.startsWith("validation-correction-")
+      ).length,
+      beforeCorrectionStepCount
+    );
   } finally {
     await server.stop();
   }

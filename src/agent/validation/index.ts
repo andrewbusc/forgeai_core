@@ -10,4 +10,8 @@ export * from "./security-validator.js";
 export * from "./test-contract-validator.js";
 export * from "./project-validator.js";
 export * from "./heavy-validator.js";
+export * from "./web-app-light-validator.js";
+export * from "./workflow-light-validator.js";
+export * from "./profile-dispatcher.js";
+export * from "./validation-failure-classifier.js";
 export * from "./violation-utils.js";

@@ -1,8 +1,9 @@
 import path from "node:path";
 import { promises as fs } from "node:fs";
 import { ensureDir } from "../../lib/fs-utils.js";
+import { workspacePath } from "../../lib/workspace.js";
 
-const runtimeLogRoot = path.join(process.cwd(), ".data", "agent-runtime");
+const runtimeLogRoot = workspacePath(".data", "agent-runtime");
 
 export interface RuntimeLogRecord {
   projectId: string;

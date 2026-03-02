@@ -1,0 +1,15 @@
+.git
+.github
+node_modules
+dist
+.env
+.env.local
+.env.*.local
+.data
+.deeprun
+.workspace
+coverage
+*.log
+*.tmp
+npm-debug.log*
+docs

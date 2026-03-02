@@ -1,8 +1,11 @@
 import { z } from "zod";
+import { ProviderRegistry } from "../../lib/providers.js";
 import { AgentContext, AgentToolName } from "../types.js";
+import { createAiMutationTool } from "./ai-mutation.js";
 import { applyPatchTool } from "./apply-patch.js";
 import { fetchRuntimeLogsTool } from "./fetch-runtime-logs.js";
 import { listFilesTool } from "./list-files.js";
+import { manualFileWriteTool } from "./manual-file-write.js";
 import { readFileTool } from "./read-file.js";
 import { runPreviewContainerTool } from "./run-preview-container.js";
 import { writeFileTool } from "./write-file.js";
@@ -45,9 +48,11 @@ export class AgentToolRegistry {
   }
 }
 
-export function createDefaultAgentToolRegistry(): AgentToolRegistry {
+export function createDefaultAgentToolRegistry(input: { providers?: ProviderRegistry } = {}): AgentToolRegistry {
   const registry = new AgentToolRegistry();
 
+  registry.register(createAiMutationTool(input.providers));
+  registry.register(manualFileWriteTool);
   registry.register(readFileTool);
   registry.register(writeFileTool);
   registry.register(applyPatchTool);

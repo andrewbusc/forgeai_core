@@ -6,6 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { withIsolatedWorktree } from "../../lib/git-versioning.js";
 import { pathExists, readTextFile } from "../../lib/fs-utils.js";
+import { summarizeStubDebt } from "../../learning/stub-debt.js";
 import { runHeavyProjectValidation } from "./heavy-validator.js";
 
 export type CheckStatus = "pass" | "fail" | "skip";
@@ -113,6 +114,16 @@ function runCommand(input: {
     let stdout = "";
     let stderr = "";
     let combined = `$ ${shellSafeCommand(input.command, input.args)}\n`;
+    let settled = false;
+
+    const finish = (result: CommandResult) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
+      resolve(result);
+    };
 
     child.stdout.on("data", (chunk: Buffer) => {
       const text = chunk.toString("utf8");
@@ -135,8 +146,18 @@ function runCommand(input: {
       }, 1_000).unref();
     }, timeoutMs);
 
+    child.on("error", (error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      finish({
+        ok: false,
+        stdout: stdout.trim(),
+        stderr: message,
+        exitCode: 1,
+        combined: truncateOutput(`${combined}${message}`).trim()
+      });
+    });
+
     child.on("close", (code) => {
-      clearTimeout(timeout);
       const exitCode = Number.isInteger(code) ? Number(code) : 1;
       const result: CommandResult = {
         ok: exitCode === 0,
@@ -147,14 +168,14 @@ function runCommand(input: {
       };
 
       if (!result.ok && !input.allowFailure) {
-        resolve({
+        finish({
           ...result,
           stderr: result.stderr || `${input.command} exited with code ${String(code ?? "unknown")}.`
         });
         return;
       }
 
-      resolve({
+      finish({
         ...result
       });
     });
@@ -262,6 +283,53 @@ async function runHeavyValidationCheck(target: string): Promise<CheckResult> {
       logsTail: truncateOutput(result.logs, 24_000)
     }
   };
+}
+
+async function runStubDebtIntegrityChecks(target: string): Promise<CheckResult[]> {
+  const summary = await summarizeStubDebt(target);
+  const checks: CheckResult[] = [];
+
+  if (summary.markerCount > 0) {
+    checks.push({
+      id: "stub_markers",
+      status: "fail",
+      message: "DeepRun provisional stub markers remain in the target.",
+      details: {
+        count: summary.markerCount,
+        paths: summary.markerPaths.slice(0, 25)
+      }
+    });
+  } else {
+    checks.push({
+      id: "stub_markers",
+      status: "pass",
+      message: "No DeepRun provisional stub markers found."
+    });
+  }
+
+  if (summary.openCount > 0) {
+    checks.push({
+      id: "stub_debt",
+      status: "fail",
+      message: "Open stub-debt artifacts remain unresolved.",
+      details: {
+        count: summary.openCount,
+        targets: summary.openTargets.slice(0, 25),
+        lastStubPath: summary.lastStubPath,
+        lastPaydownAction: summary.lastPaydownAction,
+        lastPaydownStatus: summary.lastPaydownStatus,
+        lastPaydownAt: summary.lastPaydownAt
+      }
+    });
+  } else {
+    checks.push({
+      id: "stub_debt",
+      status: "pass",
+      message: "No open stub-debt artifacts remain."
+    });
+  }
+
+  return checks;
 }
 
 async function runDockerValidationChecks(target: string): Promise<CheckResult[]> {
@@ -606,6 +674,28 @@ export async function runV1ReadinessCheck(
       id: "heavy_validation",
       status: "fail",
       message: "Heavy validation execution failed.",
+      details: {
+        error: error instanceof Error ? error.message : String(error)
+      }
+    });
+  }
+
+  try {
+    const stubDebtChecks = await runStubDebtIntegrityChecks(target);
+    checks.push(...stubDebtChecks);
+  } catch (error) {
+    checks.push({
+      id: "stub_markers",
+      status: "fail",
+      message: "Stub marker scan failed.",
+      details: {
+        error: error instanceof Error ? error.message : String(error)
+      }
+    });
+    checks.push({
+      id: "stub_debt",
+      status: "fail",
+      message: "Stub-debt integrity scan failed.",
       details: {
         error: error instanceof Error ? error.message : String(error)
       }

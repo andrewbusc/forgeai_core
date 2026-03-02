@@ -1,6 +1,16 @@
 import { z } from "zod";
 import { BuilderMessage, GenerationResult, ProviderDescriptor } from "../types.js";
 
+function parseRequestTimeoutMs(value: string | undefined, fallbackMs: number): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 1_000) {
+    return fallbackMs;
+  }
+  return Math.floor(parsed);
+}
+
+const llmRequestTimeoutMs = parseRequestTimeoutMs(process.env.DEEPRUN_LLM_TIMEOUT_MS, 180_000);
+
 const generationResultSchema = z.object({
   summary: z.string().min(1),
   files: z.array(
@@ -95,7 +105,7 @@ class OpenAICompatibleProvider implements AiProvider {
           }
         ]
       }),
-      signal: AbortSignal.timeout(90_000)
+      signal: AbortSignal.timeout(llmRequestTimeoutMs)
     });
 
     if (!response.ok) {

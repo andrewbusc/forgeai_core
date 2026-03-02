@@ -1,4 +1,12 @@
 import { z } from "zod";
+function parseRequestTimeoutMs(value, fallbackMs) {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed < 1_000) {
+        return fallbackMs;
+    }
+    return Math.floor(parsed);
+}
+const llmRequestTimeoutMs = parseRequestTimeoutMs(process.env.DEEPRUN_LLM_TIMEOUT_MS, 180_000);
 const generationResultSchema = z.object({
     summary: z.string().min(1),
     files: z.array(z.object({
@@ -71,7 +79,7 @@ class OpenAICompatibleProvider {
                     }
                 ]
             }),
-            signal: AbortSignal.timeout(90_000)
+            signal: AbortSignal.timeout(llmRequestTimeoutMs)
         });
         if (!response.ok) {
             const details = await response.text();
@@ -124,6 +132,7 @@ function parseJsonPayload(input) {
 }
 export class ProviderRegistry {
     providers = new Map();
+    defaultProviderId;
     constructor() {
         this.providers.set("mock", new MockProvider());
         const openAiKey = process.env.OPENAI_API_KEY;
@@ -146,12 +155,45 @@ export class ProviderRegistry {
                 configured: true
             }, openRouterKey, process.env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1"));
         }
+        this.defaultProviderId = this.resolveDefaultProviderId();
+    }
+    resolveDefaultProviderId() {
+        const configuredDefault = String(process.env.DEEPRUN_DEFAULT_PROVIDER || "").trim();
+        if (configuredDefault) {
+            if (!this.providers.has(configuredDefault)) {
+                throw new Error(`DEEPRUN_DEFAULT_PROVIDER is set to '${configuredDefault}', but that provider is not configured.`);
+            }
+            return configuredDefault;
+        }
+        const firstConfiguredRealProvider = Array.from(this.providers.values())
+            .map((provider) => provider.descriptor)
+            .find((descriptor) => descriptor.id !== "mock" && descriptor.configured);
+        return firstConfiguredRealProvider?.id || "mock";
     }
     list() {
-        return Array.from(this.providers.values()).map((provider) => provider.descriptor);
+        return Array.from(this.providers.values())
+            .sort((left, right) => {
+            const leftDefault = left.descriptor.id === this.defaultProviderId ? 0 : 1;
+            const rightDefault = right.descriptor.id === this.defaultProviderId ? 0 : 1;
+            if (leftDefault !== rightDefault) {
+                return leftDefault - rightDefault;
+            }
+            return left.descriptor.id.localeCompare(right.descriptor.id);
+        })
+            .map((provider) => provider.descriptor);
+    }
+    getDefaultProviderId() {
+        return this.defaultProviderId;
+    }
+    resolveProviderId(providerId) {
+        const resolved = typeof providerId === "string" && providerId.trim().length > 0 ? providerId.trim() : this.defaultProviderId;
+        if (!this.providers.has(resolved)) {
+            throw new Error(`Unknown provider: ${resolved}`);
+        }
+        return resolved;
     }
     get(providerId) {
-        const provider = this.providers.get(providerId);
+        const provider = this.providers.get(this.resolveProviderId(providerId));
         if (!provider) {
             throw new Error(`Unknown provider: ${providerId}`);
         }
