@@ -67,8 +67,8 @@ function parseFailedChecks(summary: string | undefined): string[] {
 }
 
 function resolveLimits(input?: Partial<CorrectionLimitConfig>): CorrectionLimitConfig {
-  const defaultMaxFiles = clampInt(Number(process.env.AGENT_FS_MAX_FILES_PER_STEP || 15), 1, 100);
-  const defaultMaxBytes = clampInt(Number(process.env.AGENT_FS_MAX_TOTAL_DIFF_BYTES || 400_000), 1_000, 5_000_000);
+  const defaultMaxFiles = 15;
+  const defaultMaxBytes = 400_000;
 
   return {
     maxFilesPerStep: clampInt(Number(input?.maxFilesPerStep || defaultMaxFiles), 1, 100),

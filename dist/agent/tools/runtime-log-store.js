@@ -1,7 +1,8 @@
 import path from "node:path";
 import { promises as fs } from "node:fs";
 import { ensureDir } from "../../lib/fs-utils.js";
-const runtimeLogRoot = path.join(process.cwd(), ".data", "agent-runtime");
+import { workspacePath } from "../../lib/workspace.js";
+const runtimeLogRoot = workspacePath(".data", "agent-runtime");
 function normalizeProjectId(projectId) {
     return projectId.replace(/[^a-zA-Z0-9_-]/g, "_");
 }

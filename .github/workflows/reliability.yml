@@ -18,6 +18,21 @@ on:
         required: false
         type: string
         default: "true"
+      stress_max_runs:
+        description: "Stress soak max runs for reusable/manual invocations"
+        required: false
+        type: string
+        default: "20"
+      stress_negative_max_runs:
+        description: "Negative-control stress max runs"
+        required: false
+        type: string
+        default: "40"
+      stress_snapshot_every:
+        description: "Stress artifact snapshot cadence"
+        required: false
+        type: string
+        default: "20"
   schedule:
     - cron: "0 6 * * *"
   workflow_dispatch:
@@ -34,6 +49,18 @@ on:
         description: "Run full v1-ready checks for each sample"
         required: false
         default: "true"
+      stress_max_runs:
+        description: "Stress soak max runs"
+        required: false
+        default: "20"
+      stress_negative_max_runs:
+        description: "Negative-control stress max runs"
+        required: false
+        default: "40"
+      stress_snapshot_every:
+        description: "Stress artifact snapshot cadence"
+        required: false
+        default: "20"
 
 permissions:
   contents: read
@@ -75,6 +102,9 @@ jobs:
       INPUT_ITERATIONS: ${{ inputs.iterations || github.event.inputs.iterations || '10' }}
       INPUT_MIN_PASS_RATE: ${{ inputs.min_pass_rate || github.event.inputs.min_pass_rate || '0.95' }}
       INPUT_STRICT_V1_READY: ${{ inputs.strict_v1_ready || github.event.inputs.strict_v1_ready || 'true' }}
+      INPUT_STRESS_MAX_RUNS: ${{ inputs.stress_max_runs || github.event.inputs.stress_max_runs || '20' }}
+      INPUT_STRESS_NEGATIVE_MAX_RUNS: ${{ inputs.stress_negative_max_runs || github.event.inputs.stress_negative_max_runs || '40' }}
+      INPUT_STRESS_SNAPSHOT_EVERY: ${{ inputs.stress_snapshot_every || github.event.inputs.stress_snapshot_every || '20' }}
 
     steps:
       - name: Checkout
@@ -137,6 +167,105 @@ jobs:
             run_benchmark ".deeprun/reliability-report.retry.json"
           fi
 
+      - name: Run stress gate normal soak
+        if: always()
+        run: |
+          snapshot_every="${INPUT_STRESS_SNAPSHOT_EVERY:-20}"
+          if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
+            stress_max_runs="200"
+            export DEEPRUN_STRESS_DEBT_MIN_PAYDOWN_RATE="${DEEPRUN_STRESS_DEBT_MIN_PAYDOWN_RATE:-0.5}"
+          else
+            stress_max_runs="${INPUT_STRESS_MAX_RUNS:-20}"
+            export DEEPRUN_STRESS_DEBT_MIN_PAYDOWN_RATE="${DEEPRUN_STRESS_DEBT_MIN_PAYDOWN_RATE:-0.3}"
+          fi
+
+          echo "stress_max_runs=${stress_max_runs}"
+          echo "stress_snapshot_every=${snapshot_every}"
+          echo "stress_debt_min_paydown_rate=${DEEPRUN_STRESS_DEBT_MIN_PAYDOWN_RATE}"
+
+          npm run stress -- \
+            --seed "debt-heavy-ci-normal" \
+            --maxRuns "${stress_max_runs}" \
+            --snapshotEvery "${snapshot_every}"
+
+      - name: Run stress gate negative control
+        if: always()
+        run: |
+          snapshot_every="${INPUT_STRESS_SNAPSHOT_EVERY:-20}"
+          negative_max_runs="${INPUT_STRESS_NEGATIVE_MAX_RUNS:-40}"
+
+          set +e
+          npm run stress -- \
+            --seed "debt-negative-ci-control" \
+            --maxRuns "${negative_max_runs}" \
+            --snapshotEvery "${snapshot_every}"
+          status=$?
+          set -e
+
+          if [ "${status}" -eq 0 ]; then
+            echo "Negative-control stress run unexpectedly passed."
+            exit 1
+          fi
+
+          gate_file="$(find .deeprun/stress -type f -name 'gate-stop-*.json' | sort | tail -n 1)"
+          if [ -z "${gate_file}" ]; then
+            echo "Expected gate-stop artifact was not created."
+            exit 1
+          fi
+
+          echo "gate_file=${gate_file}"
+          grep -q '"gate": "DEBT_PAYDOWN_FAILURE"' "${gate_file}"
+
+      - name: Run adversarial reliability matrix
+        if: always()
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
+            matrix_runs="20"
+            legal_slow_sessions="3"
+          else
+            matrix_runs="12"
+            legal_slow_sessions="2"
+          fi
+
+          set +e
+          npm run matrix:reliability -- \
+            --runs "${matrix_runs}" \
+            --legalSlowSessions "${legal_slow_sessions}" \
+            --output ".deeprun/reliability-matrix/proof-pack.json"
+          matrix_status=$?
+          set -e
+
+          if [ ! -f .deeprun/reliability-matrix/proof-pack.json ]; then
+            echo "proof-pack.json was not created."
+            exit 1
+          fi
+
+          node - <<'NODE'
+          const fs = require("node:fs");
+          const pack = JSON.parse(fs.readFileSync(".deeprun/reliability-matrix/proof-pack.json", "utf8"));
+          if (pack.proofPackSchemaVersion !== 1) {
+            console.error(`Expected proofPackSchemaVersion=1, got ${pack.proofPackSchemaVersion}`);
+            process.exit(1);
+          }
+          if (!pack.summary || typeof pack.summary.failedCases !== "number") {
+            console.error("Proof pack missing summary.failedCases.");
+            process.exit(1);
+          }
+          if (!Array.isArray(pack.results) || pack.results.length === 0) {
+            console.error("Proof pack missing results.");
+            process.exit(1);
+          }
+          if (pack.summary.failedCases > 0) {
+            console.error(`Reliability matrix reported ${pack.summary.failedCases} failed cases.`);
+            process.exit(1);
+          }
+          NODE
+
+          if [ "${matrix_status}" -ne 0 ]; then
+            echo "Matrix runner exited with ${matrix_status}."
+            exit "${matrix_status}"
+          fi
+
       - name: Stop deeprun API
         if: always()
         run: |
@@ -156,3 +285,5 @@ jobs:
             .deeprun/reliability-report.json
             .deeprun/reliability-report.retry.json
             .deeprun/reliability-server.log
+            .deeprun/reliability-matrix/**
+            .deeprun/stress/**

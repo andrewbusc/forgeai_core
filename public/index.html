@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>deeprun</title>
+    <title>DeepRun Factory</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -13,30 +13,38 @@
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
+    <div class="bg-grid"></div>
     <div class="bg-glow bg-glow-a"></div>
     <div class="bg-glow bg-glow-b"></div>
 
     <div class="app-shell">
       <aside class="sidebar panel">
         <div class="brand-block">
-          <h1>deeprun</h1>
-          <p>AI app builder with auth, organizations, workspaces, and Git versioning.</p>
+          <div class="brand-mark">
+            <span class="brand-mark-dot"></span>
+            <span class="brand-mark-label">DeepRun</span>
+          </div>
+          <h1>Control Room</h1>
+          <p>Queue runs, review changes, validate outputs, and deploy only when they are ready.</p>
         </div>
 
-        <section class="card-block" id="auth-card">
-          <h2>Authentication</h2>
+        <section class="card-block auth-card" id="auth-card">
+          <div class="card-heading">
+            <p class="eyebrow">Access</p>
+            <h2>Operator Session</h2>
+          </div>
 
           <div id="auth-guest">
             <form id="auth-form" class="compact-form">
               <label>
-                <span>Mode</span>
+                <span>Session Mode</span>
                 <select id="auth-mode">
                   <option value="login">Login</option>
                   <option value="register">Register</option>
                 </select>
               </label>
               <label id="auth-name-wrap" class="hidden">
-                <span>Name</span>
+                <span>Operator Name</span>
                 <input id="auth-name" placeholder="Ada Lovelace" />
               </label>
               <label>
@@ -55,18 +63,21 @@
                 <span>Initial Workspace</span>
                 <input id="auth-workspace-name" placeholder="Product Core" />
               </label>
-              <button type="submit" id="auth-submit">Continue</button>
+              <button type="submit" id="auth-submit">Enter Control Room</button>
             </form>
           </div>
 
           <div id="auth-user" class="hidden">
             <p id="auth-user-info" class="muted-copy"></p>
-            <button id="logout-btn" type="button" class="ghost-btn">Logout</button>
+            <button id="logout-btn" type="button" class="ghost-btn">Sign Out</button>
           </div>
         </section>
 
         <section class="card-block hidden" id="org-card">
-          <h2>Organizations</h2>
+          <div class="card-heading">
+            <p class="eyebrow">Scope</p>
+            <h2>Organizations & Workspaces</h2>
+          </div>
           <form id="org-selection-form" class="compact-form">
             <label>
               <span>Organization</span>
@@ -94,12 +105,15 @@
               <option value="member">member</option>
               <option value="admin">admin</option>
             </select>
-            <button type="submit">Add</button>
+            <button type="submit">Invite</button>
           </form>
         </section>
 
         <form id="create-project-form" class="create-form hidden">
-          <h2>New Project</h2>
+          <div class="card-heading">
+            <p class="eyebrow">Project Setup</p>
+            <h2>New Project</h2>
+          </div>
           <label>
             <span>Name</span>
             <input id="project-name" name="name" placeholder="Revenue Ops Copilot" required minlength="2" />
@@ -117,7 +131,10 @@
 
         <section class="project-list-wrap hidden" id="projects-card">
           <div class="list-header">
-            <h2>Projects</h2>
+            <div class="card-heading-inline">
+              <p class="eyebrow">Portfolio</p>
+              <h2>Projects</h2>
+            </div>
             <button id="refresh-projects" class="ghost-btn" type="button">Refresh</button>
           </div>
           <div id="project-list" class="project-list"></div>
@@ -125,105 +142,308 @@
       </aside>
 
       <main class="workspace">
-        <header class="workspace-header panel">
-          <div>
-            <h2 id="active-project-name">No project selected</h2>
-            <p id="active-project-meta">Authenticate and choose a workspace to begin.</p>
-          </div>
-          <div class="provider-controls">
-            <label>
-              <span>Provider</span>
-              <select id="provider-select"></select>
-            </label>
-            <label>
-              <span>Model</span>
-              <input id="model-input" placeholder="Optional model override" />
-            </label>
-          </div>
-        </header>
+        <div class="workspace-toolbar">
+          <button id="sidebar-toggle" type="button" class="sidebar-toggle" aria-pressed="false" aria-label="Toggle sidebar">
+            <span class="sidebar-toggle-icon" aria-hidden="true"></span>
+            <span id="sidebar-toggle-label">Hide Sidebar</span>
+          </button>
+        </div>
 
-        <section class="panel prompt-panel">
-          <div class="prompt-header">
-            <h3>Builder Prompt</h3>
-            <div class="prompt-actions">
-              <button id="generate-btn" type="button">Generate Build</button>
-              <button id="chat-btn" type="button" class="ghost-btn">Refine in Chat</button>
-              <button id="deploy-btn" type="button" class="ghost-btn">Deploy Production</button>
-            </div>
-          </div>
-          <textarea
-            id="prompt-input"
-            rows="5"
-            placeholder="Example: Add role-based auth, analytics dashboard, and event streaming pipeline with tests."
-          ></textarea>
-          <label class="deploy-inline">
-            <span>Custom Domain (optional)</span>
-            <input id="deploy-custom-domain" placeholder="app.example.com" />
-          </label>
-          <div id="status-line" class="status-line"></div>
-        </section>
-
-        <section class="workspace-grid">
-          <section class="panel files-panel">
-            <div class="section-header">
-              <h3>Files</h3>
-              <button id="refresh-files" type="button" class="ghost-btn">Reload</button>
-            </div>
-            <div id="file-tree" class="file-tree"></div>
-          </section>
-
-          <section class="panel editor-panel">
-            <div class="section-header">
-              <h3 id="editor-title">Editor</h3>
-              <button id="save-file" type="button">Save File</button>
-            </div>
-            <textarea id="file-editor" spellcheck="false" placeholder="Select a file to edit"></textarea>
-          </section>
-
-          <section class="panel history-panel">
-            <div class="section-header">
-              <h3>Activity</h3>
-            </div>
-            <div id="history-list" class="history-list"></div>
-
-            <div class="section-header">
-              <h3>Agent Runs</h3>
-              <button id="refresh-runs" type="button" class="ghost-btn">Reload</button>
-            </div>
-            <div id="run-list" class="history-list"></div>
-
-            <div class="section-header">
-              <h3>Run Detail</h3>
-              <div class="prompt-actions">
-                <button id="resume-run" type="button" class="ghost-btn">Resume</button>
-                <button id="validate-run" type="button" class="ghost-btn">Validate Output</button>
+        <section id="home-screen" class="home-screen">
+          <section class="panel hero-panel">
+            <div class="hero-copy">
+              <p class="eyebrow">Governed Agent Factory</p>
+              <h2>Run the factory without staring at everything at once.</h2>
+              <p class="hero-text">
+                DeepRun turns prompts into durable runs, validation gates, and deployment decisions. The UI is now
+                focused on the main control path instead of showing every subsystem at the same time.
+              </p>
+              <div class="hero-checks">
+                <span>Durable run queue</span>
+                <span>Validation-first flow</span>
+                <span>Debt-aware release</span>
               </div>
             </div>
-            <pre id="run-detail" class="diff-view"></pre>
-
-            <div class="section-header">
-              <h3>Git History</h3>
-              <button id="refresh-git" type="button" class="ghost-btn">Reload</button>
+            <div class="hero-terminal">
+              <div class="terminal-head">
+                <span></span>
+                <span></span>
+                <span></span>
+                <p>deeprun factory status</p>
+              </div>
+              <div class="terminal-body">
+                <div>$ deeprun run --profile ci --wait</div>
+                <div class="terminal-good">run_jobs claimed · lease renewed · worker active</div>
+                <div>validation: strict gates available</div>
+                <div>stub debt: tracked, paydown enforced</div>
+                <div class="terminal-good">release: governed, not guessed</div>
+              </div>
             </div>
+          </section>
+        </section>
 
-            <form id="manual-commit-form" class="inline-form">
-              <input id="manual-commit-message" placeholder="Commit message" />
-              <button type="submit">Commit</button>
-            </form>
-
-            <div id="git-list" class="history-list"></div>
-            <pre id="git-diff" class="diff-view"></pre>
-
-            <div class="section-header">
-              <h3>Deployments</h3>
-              <button id="refresh-deployments" type="button" class="ghost-btn">Reload</button>
+        <section id="dashboard-screen" class="dashboard-screen hidden">
+          <header class="workspace-header panel">
+            <div>
+              <p class="eyebrow">Active Control Surface</p>
+              <h2 id="active-project-name">No project selected</h2>
+              <p id="active-project-meta">Authenticate and choose a workspace to begin.</p>
             </div>
-            <div id="deployment-list" class="history-list"></div>
-            <pre id="deployment-logs" class="diff-view"></pre>
+            <div class="provider-controls">
+              <label>
+                <span>Provider</span>
+                <select id="provider-select"></select>
+              </label>
+              <label>
+                <span>Model</span>
+                <input id="model-input" placeholder="Optional model override" />
+              </label>
+            </div>
+          </header>
+
+          <section id="dashboard-metrics" class="dashboard-metrics"></section>
+
+          <section class="panel stage-strip">
+            <div class="stage-strip-copy">
+              <p class="eyebrow">Lifecycle</p>
+              <h3>Build to governed release</h3>
+              <p id="stage-caption">Move through the build lifecycle one stage at a time.</p>
+            </div>
+            <nav class="stage-nav" id="stage-nav" aria-label="Workspace stages">
+              <button type="button" class="stage-btn active" data-stage="build">Build</button>
+              <button type="button" class="stage-btn" data-stage="review">Review</button>
+              <button type="button" class="stage-btn" data-stage="validate">Validate</button>
+              <button type="button" class="stage-btn" data-stage="deploy">Deploy</button>
+            </nav>
+          </section>
+
+          <section class="stage-body">
+            <section id="stage-build" class="stage-view">
+              <section class="panel prompt-panel">
+                <div class="prompt-header">
+                  <div class="card-heading-inline">
+                    <p class="eyebrow">Build Request</p>
+                    <h3>Queue a new generation pass</h3>
+                  </div>
+                  <div class="prompt-actions">
+                    <button id="generate-btn" type="button">Generate Build</button>
+                    <button id="chat-btn" type="button" class="ghost-btn">Refine in Chat</button>
+                  </div>
+                </div>
+                <textarea
+                  id="prompt-input"
+                  rows="6"
+                  placeholder="Example: Add role-based auth, analytics dashboard, and event streaming pipeline with tests."
+                ></textarea>
+                <div id="status-line" class="status-line"></div>
+              </section>
+
+              <div class="build-grid">
+                <section class="panel stage-card">
+                  <div class="section-header">
+                    <div class="card-heading-inline">
+                      <p class="eyebrow">Execution Context</p>
+                      <h3>Build Brief</h3>
+                    </div>
+                  </div>
+                  <div id="build-overview" class="overview-stack"></div>
+                </section>
+              </div>
+            </section>
+
+            <section id="stage-review" class="stage-view hidden">
+              <div class="review-grid">
+                <section class="panel files-panel">
+                  <div class="section-header">
+                    <div class="card-heading-inline">
+                      <p class="eyebrow">Workspace</p>
+                      <h3>Files</h3>
+                    </div>
+                    <button id="refresh-files" type="button" class="ghost-btn">Reload</button>
+                  </div>
+                  <div id="file-tree" class="file-tree"></div>
+                </section>
+
+                <section class="panel editor-panel">
+                  <div class="section-header">
+                    <div class="card-heading-inline">
+                      <p class="eyebrow">Editor</p>
+                      <h3 id="editor-title">Editor</h3>
+                    </div>
+                    <button id="save-file" type="button">Save File</button>
+                  </div>
+                  <textarea id="file-editor" spellcheck="false" placeholder="Select a file to edit"></textarea>
+                </section>
+
+                <div class="stage-stack">
+                  <section class="panel history-panel">
+                    <div class="section-header">
+                      <div class="card-heading-inline">
+                        <p class="eyebrow">Execution Feed</p>
+                        <h3>Activity</h3>
+                      </div>
+                    </div>
+                    <div id="history-list" class="history-list"></div>
+                  </section>
+
+                  <section class="panel history-panel">
+                    <div class="section-header">
+                      <div class="card-heading-inline">
+                        <p class="eyebrow">Versioning</p>
+                        <h3>Git History</h3>
+                      </div>
+                      <button id="refresh-git" type="button" class="ghost-btn">Reload</button>
+                    </div>
+
+                    <form id="manual-commit-form" class="inline-form">
+                      <input id="manual-commit-message" placeholder="Commit message" />
+                      <button type="submit">Commit</button>
+                    </form>
+
+                    <div id="git-list" class="history-list"></div>
+                    <pre id="git-diff" class="diff-view"></pre>
+                  </section>
+                </div>
+              </div>
+            </section>
+
+            <section id="stage-validate" class="stage-view hidden">
+              <div class="validate-grid">
+                <section class="panel stage-card">
+                  <div class="section-header">
+                    <div class="card-heading-inline">
+                      <p class="eyebrow">Queue & Outcomes</p>
+                      <h3>Run History</h3>
+                    </div>
+                    <button id="refresh-runs" type="button" class="ghost-btn">Reload</button>
+                  </div>
+                  <div class="run-filters">
+                    <div class="run-search-wrap">
+                      <input id="run-search-input" placeholder="Search run ID, goal, branch, or status" />
+                      <button id="run-search-clear" type="button" class="ghost-btn hidden">Clear</button>
+                    </div>
+                    <div class="run-tabs" id="run-status-tabs">
+                      <button type="button" class="run-tab active" data-run-tab="all">All</button>
+                      <button type="button" class="run-tab" data-run-tab="active">Active</button>
+                      <button type="button" class="run-tab" data-run-tab="attention">Needs Attention</button>
+                      <button type="button" class="run-tab" data-run-tab="complete">Complete</button>
+                    </div>
+                    <div class="run-profile-filters" id="run-profile-filters">
+                      <button type="button" class="run-chip-filter active" data-run-profile="all">all profiles</button>
+                      <button type="button" class="run-chip-filter" data-run-profile="full">full</button>
+                      <button type="button" class="run-chip-filter" data-run-profile="ci">ci</button>
+                      <button type="button" class="run-chip-filter" data-run-profile="smoke">smoke</button>
+                    </div>
+                  </div>
+                  <div id="run-list" class="history-list run-list"></div>
+                </section>
+
+                <div class="stage-stack">
+                  <section class="panel stage-card">
+                    <div class="section-header">
+                      <div class="card-heading-inline">
+                        <p class="eyebrow">Readiness</p>
+                        <h3>Validation Summary</h3>
+                      </div>
+                      <div class="prompt-actions">
+                        <button id="resume-run" type="button" class="ghost-btn">Resume</button>
+                        <button id="validate-run" type="button" class="ghost-btn">Validate Output</button>
+                      </div>
+                    </div>
+                    <div id="validate-summary" class="overview-stack"></div>
+                  </section>
+
+                  <section class="panel stage-card">
+                    <div class="section-header">
+                      <div class="card-heading-inline">
+                        <p class="eyebrow">Quick Trace</p>
+                        <h3>Selected Run Snapshot</h3>
+                      </div>
+                    </div>
+                    <pre id="run-detail" class="diff-view"></pre>
+                  </section>
+                </div>
+              </div>
+            </section>
+
+            <section id="stage-deploy" class="stage-view hidden">
+              <div class="deploy-grid">
+                <section class="panel stage-card deploy-action-card">
+                  <div class="section-header">
+                    <div class="card-heading-inline">
+                      <p class="eyebrow">Release Contract</p>
+                      <h3>Deploy Readiness</h3>
+                    </div>
+                  </div>
+                  <div id="deploy-eligibility" class="overview-stack"></div>
+                  <label class="deploy-inline">
+                    <span>Custom Domain (optional)</span>
+                    <input id="deploy-custom-domain" placeholder="app.example.com" />
+                  </label>
+                  <div class="prompt-actions">
+                    <button id="deploy-btn" type="button">Deploy Production</button>
+                  </div>
+                </section>
+
+                <section class="panel stage-card">
+                  <div class="section-header">
+                    <div class="card-heading-inline">
+                      <p class="eyebrow">Runtime</p>
+                      <h3>Deployments</h3>
+                    </div>
+                    <button id="refresh-deployments" type="button" class="ghost-btn">Reload</button>
+                  </div>
+                  <div id="deployment-list" class="history-list"></div>
+                </section>
+
+                <section class="panel stage-card">
+                  <div class="section-header">
+                    <div class="card-heading-inline">
+                      <p class="eyebrow">Logs</p>
+                      <h3>Deployment Logs</h3>
+                    </div>
+                  </div>
+                  <pre id="deployment-logs" class="diff-view"></pre>
+                </section>
+              </div>
+            </section>
           </section>
         </section>
       </main>
     </div>
+
+    <div id="run-drawer-backdrop" class="drawer-backdrop hidden"></div>
+    <aside id="run-drawer" class="run-drawer hidden" aria-hidden="true">
+      <div class="run-drawer-head">
+        <div>
+          <p class="eyebrow">Run Inspector</p>
+          <h3 id="run-drawer-title">No run selected</h3>
+          <p id="run-drawer-subtitle" class="drawer-subtitle">Choose a run from Run History.</p>
+        </div>
+        <button id="run-drawer-close" type="button" class="ghost-btn">Close</button>
+      </div>
+      <div class="run-drawer-body">
+        <div id="run-drawer-summary" class="drawer-grid"></div>
+        <section class="drawer-section">
+          <div class="section-header">
+            <div class="card-heading-inline">
+              <p class="eyebrow">Validation</p>
+              <h4>Run Readiness</h4>
+            </div>
+          </div>
+          <div id="run-drawer-validation" class="drawer-stack"></div>
+        </section>
+        <section class="drawer-section">
+          <div class="section-header">
+            <div class="card-heading-inline">
+              <p class="eyebrow">Execution</p>
+              <h4>Recent Steps</h4>
+            </div>
+          </div>
+          <div id="run-drawer-steps" class="drawer-stack"></div>
+        </section>
+      </div>
+    </aside>
 
     <script type="module" src="./app.js"></script>
   </body>

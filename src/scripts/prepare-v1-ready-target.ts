@@ -1,6 +1,7 @@
 import path from "node:path";
 import { rm } from "node:fs/promises";
 import { ensureDir, writeTextFile } from "../lib/fs-utils.js";
+import { workspacePath } from "../lib/workspace.js";
 import { getTemplate } from "../templates/catalog.js";
 import type { ProjectTemplateId } from "../types.js";
 
@@ -23,7 +24,7 @@ function printHelp(): void {
       "Usage: npm run prepare:v1-ready-target -- [options]",
       "",
       "Options:",
-      "  --output <path>      Target directory to scaffold (default: .deeprun/v1-ready-target)",
+      "  --output <path>      Target directory to scaffold (default: DEEPRUN_WORKSPACE_ROOT/.deeprun/v1-ready-target)",
       "  --template <id>      Template id (default: canonical-backend)",
       "  --clean <bool>       Remove target directory before scaffold (default: true)",
       "  --help               Show this help message",
@@ -72,7 +73,7 @@ function parseOptions(argv: string[]): PrepareOptions {
     throw new Error(`Unsupported template '${templateIdRaw}'.`);
   }
 
-  const outputPath = path.resolve(options.output || path.join(process.cwd(), ".deeprun", "v1-ready-target"));
+  const outputPath = path.resolve(options.output || workspacePath(".deeprun", "v1-ready-target"));
 
   return {
     outputPath,

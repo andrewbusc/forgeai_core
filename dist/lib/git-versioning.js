@@ -62,7 +62,7 @@ export async function ensureGitRepo(projectDir) {
     if (!(await isGitRepo(projectDir))) {
         await execGit(projectDir, ["init"]);
     }
-    await execGit(projectDir, ["config", "user.name", process.env.GIT_AUTHOR_NAME || "ForgeAI Builder"]);
+    await execGit(projectDir, ["config", "user.name", process.env.GIT_AUTHOR_NAME || "deeprun Builder"]);
     await execGit(projectDir, ["config", "user.email", process.env.GIT_AUTHOR_EMAIL || "builder@local.dev"]);
 }
 function sanitizeRunIdentifier(value) {
@@ -78,7 +78,7 @@ function buildDefaultRunBranch(runId) {
     return `run/${safe.slice(0, 100)}`;
 }
 function buildDefaultWorktreePath(projectDir, runId) {
-    return path.join(projectDir, ".forgeai", "worktrees", sanitizeRunIdentifier(runId) || "run");
+    return path.join(projectDir, ".deeprun", "worktrees", sanitizeRunIdentifier(runId) || "run");
 }
 async function hasPendingChanges(projectDir) {
     const result = await execGit(projectDir, ["status", "--porcelain"]);
@@ -148,11 +148,11 @@ async function ensureHeadCommit(projectDir) {
     if (hash) {
         return hash;
     }
-    hash = await createAutoCommit(projectDir, "forgeai: bootstrap repository");
+    hash = await createAutoCommit(projectDir, "deeprun: bootstrap repository");
     if (hash) {
         return hash;
     }
-    await execGit(projectDir, ["commit", "--allow-empty", "-m", "forgeai: bootstrap repository", "--no-gpg-sign"]);
+    await execGit(projectDir, ["commit", "--allow-empty", "-m", "deeprun: bootstrap repository", "--no-gpg-sign"]);
     const resolved = await readCurrentCommitHash(projectDir);
     if (!resolved) {
         throw new Error("Unable to establish a base commit for repository.");
@@ -208,10 +208,10 @@ export async function resetWorktreeToCommit(projectDir, ref) {
 }
 export async function withIsolatedWorktree(input, runner) {
     await ensureGitRepo(input.projectDir);
-    const root = path.join(input.projectDir, ".forgeai", "validation");
+    const root = path.join(input.projectDir, ".deeprun", "validation");
     await ensureDir(root);
     const isolatedRoot = await fs.mkdtemp(path.join(root, `${input.prefix || "check"}-`));
-    const ref = input.ref?.trim() || "HEAD";
+    const ref = input.ref?.trim() || (await ensureHeadCommit(input.projectDir));
     await execGit(input.projectDir, ["worktree", "add", "--detach", isolatedRoot, ref]);
     try {
         return await runner(isolatedRoot);

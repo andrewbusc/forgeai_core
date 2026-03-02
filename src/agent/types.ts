@@ -6,6 +6,8 @@ export const agentStepTypeSchema = z.enum(["analyze", "modify", "verify"]);
 export type AgentStepType = z.infer<typeof agentStepTypeSchema>;
 
 export const agentToolNameSchema = z.enum([
+  "ai_mutation",
+  "manual_file_write",
   "read_file",
   "write_file",
   "apply_patch",
@@ -19,6 +21,7 @@ export const agentStepSchema = z.object({
   id: z.string().min(1).max(80),
   type: agentStepTypeSchema,
   tool: agentToolNameSchema,
+  mutates: z.boolean().optional(),
   input: z.record(z.unknown()).default({})
 });
 export type AgentStep = z.infer<typeof agentStepSchema>;
@@ -31,9 +34,29 @@ export type AgentPlan = z.infer<typeof agentPlanSchema>;
 
 export const agentRunStatusSchema = canonicalAgentRunStatusSchema;
 export type AgentRunStatus = CanonicalAgentRunStatus;
+export const agentRunValidationStatusSchema = z.enum(["failed", "passed"]);
+export type AgentRunValidationStatus = z.infer<typeof agentRunValidationStatusSchema>;
 
 export const agentStepExecutionStatusSchema = z.enum(["completed", "failed"]);
 export type AgentStepExecutionStatus = z.infer<typeof agentStepExecutionStatusSchema>;
+
+export const agentRunJobTypeSchema = z.enum(["kernel", "validation", "evaluation"]);
+export type AgentRunJobType = z.infer<typeof agentRunJobTypeSchema>;
+
+export const agentRunJobStatusSchema = z.enum(["queued", "claimed", "running", "complete", "failed"]);
+export type AgentRunJobStatus = z.infer<typeof agentRunJobStatusSchema>;
+
+export const workerNodeRoleSchema = z.enum(["compute", "eval"]);
+export type WorkerNodeRole = z.infer<typeof workerNodeRoleSchema>;
+
+export const workerNodeStatusSchema = z.enum(["online", "offline"]);
+export type WorkerNodeStatus = z.infer<typeof workerNodeStatusSchema>;
+
+export const agentRunExecutionValidationModeSchema = z.enum(["off", "warn", "enforce"]);
+export type AgentRunExecutionValidationMode = z.infer<typeof agentRunExecutionValidationModeSchema>;
+
+export const agentRunExecutionProfileSchema = z.enum(["full", "ci", "smoke"]);
+export type AgentRunExecutionProfile = z.infer<typeof agentRunExecutionProfileSchema>;
 
 export interface AgentContext {
   project: Project;
@@ -94,12 +117,41 @@ export interface AgentRun {
   baseCommitHash?: string | null;
   currentCommitHash?: string | null;
   lastValidCommitHash?: string | null;
+  correctionAttempts: number;
+  lastCorrectionReason?: string | null;
+  validationStatus?: AgentRunValidationStatus | null;
+  validationResult?: Record<string, unknown> | null;
+  validatedAt?: string | null;
   runLockOwner?: string | null;
   runLockAcquiredAt?: string | null;
+  metadata?: Record<string, unknown>;
   errorMessage?: string | null;
+  errorDetails?: Record<string, unknown> | null;
   finishedAt?: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface AgentRunJob {
+  id: string;
+  runId: string;
+  jobType: AgentRunJobType;
+  targetRole: WorkerNodeRole;
+  status: AgentRunJobStatus;
+  requiredCapabilities?: Record<string, unknown> | null;
+  assignedNode?: string | null;
+  leaseExpiresAt?: string | null;
+  attemptCount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface WorkerNode {
+  nodeId: string;
+  role: WorkerNodeRole;
+  capabilities: Record<string, unknown>;
+  lastHeartbeat: string;
+  status: WorkerNodeStatus;
 }
 
 export interface StartAgentRunInput {
@@ -109,12 +161,31 @@ export interface StartAgentRunInput {
   providerId: string;
   model?: string;
   requestId: string;
+  executionConfig?: Partial<AgentRunExecutionConfig>;
+}
+
+export interface StartAgentRunWithPlanInput {
+  project: Project;
+  createdByUserId: string;
+  goal: string;
+  providerId: string;
+  model?: string;
+  plan: AgentPlan;
+  requestId: string;
+  metadata?: Record<string, unknown>;
+  executionMode?: "isolated" | "project";
+  executionProfile?: "default" | "builder";
+  executionConfig?: Partial<AgentRunExecutionConfig>;
 }
 
 export interface ResumeAgentRunInput {
   project: Project;
   runId: string;
   requestId: string;
+  createdByUserId?: string;
+  executionConfig?: Partial<AgentRunExecutionConfig>;
+  overrideExecutionConfig?: boolean;
+  fork?: boolean;
 }
 
 export interface ForkAgentRunInput {
@@ -152,6 +223,18 @@ export interface AgentRunDetail {
   run: AgentRun;
   steps: AgentStepRecord[];
   telemetry: AgentRunTelemetry;
+  executionConfigSummary?: AgentRunExecutionConfig;
+  contract?: AgentRunExecutionContract;
+  stubDebt?: {
+    markerCount: number;
+    markerPaths: string[];
+    openCount: number;
+    openTargets: string[];
+    lastStubPath: string | null;
+    lastPaydownAction: string | null;
+    lastPaydownStatus: "open" | "closed" | null;
+    lastPaydownAt: string | null;
+  };
 }
 
 export interface AgentCorrectionClassificationTelemetry {
@@ -221,9 +304,12 @@ export interface AgentRunTelemetry {
 
 export interface StartAgentRunOutput extends AgentRunDetail {
   executedStep?: AgentStepExecution;
+  queuedJob?: AgentRunJob;
 }
 
-export interface ResumeAgentRunOutput extends AgentRunDetail {}
+export interface ResumeAgentRunOutput extends AgentRunDetail {
+  queuedJob?: AgentRunJob;
+}
 
 export interface ForkAgentRunOutput extends AgentRunDetail {}
 
@@ -271,6 +357,7 @@ export interface PlannerInput {
   project: Project;
   projectRoot: string;
   memory?: PlannerMemoryContext;
+  plannerTimeoutMs?: number;
 }
 
 export interface PlannerFailureDiagnostic {
@@ -313,4 +400,55 @@ export interface PlannerRuntimeCorrectionInput extends PlannerInput {
   attempt: number;
   failureReport?: PlannerFailureReport;
   correctionConstraint?: PlannerCorrectionConstraint;
+}
+
+export interface AgentRunExecutionConfig {
+  schemaVersion: number;
+  profile: AgentRunExecutionProfile;
+  lightValidationMode: AgentRunExecutionValidationMode;
+  heavyValidationMode: AgentRunExecutionValidationMode;
+  maxRuntimeCorrectionAttempts: number;
+  maxHeavyCorrectionAttempts: number;
+  correctionPolicyMode: AgentRunExecutionValidationMode;
+  correctionConvergenceMode: AgentRunExecutionValidationMode;
+  plannerTimeoutMs: number;
+  maxFilesPerStep: number;
+  maxTotalDiffBytes: number;
+  maxFileBytes: number;
+  allowEnvMutation: boolean;
+}
+
+export interface AgentRunExecutionContract {
+  schemaVersion: number;
+  hash: string;
+  material: {
+    executionContractSchemaVersion: number;
+    normalizedExecutionConfig: AgentRunExecutionConfig;
+    determinismPolicyVersion: number;
+    plannerPolicyVersion: number;
+    correctionRecipeVersion: number;
+    validationPolicyVersion: number;
+    randomnessSeed: string;
+  };
+  effectiveConfig: AgentRunExecutionConfig;
+  fallbackUsed: boolean;
+  fallbackFields: Array<keyof AgentRunExecutionConfig>;
+}
+
+export function withAgentStepCapabilities(step: AgentStep): AgentStep {
+  if (typeof step.mutates === "boolean") {
+    return step;
+  }
+
+  return {
+    ...step,
+    mutates: step.type === "modify"
+  };
+}
+
+export function withAgentPlanCapabilities(plan: AgentPlan): AgentPlan {
+  return {
+    ...plan,
+    steps: plan.steps.map((step) => withAgentStepCapabilities(step))
+  };
 }

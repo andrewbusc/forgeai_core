@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -9,6 +9,11 @@ import { pathExists } from "../../lib/fs-utils.js";
 import { createAutoCommit } from "../../lib/git-versioning.js";
 import { Project } from "../../types.js";
 import { AgentExecutor } from "../executor.js";
+import {
+  buildExecutionContractMaterial,
+  EXECUTION_CONFIG_SCHEMA_VERSION,
+  hashExecutionContractMaterial
+} from "../execution-contract.js";
 import { AgentKernel } from "../kernel.js";
 import { AgentPlanner } from "../planner.js";
 import { createDefaultAgentToolRegistry } from "../tools/index.js";
@@ -29,6 +34,60 @@ if (!databaseUrl) {
   );
 }
 const requiredDatabaseUrl: string = databaseUrl;
+
+function executionConfigProfile(profile: "full" | "ci" | "smoke"): Record<string, unknown> {
+  if (profile === "ci") {
+    return {
+      schemaVersion: EXECUTION_CONFIG_SCHEMA_VERSION,
+      profile: "ci",
+      lightValidationMode: "off",
+      heavyValidationMode: "off",
+      maxRuntimeCorrectionAttempts: 0,
+      maxHeavyCorrectionAttempts: 0,
+      correctionPolicyMode: "warn",
+      correctionConvergenceMode: "warn",
+      plannerTimeoutMs: 5_000,
+      maxFilesPerStep: 15,
+      maxTotalDiffBytes: 400_000,
+      maxFileBytes: 1_500_000,
+      allowEnvMutation: false
+    };
+  }
+
+  if (profile === "smoke") {
+    return {
+      schemaVersion: EXECUTION_CONFIG_SCHEMA_VERSION,
+      profile: "smoke",
+      lightValidationMode: "warn",
+      heavyValidationMode: "warn",
+      maxRuntimeCorrectionAttempts: 1,
+      maxHeavyCorrectionAttempts: 1,
+      correctionPolicyMode: "warn",
+      correctionConvergenceMode: "warn",
+      plannerTimeoutMs: 10_000,
+      maxFilesPerStep: 15,
+      maxTotalDiffBytes: 400_000,
+      maxFileBytes: 1_500_000,
+      allowEnvMutation: false
+    };
+  }
+
+  return {
+    schemaVersion: EXECUTION_CONFIG_SCHEMA_VERSION,
+    profile: "full",
+    lightValidationMode: "enforce",
+    heavyValidationMode: "enforce",
+    maxRuntimeCorrectionAttempts: 5,
+    maxHeavyCorrectionAttempts: 3,
+    correctionPolicyMode: "enforce",
+    correctionConvergenceMode: "enforce",
+    plannerTimeoutMs: 120_000,
+    maxFilesPerStep: 15,
+    maxTotalDiffBytes: 400_000,
+    maxFileBytes: 1_500_000,
+    allowEnvMutation: false
+  };
+}
 
 interface Harness {
   tmpRoot: string;
@@ -305,6 +364,15 @@ async function destroyHarness(harness: Harness): Promise<void> {
   await rm(harness.tmpRoot, { recursive: true, force: true });
 }
 
+async function countFiles(targetDir: string): Promise<number> {
+  if (!(await pathExists(targetDir))) {
+    return 0;
+  }
+
+  const entries = await readdir(targetDir, { withFileTypes: true });
+  return entries.filter((entry) => entry.isFile()).length;
+}
+
 test("fork -> validate -> resume flow", async () => {
   const previousLightValidation = process.env.AGENT_LIGHT_VALIDATION_MODE;
   const previousHeavyValidation = process.env.AGENT_HEAVY_VALIDATION_MODE;
@@ -367,6 +435,57 @@ test("fork -> validate -> resume flow", async () => {
     const resumedStep = resumed.steps.find((step) => step.stepId === "step-2");
     assert.ok(resumedStep);
     assert.equal(resumedStep?.status, "completed");
+  } finally {
+    if (previousLightValidation === undefined) {
+      delete process.env.AGENT_LIGHT_VALIDATION_MODE;
+    } else {
+      process.env.AGENT_LIGHT_VALIDATION_MODE = previousLightValidation;
+    }
+
+    if (previousHeavyValidation === undefined) {
+      delete process.env.AGENT_HEAVY_VALIDATION_MODE;
+    } else {
+      process.env.AGENT_HEAVY_VALIDATION_MODE = previousHeavyValidation;
+    }
+
+    if (previousHeavyInstall === undefined) {
+      delete process.env.AGENT_HEAVY_INSTALL_DEPS;
+    } else {
+      process.env.AGENT_HEAVY_INSTALL_DEPS = previousHeavyInstall;
+    }
+
+    await destroyHarness(harness);
+  }
+});
+
+test("terminal runs retain worktree artifacts at terminal state", async () => {
+  const previousLightValidation = process.env.AGENT_LIGHT_VALIDATION_MODE;
+  const previousHeavyValidation = process.env.AGENT_HEAVY_VALIDATION_MODE;
+  const previousHeavyInstall = process.env.AGENT_HEAVY_INSTALL_DEPS;
+
+  process.env.AGENT_LIGHT_VALIDATION_MODE = "off";
+  process.env.AGENT_HEAVY_VALIDATION_MODE = "off";
+  process.env.AGENT_HEAVY_INSTALL_DEPS = "false";
+
+  const harness = await createHarness();
+
+  try {
+    const kernel = new AgentKernel({
+      store: harness.store,
+      planner: new DeterministicPlanner()
+    });
+
+    const started = await kernel.startRun({
+      project: harness.project,
+      createdByUserId: harness.userId,
+      goal: "Retain terminal worktree artifact",
+      providerId: "mock",
+      requestId: "kernel-artifact-retention"
+    });
+
+    assert.equal(started.run.status, "complete");
+    assert.ok(started.run.worktreePath);
+    assert.equal(await pathExists(started.run.worktreePath || ""), true);
   } finally {
     if (previousLightValidation === undefined) {
       delete process.env.AGENT_LIGHT_VALIDATION_MODE;
@@ -904,12 +1023,21 @@ test("runtime correction loop stops at configured goal-phase limit", async () =>
 
     assert.equal(started.run.status, "failed");
     assert.equal(started.run.errorMessage, "Runtime correction limit reached (2/2).");
+    assert.equal((started.run.errorDetails as { category?: string } | undefined)?.category, "runtime_correction_limit");
     const correctionSteps = started.steps.filter((entry) => entry.stepId.startsWith("runtime-correction-"));
     assert.equal(correctionSteps.length, 2);
     for (const step of correctionSteps) {
       assert.equal(step.status, "completed");
       assert.ok(step.commitHash);
     }
+
+    const failedVerifyStep = [...started.steps]
+      .sort((a, b) => b.stepIndex - a.stepIndex || b.attempt - a.attempt)
+      .find((entry) => entry.stepId.includes("runtime-retry-2"));
+    assert.ok(failedVerifyStep);
+    const failureDetails = failedVerifyStep?.outputPayload.failureDetails as { category?: string; runtimeStatus?: string } | undefined;
+    assert.equal(failureDetails?.category, "runtime_verification");
+    assert.equal(failureDetails?.runtimeStatus, "failed");
   } finally {
     if (previousLightValidation === undefined) {
       delete process.env.AGENT_LIGHT_VALIDATION_MODE;
@@ -933,6 +1061,685 @@ test("runtime correction loop stops at configured goal-phase limit", async () =>
       delete process.env.AGENT_GOAL_MAX_CORRECTIONS;
     } else {
       process.env.AGENT_GOAL_MAX_CORRECTIONS = previousGoalCorrections;
+    }
+
+    await destroyHarness(harness);
+  }
+});
+
+test("run-scoped execution config overrides env runtime correction limits", async () => {
+  const previousLightValidation = process.env.AGENT_LIGHT_VALIDATION_MODE;
+  const previousHeavyValidation = process.env.AGENT_HEAVY_VALIDATION_MODE;
+  const previousHeavyInstall = process.env.AGENT_HEAVY_INSTALL_DEPS;
+  const previousGoalCorrections = process.env.AGENT_GOAL_MAX_CORRECTIONS;
+
+  process.env.AGENT_LIGHT_VALIDATION_MODE = "off";
+  process.env.AGENT_HEAVY_VALIDATION_MODE = "off";
+  process.env.AGENT_HEAVY_INSTALL_DEPS = "false";
+  process.env.AGENT_GOAL_MAX_CORRECTIONS = "2";
+
+  const harness = await createHarness();
+
+  try {
+    const executor = new ScriptedExecutor((step) => {
+      if (step.id.startsWith("runtime-correction-")) {
+        return buildExecution({
+          step,
+          status: "completed",
+          output: {
+            proposedChanges: [
+              {
+                path: "src/runtime-correction-override.txt",
+                type: "create",
+                newContent: "runtime correction override\n"
+              }
+            ]
+          }
+        });
+      }
+
+      if (step.tool === "run_preview_container") {
+        return buildExecution({
+          step,
+          status: "completed",
+          output: {
+            runtimeStatus: "failed",
+            errorMessage: `runtime unhealthy ${step.id}`,
+            logs: `startup error ${step.id}`
+          }
+        });
+      }
+
+      return buildExecution({
+        step,
+        status: "completed",
+        output: {}
+      });
+    });
+
+    const kernel = new AgentKernel({
+      store: harness.store,
+      planner: new RuntimeCorrectionPlanner(),
+      executor
+    });
+
+    const started = await kernel.startRun({
+      project: harness.project,
+      createdByUserId: harness.userId,
+      goal: "Repair runtime startup with ci profile",
+      providerId: "mock",
+      requestId: "kernel-runtime-correction-execution-config",
+      executionConfig: {
+        profile: "ci"
+      }
+    });
+
+    assert.equal(started.run.status, "failed");
+    assert.equal(started.run.errorMessage, "Runtime correction limit reached (0/0).");
+    assert.equal(started.steps.filter((entry) => entry.stepId.startsWith("runtime-correction-")).length, 0);
+    assert.deepEqual(
+      (started.run.metadata as { executionConfig?: { profile?: string; maxRuntimeCorrectionAttempts?: number } }).executionConfig,
+      {
+        ...executionConfigProfile("ci")
+      }
+    );
+  } finally {
+    if (previousLightValidation === undefined) {
+      delete process.env.AGENT_LIGHT_VALIDATION_MODE;
+    } else {
+      process.env.AGENT_LIGHT_VALIDATION_MODE = previousLightValidation;
+    }
+
+    if (previousHeavyValidation === undefined) {
+      delete process.env.AGENT_HEAVY_VALIDATION_MODE;
+    } else {
+      process.env.AGENT_HEAVY_VALIDATION_MODE = previousHeavyValidation;
+    }
+
+    if (previousHeavyInstall === undefined) {
+      delete process.env.AGENT_HEAVY_INSTALL_DEPS;
+    } else {
+      process.env.AGENT_HEAVY_INSTALL_DEPS = previousHeavyInstall;
+    }
+
+    if (previousGoalCorrections === undefined) {
+      delete process.env.AGENT_GOAL_MAX_CORRECTIONS;
+    } else {
+      process.env.AGENT_GOAL_MAX_CORRECTIONS = previousGoalCorrections;
+    }
+
+    await destroyHarness(harness);
+  }
+});
+
+test("queueResumeRun preserves persisted execution config when unchanged", async () => {
+  const previousLightValidation = process.env.AGENT_LIGHT_VALIDATION_MODE;
+  const previousHeavyValidation = process.env.AGENT_HEAVY_VALIDATION_MODE;
+  const previousPlannerTimeout = process.env.DEEPRUN_PLANNER_TIMEOUT_MS;
+
+  process.env.AGENT_LIGHT_VALIDATION_MODE = "off";
+  process.env.AGENT_HEAVY_VALIDATION_MODE = "off";
+  process.env.DEEPRUN_PLANNER_TIMEOUT_MS = "3000";
+
+  const harness = await createHarness();
+
+  try {
+    const kernel = new AgentKernel({
+      store: harness.store,
+      planner: new DeterministicPlanner()
+    });
+    const persistedExecutionConfig = executionConfigProfile("ci");
+
+    const run = await harness.store.createAgentRun({
+      projectId: harness.project.id,
+      orgId: harness.project.orgId,
+      workspaceId: harness.project.workspaceId,
+      createdByUserId: harness.userId,
+      goal: "resume unchanged config",
+      providerId: "mock",
+      status: "failed",
+      currentStepIndex: 0,
+      plan: {
+        goal: "resume unchanged config",
+        steps: [
+          {
+            id: "step-1",
+            type: "analyze",
+            tool: "list_files",
+            input: {
+              path: "."
+            }
+          }
+        ]
+      },
+      metadata: {
+        executionConfig: persistedExecutionConfig
+      }
+    });
+
+    const resumed = await kernel.queueResumeRun({
+      project: harness.project,
+      runId: run.id,
+      requestId: "queue-resume-unchanged"
+    });
+
+    assert.equal(resumed.run.id, run.id);
+    assert.equal(resumed.run.status, "queued");
+    assert.ok(resumed.queuedJob);
+    assert.deepEqual(
+      (resumed.run.metadata as { executionConfig?: unknown }).executionConfig,
+      persistedExecutionConfig
+    );
+  } finally {
+    if (previousLightValidation === undefined) {
+      delete process.env.AGENT_LIGHT_VALIDATION_MODE;
+    } else {
+      process.env.AGENT_LIGHT_VALIDATION_MODE = previousLightValidation;
+    }
+
+    if (previousHeavyValidation === undefined) {
+      delete process.env.AGENT_HEAVY_VALIDATION_MODE;
+    } else {
+      process.env.AGENT_HEAVY_VALIDATION_MODE = previousHeavyValidation;
+    }
+
+    if (previousPlannerTimeout === undefined) {
+      delete process.env.DEEPRUN_PLANNER_TIMEOUT_MS;
+    } else {
+      process.env.DEEPRUN_PLANNER_TIMEOUT_MS = previousPlannerTimeout;
+    }
+
+    await destroyHarness(harness);
+  }
+});
+
+test("queueResumeRun attaches execution config to legacy runs on first continue", async () => {
+  const harness = await createHarness();
+
+  try {
+    const kernel = new AgentKernel({
+      store: harness.store,
+      planner: new DeterministicPlanner()
+    });
+
+    const run = await harness.store.createAgentRun({
+      projectId: harness.project.id,
+      orgId: harness.project.orgId,
+      workspaceId: harness.project.workspaceId,
+      createdByUserId: harness.userId,
+      goal: "legacy resume attach",
+      providerId: "mock",
+      status: "failed",
+      currentStepIndex: 0,
+      plan: {
+        goal: "legacy resume attach",
+        steps: [
+          {
+            id: "step-1",
+            type: "analyze",
+            tool: "list_files",
+            input: {
+              path: "."
+            }
+          }
+        ]
+      },
+      metadata: {}
+    });
+
+    const resumed = await kernel.queueResumeRun({
+      project: harness.project,
+      runId: run.id,
+      requestId: "queue-resume-legacy"
+    });
+
+    const executionConfig = (resumed.run.metadata as { executionConfig?: { profile?: string } }).executionConfig;
+    assert.ok(executionConfig);
+    assert.equal(executionConfig?.profile, "full");
+    assert.ok(resumed.queuedJob);
+  } finally {
+    await destroyHarness(harness);
+  }
+});
+
+test("queueResumeRun rejects execution config mismatch without override or fork", async () => {
+  const harness = await createHarness();
+
+  try {
+    const kernel = new AgentKernel({
+      store: harness.store,
+      planner: new DeterministicPlanner()
+    });
+
+    const run = await harness.store.createAgentRun({
+      projectId: harness.project.id,
+      orgId: harness.project.orgId,
+      workspaceId: harness.project.workspaceId,
+      createdByUserId: harness.userId,
+      goal: "resume mismatch reject",
+      providerId: "mock",
+      status: "failed",
+      currentStepIndex: 0,
+      plan: {
+        goal: "resume mismatch reject",
+        steps: [
+          {
+            id: "step-1",
+            type: "analyze",
+            tool: "list_files",
+            input: {
+              path: "."
+            }
+          }
+        ]
+      },
+      metadata: {
+        executionConfig: {
+          ...executionConfigProfile("full")
+        }
+      }
+    });
+
+    await assert.rejects(
+      () =>
+        kernel.queueResumeRun({
+          project: harness.project,
+          runId: run.id,
+          requestId: "queue-resume-mismatch",
+          executionConfig: {
+        profile: "ci"
+          }
+        }),
+      /Execution config mismatch/
+    );
+  } finally {
+    await destroyHarness(harness);
+  }
+});
+
+test("queueResumeRun mutates the persisted execution contract only with explicit override", async () => {
+  const harness = await createHarness();
+
+  try {
+    const kernel = new AgentKernel({
+      store: harness.store,
+      planner: new DeterministicPlanner()
+    });
+
+    const run = await harness.store.createAgentRun({
+      projectId: harness.project.id,
+      orgId: harness.project.orgId,
+      workspaceId: harness.project.workspaceId,
+      createdByUserId: harness.userId,
+      goal: "resume override config",
+      providerId: "mock",
+      status: "failed",
+      currentStepIndex: 0,
+      plan: {
+        goal: "resume override config",
+        steps: [
+          {
+            id: "step-1",
+            type: "analyze",
+            tool: "list_files",
+            input: {
+              path: "."
+            }
+          }
+        ]
+      },
+      metadata: {
+        executionConfig: {
+          ...executionConfigProfile("full")
+        }
+      }
+    });
+
+    const resumed = await kernel.queueResumeRun({
+      project: harness.project,
+      runId: run.id,
+      requestId: "queue-resume-override",
+      executionConfig: {
+        profile: "ci"
+      },
+      overrideExecutionConfig: true
+    });
+
+    const executionConfig = (resumed.run.metadata as { executionConfig?: { profile?: string; schemaVersion?: number } }).executionConfig;
+    assert.equal(resumed.run.id, run.id);
+    assert.equal(executionConfig?.profile, "ci");
+    assert.equal(executionConfig?.schemaVersion, EXECUTION_CONFIG_SCHEMA_VERSION);
+  } finally {
+    await destroyHarness(harness);
+  }
+});
+
+test("queueResumeRun forks a new run when execution config changes explicitly", async () => {
+  const previousLightValidation = process.env.AGENT_LIGHT_VALIDATION_MODE;
+  const previousHeavyValidation = process.env.AGENT_HEAVY_VALIDATION_MODE;
+  const previousHeavyInstall = process.env.AGENT_HEAVY_INSTALL_DEPS;
+
+  process.env.AGENT_LIGHT_VALIDATION_MODE = "off";
+  process.env.AGENT_HEAVY_VALIDATION_MODE = "off";
+  process.env.AGENT_HEAVY_INSTALL_DEPS = "false";
+
+  const harness = await createHarness();
+
+  try {
+    const kernel = new AgentKernel({
+      store: harness.store,
+      planner: new DeterministicPlanner()
+    });
+
+    const started = await kernel.startRun({
+      project: harness.project,
+      createdByUserId: harness.userId,
+      goal: "resume fork config",
+      providerId: "mock",
+      requestId: "queue-resume-fork-start",
+      executionConfig: {
+        profile: "full",
+        lightValidationMode: "off",
+        heavyValidationMode: "off",
+        maxRuntimeCorrectionAttempts: 0,
+        maxHeavyCorrectionAttempts: 0,
+        correctionPolicyMode: "warn",
+        correctionConvergenceMode: "warn",
+        plannerTimeoutMs: 120_000
+      }
+    });
+
+    const replayReady =
+      (await harness.store.updateAgentRun(started.run.id, {
+        status: "failed",
+        currentStepIndex: 1,
+        errorMessage: "resume fork config seed",
+        finishedAt: null
+      })) || started.run;
+
+    const forked = await kernel.queueResumeRun({
+      project: harness.project,
+      runId: replayReady.id,
+      requestId: "queue-resume-fork",
+      createdByUserId: harness.userId,
+      fork: true,
+      executionConfig: {
+        profile: "ci"
+      }
+    });
+
+    assert.notEqual(forked.run.id, replayReady.id);
+    assert.equal(forked.run.status, "queued");
+    assert.equal(forked.run.currentStepIndex, replayReady.currentStepIndex);
+    assert.ok(forked.queuedJob);
+
+    const sourceRun = await harness.store.getAgentRun(replayReady.id);
+    const sourceExecutionConfig = (sourceRun?.metadata as { executionConfig?: { profile?: string } }).executionConfig;
+    const forkExecutionConfig = (forked.run.metadata as { executionConfig?: { profile?: string } }).executionConfig;
+
+    assert.equal(sourceExecutionConfig?.profile, "full");
+    assert.equal(forkExecutionConfig?.profile, "ci");
+  } finally {
+    if (previousLightValidation === undefined) {
+      delete process.env.AGENT_LIGHT_VALIDATION_MODE;
+    } else {
+      process.env.AGENT_LIGHT_VALIDATION_MODE = previousLightValidation;
+    }
+
+    if (previousHeavyValidation === undefined) {
+      delete process.env.AGENT_HEAVY_VALIDATION_MODE;
+    } else {
+      process.env.AGENT_HEAVY_VALIDATION_MODE = previousHeavyValidation;
+    }
+
+    if (previousHeavyInstall === undefined) {
+      delete process.env.AGENT_HEAVY_INSTALL_DEPS;
+    } else {
+      process.env.AGENT_HEAVY_INSTALL_DEPS = previousHeavyInstall;
+    }
+
+    await destroyHarness(harness);
+  }
+});
+
+test("executeRunJob fails closed when stored execution contract hash mismatches persisted config", async () => {
+  const harness = await createHarness();
+
+  try {
+    const kernel = new AgentKernel({
+      store: harness.store,
+      planner: new DeterministicPlanner()
+    });
+    const persistedExecutionConfig = executionConfigProfile("full");
+    const run = await harness.store.createAgentRun({
+      projectId: harness.project.id,
+      orgId: harness.project.orgId,
+      workspaceId: harness.project.workspaceId,
+      createdByUserId: harness.userId,
+      goal: "contract hash mismatch",
+      providerId: "mock",
+      model: "mock-v1",
+      status: "queued",
+      currentStepIndex: 0,
+      plan: {
+        goal: "contract hash mismatch",
+        steps: []
+      },
+      metadata: {
+        executionConfig: persistedExecutionConfig,
+        executionContractSchemaVersion: EXECUTION_CONFIG_SCHEMA_VERSION,
+        executionContractHash: "bad-hash",
+        effectiveExecutionConfig: persistedExecutionConfig,
+        executionContractFallbackUsed: false,
+        executionContractFallbackFields: []
+      }
+    });
+
+    await assert.rejects(
+      () =>
+        kernel.executeRunJob({
+          job: { jobType: "kernel", runId: run.id },
+          project: harness.project,
+          requestId: "execute-run-job-contract-mismatch"
+        }),
+      /CONTRACT_MISMATCH/
+    );
+  } finally {
+    await destroyHarness(harness);
+  }
+});
+
+test("executeRunJob refuses unsupported future execution contracts deterministically", async () => {
+  const harness = await createHarness();
+
+  try {
+    const kernel = new AgentKernel({
+      store: harness.store,
+      planner: new DeterministicPlanner()
+    });
+    const persistedExecutionConfig = executionConfigProfile("full");
+    const unsupportedMaterial = {
+      ...buildExecutionContractMaterial(
+        persistedExecutionConfig as unknown as Parameters<typeof buildExecutionContractMaterial>[0]
+      ),
+      plannerPolicyVersion: 999
+    };
+    const run = await harness.store.createAgentRun({
+      projectId: harness.project.id,
+      orgId: harness.project.orgId,
+      workspaceId: harness.project.workspaceId,
+      createdByUserId: harness.userId,
+      goal: "unsupported contract",
+      providerId: "mock",
+      model: "mock-v1",
+      status: "queued",
+      currentStepIndex: 0,
+      plan: {
+        goal: "unsupported contract",
+        steps: []
+      },
+      metadata: {
+        executionConfig: persistedExecutionConfig,
+        executionContractSchemaVersion: EXECUTION_CONFIG_SCHEMA_VERSION,
+        executionContractHash: hashExecutionContractMaterial(unsupportedMaterial),
+        executionContractMaterial: unsupportedMaterial,
+        effectiveExecutionConfig: persistedExecutionConfig,
+        executionContractFallbackUsed: false,
+        executionContractFallbackFields: []
+      }
+    });
+
+    await assert.rejects(
+      () =>
+        kernel.executeRunJob({
+          job: { jobType: "kernel", runId: run.id },
+          project: harness.project,
+          requestId: "execute-run-job-unsupported-contract"
+        }),
+      /UNSUPPORTED_CONTRACT/
+    );
+  } finally {
+    await destroyHarness(harness);
+  }
+});
+
+test("worker lease reclaim completes terminal jobs without duplicating side effects", async () => {
+  const previousLightValidation = process.env.AGENT_LIGHT_VALIDATION_MODE;
+  const previousHeavyValidation = process.env.AGENT_HEAVY_VALIDATION_MODE;
+  const previousHeavyInstall = process.env.AGENT_HEAVY_INSTALL_DEPS;
+
+  process.env.AGENT_LIGHT_VALIDATION_MODE = "off";
+  process.env.AGENT_HEAVY_VALIDATION_MODE = "off";
+  process.env.AGENT_HEAVY_INSTALL_DEPS = "false";
+
+  const harness = await createHarness();
+
+  try {
+    const kernel = new AgentKernel({
+      store: harness.store,
+      planner: new DeterministicPlanner()
+    });
+
+    const queued = await kernel.queueRun({
+      project: harness.project,
+      createdByUserId: harness.userId,
+      goal: "lease reclaim idempotency",
+      providerId: "mock",
+      requestId: "queue-lease-reclaim",
+      executionConfig: executionConfigProfile("ci")
+    });
+
+    const queuedJob = queued.queuedJob;
+    assert.ok(queuedJob);
+
+    await harness.store.upsertWorkerNodeHeartbeat({
+      nodeId: "worker-a",
+      role: "compute",
+      status: "online",
+      capabilities: {}
+    });
+
+    const claimedByA = await harness.store.claimNextRunJob({
+      nodeId: "worker-a",
+      targetRole: "compute",
+      workerCapabilities: {},
+      leaseSeconds: 15,
+      runIds: [queued.run.id]
+    });
+    assert.ok(claimedByA);
+    await harness.store.markRunJobRunning(claimedByA.id, "worker-a", 15);
+
+    const firstDetail = await kernel.executeRunJob({
+      job: claimedByA,
+      project: harness.project,
+      requestId: "worker-a:first-pass"
+    });
+    assert.equal(firstDetail.run.status, "complete");
+
+    const projectRoot = harness.store.getProjectWorkspacePath(harness.project);
+    const stepsAfterFirst = await harness.store.listAgentStepsByRun(queued.run.id);
+    const committedStepCountAfterFirst = stepsAfterFirst.filter((entry) => Boolean(entry.commitHash)).length;
+    const learningCountAfterFirst = Number(
+      (await harness.store.query<{ count: string }>(
+        `SELECT COUNT(*)::text AS count FROM learning_events WHERE run_id = $1`,
+        [queued.run.id]
+      ))[0]?.count || 0
+    );
+    const stubArtifactCountAfterFirst = await countFiles(path.join(projectRoot, ".deeprun", "learning", "stub-debt"));
+    const snapshotCountAfterFirst = await countFiles(path.join(projectRoot, ".deeprun", "learning", "snapshots"));
+
+    await harness.store.query(
+      `UPDATE run_jobs
+       SET lease_expires_at = NOW() - interval '1 second'
+       WHERE id = $1`,
+      [claimedByA.id]
+    );
+
+    await harness.store.upsertWorkerNodeHeartbeat({
+      nodeId: "worker-b",
+      role: "compute",
+      status: "online",
+      capabilities: {}
+    });
+
+    const claimedByB = await harness.store.claimNextRunJob({
+      nodeId: "worker-b",
+      targetRole: "compute",
+      workerCapabilities: {},
+      leaseSeconds: 15,
+      runIds: [queued.run.id]
+    });
+    assert.ok(claimedByB);
+    assert.equal(claimedByB?.id, claimedByA.id);
+    assert.equal(claimedByB?.attemptCount, claimedByA.attemptCount + 1);
+    await harness.store.markRunJobRunning(claimedByB.id, "worker-b", 15);
+
+    const secondDetail = await kernel.executeRunJob({
+      job: claimedByB,
+      project: harness.project,
+      requestId: "worker-b:reclaim-pass"
+    });
+    assert.equal(secondDetail.run.status, "complete");
+
+    await harness.store.completeRunJob(claimedByB.id, "worker-b");
+
+    const stepsAfterSecond = await harness.store.listAgentStepsByRun(queued.run.id);
+    const committedStepCountAfterSecond = stepsAfterSecond.filter((entry) => Boolean(entry.commitHash)).length;
+    const learningCountAfterSecond = Number(
+      (await harness.store.query<{ count: string }>(
+        `SELECT COUNT(*)::text AS count FROM learning_events WHERE run_id = $1`,
+        [queued.run.id]
+      ))[0]?.count || 0
+    );
+    const stubArtifactCountAfterSecond = await countFiles(path.join(projectRoot, ".deeprun", "learning", "stub-debt"));
+    const snapshotCountAfterSecond = await countFiles(path.join(projectRoot, ".deeprun", "learning", "snapshots"));
+    const finalJob = (await harness.store.listRunJobs(20)).find((entry) => entry.runId === queued.run.id);
+
+    // For this deterministic queue case, side effects are committed steps and emitted learning artifacts.
+    assert.equal(committedStepCountAfterSecond, committedStepCountAfterFirst);
+    assert.equal(learningCountAfterSecond, learningCountAfterFirst);
+    assert.equal(stubArtifactCountAfterSecond, stubArtifactCountAfterFirst);
+    assert.equal(snapshotCountAfterSecond, snapshotCountAfterFirst);
+    assert.equal(finalJob?.status, "complete");
+    assert.equal(finalJob?.assignedNode, "worker-b");
+    assert.equal(finalJob?.attemptCount, 2);
+  } finally {
+    if (previousLightValidation === undefined) {
+      delete process.env.AGENT_LIGHT_VALIDATION_MODE;
+    } else {
+      process.env.AGENT_LIGHT_VALIDATION_MODE = previousLightValidation;
+    }
+
+    if (previousHeavyValidation === undefined) {
+      delete process.env.AGENT_HEAVY_VALIDATION_MODE;
+    } else {
+      process.env.AGENT_HEAVY_VALIDATION_MODE = previousHeavyValidation;
+    }
+
+    if (previousHeavyInstall === undefined) {
+      delete process.env.AGENT_HEAVY_INSTALL_DEPS;
+    } else {
+      process.env.AGENT_HEAVY_INSTALL_DEPS = previousHeavyInstall;
     }
 
     await destroyHarness(harness);

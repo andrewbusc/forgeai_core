@@ -1,0 +1,69 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: deeprun
+    volumes:
+      - deeprun_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d deeprun"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      TRUST_PROXY: "false"
+      READINESS_DB_TIMEOUT_MS: "2000"
+      SHUTDOWN_GRACE_MS: "15000"
+      METRICS_ENABLED: "true"
+      METRICS_AUTH_TOKEN: local-metrics-token
+      DEEPRUN_LLM_TIMEOUT_MS: "240000"
+      DEEPRUN_PLANNER_TIMEOUT_MS: "180000"
+      AGENT_FS_MAX_FILES_PER_STEP: "25"
+      DATABASE_URL: postgres://postgres:postgres@db:5432/deeprun
+      DATABASE_SSL: ""
+      CORS_ALLOWED_ORIGINS: http://localhost:3010
+      AUTH_TOKEN_SECRET: local-dev-auth-token-change-me
+      COOKIE_SECURE: "false"
+      COOKIE_SAMESITE: Lax
+      RATE_LIMIT_LOGIN_MAX: "100"
+      RATE_LIMIT_GENERATION_MAX: "100"
+      DEEPRUN_DEFAULT_PROVIDER: openai
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: gpt-4.1-mini
+
+    ports:
+      - "3010:3000"
+    volumes:
+      - deeprun_workspace:/app/.workspace
+      - deeprun_runtime_state:/app/.deeprun
+      - deeprun_data:/app/.data
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/api/ready').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+volumes:
+  deeprun_pg_data:
+  deeprun_workspace:
+  deeprun_runtime_state:
+  deeprun_data:

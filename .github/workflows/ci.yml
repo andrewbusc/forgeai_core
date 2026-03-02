@@ -44,3 +44,6 @@ jobs:
 
       - name: Run CI test gate (includes bootstrap API/CLI coverage)
         run: npm run test:ci
+
+      - name: Run canonical template validation integration guard
+        run: npm run test:template-validation

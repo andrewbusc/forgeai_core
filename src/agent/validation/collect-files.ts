@@ -1,5 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { compareNormalizedPaths } from "../../lib/fs-utils.js";
 import { SourceFileEntry } from "./types.js";
 import { isCodeFile, isTestFilePath, normalizeToPosix, toProjectRelativePath } from "./path-utils.js";
 
@@ -13,7 +14,7 @@ export async function collectProductionFiles(projectRoot: string): Promise<Sourc
   async function walk(dir: string): Promise<void> {
     const entries = await fs.readdir(dir, { withFileTypes: true });
 
-    for (const entry of entries) {
+    for (const entry of entries.sort((left, right) => compareNormalizedPaths(left.name, right.name))) {
       if (ignoredDirs.has(entry.name)) {
         continue;
       }
@@ -51,7 +52,6 @@ export async function collectProductionFiles(projectRoot: string): Promise<Sourc
     throw error;
   }
 
-  files.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
+  files.sort((a, b) => compareNormalizedPaths(a.relativePath, b.relativePath));
   return files;
 }
-

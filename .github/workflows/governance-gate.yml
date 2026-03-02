@@ -1,0 +1,277 @@
+name: Governance Gate
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      fixture_mode:
+        description: "Governance fixture mode"
+        required: false
+        default: "pass"
+        type: choice
+        options:
+          - pass
+          - fail
+
+permissions:
+  contents: read
+
+jobs:
+  governance_gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: deeprun_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d deeprun_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      PORT: 3012
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/deeprun_test
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/deeprun_test
+      NODE_ENV: test
+      AUTH_TOKEN_SECRET: governance-gate-ci-secret
+      CORS_ALLOWED_ORIGINS: http://127.0.0.1:3012
+      RATE_LIMIT_LOGIN_MAX: 500
+      RATE_LIMIT_GENERATION_MAX: 500
+      AGENT_LIGHT_VALIDATION_MODE: off
+      AGENT_HEAVY_VALIDATION_MODE: off
+      AGENT_HEAVY_INSTALL_DEPS: "true"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Start deeprun API
+        run: |
+          mkdir -p .deeprun/governance
+          npx tsx -r dotenv/config src/server.ts > .deeprun/governance/server.log 2>&1 &
+          echo $! > .deeprun/governance/server.pid
+
+          for attempt in $(seq 1 90); do
+            if curl -fsS "http://127.0.0.1:${PORT}/api/health" > /dev/null; then
+              echo "API is healthy."
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "API failed to become healthy."
+          cat .deeprun/governance/server.log || true
+          exit 1
+
+      - name: Run governance gate scenario
+        run: |
+          fixture_mode="${{ github.event.inputs.fixture_mode || 'pass' }}"
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+            fixture_mode="pass"
+          fi
+
+          echo "fixture_mode=${fixture_mode}"
+
+          config_path=".deeprun/governance/cli.json"
+          run_output=".deeprun/governance/run.stdout"
+          decision_output=".deeprun/governance/governance-decision.json"
+          decision_stdout=".deeprun/governance/governance-decision.stdout.json"
+          suffix="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          email="governance-${suffix}@deeprun.local"
+
+          env DEEPRUN_CLI_CONFIG="${config_path}" DATABASE_URL="${DATABASE_URL}" \
+            npm run deeprun -- \
+              init \
+              --api "http://127.0.0.1:${PORT}" \
+              --email "${email}" \
+              --password "Password123!" \
+              --name "Governance Gate" \
+              --org "Governance Org ${suffix}" \
+              --workspace "Governance Workspace ${suffix}" \
+              > .deeprun/governance/init.stdout
+
+          env DEEPRUN_CLI_CONFIG="${config_path}" DATABASE_URL="${DATABASE_URL}" \
+            npm run deeprun -- \
+              run "Build kernel run for governance ${suffix}" \
+              --engine kernel \
+              --provider mock \
+              --profile ci \
+              --wait \
+              --project-name "Governance Project ${suffix}" \
+              > "${run_output}"
+
+          project_id="$(grep '^PROJECT_ID=' "${run_output}" | tail -n 1 | cut -d= -f2-)"
+          run_id="$(grep '^RUN_ID=' "${run_output}" | tail -n 1 | cut -d= -f2-)"
+
+          if [ -z "${project_id}" ] || [ -z "${run_id}" ]; then
+            echo "Failed to extract project/run ids from run output."
+            cat "${run_output}" || true
+            exit 1
+          fi
+
+          strict_flag=""
+          extra_env=""
+          expected_decision="PASS"
+          expected_reason_code=""
+
+          if [ "${fixture_mode}" = "fail" ]; then
+            strict_flag="--strict-v1-ready"
+            extra_env="V1_DOCKER_BIN=__missing_docker_binary__"
+            expected_decision="FAIL"
+            expected_reason_code="RUN_V1_READY_FAILED"
+          else
+            env DATABASE_URL="${DATABASE_URL}" PROJECT_ID="${project_id}" RUN_ID="${run_id}" \
+              npx tsx -e '
+                import { AppStore } from "./src/lib/project-store.ts";
+                const store = new AppStore();
+                const project = await store.getProject(process.env.PROJECT_ID || "");
+                if (!project) {
+                  throw new Error(`Project not found: ${process.env.PROJECT_ID || ""}`);
+                }
+                await store.updateAgentRun(process.env.RUN_ID || "", {
+                  validationStatus: "passed",
+                  validationResult: {
+                    targetPath: store.getProjectWorkspacePath(project),
+                    validation: {
+                      ok: true,
+                      blockingCount: 0,
+                      warningCount: 0,
+                      summary: "governance workflow pass fixture",
+                      checks: []
+                    }
+                  },
+                  validatedAt: new Date().toISOString()
+                });
+                await store.close();
+              '
+          fi
+
+          set +e
+          env DEEPRUN_CLI_CONFIG="${config_path}" DATABASE_URL="${DATABASE_URL}" ${extra_env} \
+            npm run deeprun -- \
+              gate \
+              --project "${project_id}" \
+              --run "${run_id}" \
+              ${strict_flag} \
+              --output "${decision_output}" \
+              > "${decision_stdout}"
+          set -e
+
+          if [ ! -f "${decision_output}" ]; then
+            echo "governance-decision.json was not created."
+            exit 1
+          fi
+
+          node - <<'NODE'
+          const fs = require("node:fs");
+          const decision = JSON.parse(fs.readFileSync(".deeprun/governance/governance-decision.json", "utf8"));
+          const expected = process.env.EXPECTED_DECISION;
+          const expectedReason = process.env.EXPECTED_REASON_CODE || "";
+          if (decision.decision !== expected) {
+            console.error(`Expected decision ${expected}, got ${decision.decision}`);
+            process.exit(1);
+          }
+          if (decision.decisionSchemaVersion !== 2) {
+            console.error(`Expected decisionSchemaVersion=2, got ${decision.decisionSchemaVersion}`);
+            process.exit(1);
+          }
+          if (!decision.decisionHash || decision.decisionHash.length !== 64) {
+            console.error("Decision payload missing decisionHash.");
+            process.exit(1);
+          }
+          if (!Array.isArray(decision.reasonCodes)) {
+            console.error("Decision payload missing reasonCodes.");
+            process.exit(1);
+          }
+          if (!decision.contract || !decision.contract.hash) {
+            console.error("Decision payload missing contract hash.");
+            process.exit(1);
+          }
+          if (!decision.contract.plannerPolicyVersion || !decision.contract.validationPolicyVersion) {
+            console.error("Decision payload missing contract policy versions.");
+            process.exit(1);
+          }
+          if (expectedReason && !decision.reasonCodes.includes(expectedReason)) {
+            console.error(`Expected reason code ${expectedReason}, got ${decision.reasonCodes.join(",")}`);
+            process.exit(1);
+          }
+          NODE
+        env:
+          DEEPRUN_CLI_CONFIG: .deeprun/governance/cli.json
+          EXPECTED_DECISION: ${{ github.event_name == 'pull_request' && 'PASS' || (github.event.inputs.fixture_mode == 'fail' && 'FAIL' || 'PASS') }}
+          EXPECTED_REASON_CODE: ${{ github.event_name == 'pull_request' && '' || (github.event.inputs.fixture_mode == 'fail' && 'RUN_V1_READY_FAILED' || '') }}
+
+      - name: Run fresh public PASS integration check
+        run: |
+          npm run integration:fresh-gate -- \
+            --api "http://127.0.0.1:${PORT}" \
+            --mode pass \
+            --output ".deeprun/fresh-integration/pass-governance-decision.json"
+
+      - name: Restart deeprun API in fail mode
+        run: |
+          if [ -f .deeprun/governance/server.pid ]; then
+            pid="$(cat .deeprun/governance/server.pid)"
+            kill "${pid}" 2>/dev/null || true
+          fi
+          sleep 1
+
+          V1_DOCKER_BIN="__missing_docker_binary__" \
+            npx tsx -r dotenv/config src/server.ts > .deeprun/governance/server-fail.log 2>&1 &
+          echo $! > .deeprun/governance/server.pid
+
+          for attempt in $(seq 1 90); do
+            if curl -fsS "http://127.0.0.1:${PORT}/api/health" > /dev/null; then
+              echo "Fail-mode API is healthy."
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "Fail-mode API failed to become healthy."
+          cat .deeprun/governance/server-fail.log || true
+          exit 1
+
+      - name: Run fresh public FAIL integration check
+        run: |
+          npm run integration:fresh-gate -- \
+            --api "http://127.0.0.1:${PORT}" \
+            --mode fail \
+            --output ".deeprun/fresh-integration/fail-governance-decision.json"
+
+      - name: Stop deeprun API
+        if: always()
+        run: |
+          if [ -f .deeprun/governance/server.pid ]; then
+            pid="$(cat .deeprun/governance/server.pid)"
+            kill "${pid}" 2>/dev/null || true
+          fi
+          sleep 1
+
+      - name: Upload governance artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: governance-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: warn
+          path: |
+            .deeprun/governance/**
+            .deeprun/fresh-integration/**
+            .deeprun/decisions/**

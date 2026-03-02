@@ -199,6 +199,11 @@ async function readRefHash(projectDir: string, ref: string): Promise<string | nu
   return value || null;
 }
 
+export async function resolveCommitHash(projectDir: string, ref: string): Promise<string | null> {
+  await ensureGitRepo(projectDir);
+  return readRefHash(projectDir, ref);
+}
+
 async function readCurrentBranch(projectDir: string): Promise<string | null> {
   const result = await execGit(projectDir, ["rev-parse", "--abbrev-ref", "HEAD"], {
     allowFailure: true

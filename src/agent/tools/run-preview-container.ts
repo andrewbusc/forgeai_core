@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { z } from "zod";
 import { ensureDir, pathExists, readTextFile } from "../../lib/fs-utils.js";
+import { workspacePath } from "../../lib/workspace.js";
 import { AgentTool } from "./index.js";
 import { writeRuntimeLog } from "./runtime-log-store.js";
 
@@ -216,7 +217,7 @@ EXPOSE ${input.containerPort}
 CMD ["sh", "-lc", "${escapeDoubleQuotes(startCommand)}"]
 `;
 
-  const dockerfileDir = path.join(process.cwd(), ".data", "agent-runtime", "dockerfiles");
+  const dockerfileDir = workspacePath(".data", "agent-runtime", "dockerfiles");
   await ensureDir(dockerfileDir);
   const dockerfilePath = path.join(dockerfileDir, `${input.requestId}.Dockerfile`);
   await fs.writeFile(dockerfilePath, generatedDockerfile, "utf8");

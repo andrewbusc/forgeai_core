@@ -38,8 +38,10 @@ export async function runSecurityBaselineValidation(projectRoot, contract = arch
     const byPath = (relativePath) => contentByPath.get(relativePath) || "";
     const hasHelmet = testAny(allSource, [
         /\bfrom\s+["']helmet["']/,
+        /\bfrom\s+["']@fastify\/helmet["']/,
         /\brequire\s*\(\s*["']helmet["']\s*\)/,
-        /\bhelmet\s*\(/
+        /\bhelmet\s*\(/,
+        /\bregister\s*\(\s*helmet\b/
     ]);
     if (contract.rules.securityHelmet.enabled && !hasHelmet) {
         violations.push({
@@ -49,7 +51,12 @@ export async function runSecurityBaselineValidation(projectRoot, contract = arch
             message: "Helmet middleware is required but was not detected."
         });
     }
-    const hasRateLimiting = testAny(allSource, [/\benforceRateLimit\b/, /\brateLimit\b/i, /rate[-_ ]limit/i]);
+    const hasRateLimiting = testAny(allSource, [
+        /\bfrom\s+["']@fastify\/rate-limit["']/,
+        /\benforceRateLimit\b/,
+        /\brateLimit\b/i,
+        /rate[-_ ]limit/i
+    ]);
     if (contract.rules.securityRateLimit.enabled && !hasRateLimiting) {
         violations.push({
             ruleId: contract.rules.securityRateLimit.id,
@@ -95,7 +102,7 @@ export async function runSecurityBaselineValidation(projectRoot, contract = arch
             message: "Environment variable validation was not detected."
         });
     }
-    const hasSecurePasswordHashing = testAny(allSource, [/\bscrypt\b/i, /\bbcrypt\b/i, /\bargon2\b/i]);
+    const hasSecurePasswordHashing = testAny(allSource, [/\bscrypt(?:sync)?\b/i, /\bbcrypt\b/i, /\bargon2\b/i]);
     if (contract.rules.securityPasswordHashing.enabled && !hasSecurePasswordHashing) {
         violations.push({
             ruleId: contract.rules.securityPasswordHashing.id,

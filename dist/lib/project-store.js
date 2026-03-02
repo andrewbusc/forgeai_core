@@ -2,6 +2,15 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { Pool } from "pg";
 import { ensureDir } from "./fs-utils.js";
+import { resolveWorkspaceRoot } from "./workspace.js";
+function deriveLearningEventMetrics(blockingBefore, blockingAfter) {
+    const hasBlockingValues = typeof blockingBefore === "number" && typeof blockingAfter === "number";
+    return {
+        delta: hasBlockingValues ? blockingBefore - blockingAfter : null,
+        regressionFlag: hasBlockingValues ? blockingAfter > blockingBefore : false,
+        convergenceFlag: typeof blockingAfter === "number" ? blockingAfter === 0 : false
+    };
+}
 const schemaSql = `
 CREATE TABLE IF NOT EXISTS users (
   id UUID PRIMARY KEY,
@@ -75,6 +84,8 @@ CREATE TABLE IF NOT EXISTS deployments (
   org_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
   workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
   created_by_user_id UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  run_id UUID,
+  commit_hash TEXT,
   status TEXT NOT NULL CHECK (status IN ('queued', 'building', 'pushing', 'launching', 'ready', 'failed')),
   image_repository TEXT,
   image_tag TEXT,
@@ -113,8 +124,7 @@ CREATE TABLE IF NOT EXISTS agent_runs (
   provider_id TEXT NOT NULL,
   model TEXT,
   status TEXT NOT NULL CHECK (status IN (
-    'queued', 'running', 'cancelling', 'cancelled', 'failed', 'complete',
-    'planned', 'paused', 'completed'
+    'queued', 'running', 'correcting', 'optimizing', 'validating', 'cancelled', 'failed', 'complete'
   )),
   step_index INTEGER NOT NULL DEFAULT 0,
   corrections_used INTEGER NOT NULL DEFAULT 0,
@@ -130,9 +140,16 @@ CREATE TABLE IF NOT EXISTS agent_runs (
   base_commit_hash TEXT,
   current_commit_hash TEXT,
   last_valid_commit_hash TEXT,
+  correction_attempts INTEGER NOT NULL DEFAULT 0,
+  last_correction_reason TEXT,
+  validation_status TEXT CHECK (validation_status IN ('failed', 'passed')),
+  validation_result JSONB,
+  validated_at TIMESTAMPTZ,
   run_lock_owner TEXT,
   run_lock_acquired_at TIMESTAMPTZ,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
   error_message TEXT,
+  error_details JSONB,
   created_at TIMESTAMPTZ NOT NULL,
   updated_at TIMESTAMPTZ NOT NULL,
   finished_at TIMESTAMPTZ
@@ -147,6 +164,7 @@ CREATE TABLE IF NOT EXISTS agent_steps (
   run_id UUID NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
   project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   step_index INTEGER NOT NULL,
+  attempt INTEGER NOT NULL DEFAULT 1,
   step_id TEXT NOT NULL,
   step_type TEXT NOT NULL CHECK (step_type IN (
     'goal', 'correction', 'optimization',
@@ -169,6 +187,39 @@ CREATE TABLE IF NOT EXISTS agent_steps (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_steps_run_step_index ON agent_steps (run_id, step_index);
 CREATE INDEX IF NOT EXISTS idx_agent_steps_run_id ON agent_steps (run_id);
 CREATE INDEX IF NOT EXISTS idx_agent_steps_project_id ON agent_steps (project_id);
+
+CREATE TABLE IF NOT EXISTS run_jobs (
+  id UUID PRIMARY KEY,
+  run_id UUID NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+  job_type TEXT NOT NULL CHECK (job_type IN ('kernel', 'validation', 'evaluation')),
+  target_role TEXT NOT NULL CHECK (target_role IN ('compute', 'eval')),
+  status TEXT NOT NULL CHECK (status IN ('queued', 'claimed', 'running', 'complete', 'failed')),
+  required_capabilities JSONB,
+  assigned_node TEXT,
+  lease_expires_at TIMESTAMPTZ,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_run_jobs_target_role_status_created_at
+  ON run_jobs (target_role, status, created_at ASC);
+CREATE INDEX IF NOT EXISTS idx_run_jobs_lease_expires_at ON run_jobs (lease_expires_at);
+CREATE INDEX IF NOT EXISTS idx_run_jobs_required_caps ON run_jobs USING GIN (required_capabilities);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_run_jobs_active_run_id
+  ON run_jobs (run_id)
+  WHERE status IN ('queued', 'claimed', 'running');
+
+CREATE TABLE IF NOT EXISTS worker_nodes (
+  node_id TEXT PRIMARY KEY,
+  role TEXT NOT NULL CHECK (role IN ('compute', 'eval')),
+  capabilities JSONB NOT NULL DEFAULT '{}'::jsonb,
+  last_heartbeat TIMESTAMPTZ NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('online', 'offline'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_worker_nodes_role_status ON worker_nodes (role, status);
+CREATE INDEX IF NOT EXISTS idx_worker_nodes_last_heartbeat ON worker_nodes (last_heartbeat);
 
 CREATE TABLE IF NOT EXISTS auth_sessions (
   id UUID PRIMARY KEY,
@@ -194,7 +245,7 @@ CREATE TABLE IF NOT EXISTS rate_limits (
 CREATE INDEX IF NOT EXISTS idx_rate_limits_reset_at ON rate_limits (reset_at);
 `;
 const deploymentSelectColumns = `
-id, project_id, org_id, workspace_id, created_by_user_id, status,
+id, project_id, org_id, workspace_id, created_by_user_id, run_id, commit_hash, status,
 image_repository, image_tag, image_ref, image_digest, registry_host,
 container_name, container_id, container_port, host_port,
 subdomain, public_url, custom_domain, is_active, metadata, logs,
@@ -204,13 +255,22 @@ const agentRunSelectColumns = `
 id, project_id, org_id, workspace_id, created_by_user_id, goal,
 provider_id, model, status, current_step_index, plan, last_step_id,
 run_branch, worktree_path, base_commit_hash, current_commit_hash, last_valid_commit_hash,
-run_lock_owner, run_lock_acquired_at,
-error_message, created_at, updated_at, finished_at
+correction_attempts, last_correction_reason,
+validation_status, validation_result, validated_at,
+run_lock_owner, run_lock_acquired_at, metadata,
+error_message, error_details, created_at, updated_at, finished_at
 `;
 const agentStepSelectColumns = `
-id, run_id, project_id, step_index, step_id, step_type, tool,
+id, run_id, project_id, step_index, attempt, step_id, step_type, tool,
 input_payload, output_payload, status, error_message, commit_hash,
 runtime_status, started_at, finished_at, created_at
+`;
+const runJobSelectColumns = `
+id, run_id, job_type, target_role, status, required_capabilities, assigned_node, lease_expires_at,
+attempt_count, created_at, updated_at
+`;
+const workerNodeSelectColumns = `
+node_id, role, capabilities, last_heartbeat, status
 `;
 const projectMetadataSelectColumns = `
 project_id, org_id, workspace_id, architecture_summary, stack_info,
@@ -230,6 +290,12 @@ function toIso(value) {
         return value.toISOString();
     }
     return new Date(value).toISOString();
+}
+function isPgUniqueViolation(error) {
+    return Boolean(error &&
+        typeof error === "object" &&
+        "code" in error &&
+        String(error.code) === "23505");
 }
 function mapUser(row) {
     return {
@@ -335,6 +401,8 @@ function mapDeployment(row) {
         orgId: row.org_id,
         workspaceId: row.workspace_id,
         createdByUserId: row.created_by_user_id,
+        runId: row.run_id,
+        commitHash: row.commit_hash,
         status: row.status,
         imageRepository: row.image_repository,
         imageTag: row.image_tag,
@@ -359,15 +427,59 @@ function mapDeployment(row) {
         finishedAt: row.finished_at ? toIso(row.finished_at) : null
     };
 }
+function normalizeAgentRunStatus(value) {
+    const raw = String(value || "").trim().toLowerCase();
+    if (raw === "planned") {
+        return "queued";
+    }
+    if (raw === "paused" || raw === "cancelling") {
+        return "cancelled";
+    }
+    if (raw === "completed") {
+        return "complete";
+    }
+    if (raw === "queued" ||
+        raw === "running" ||
+        raw === "correcting" ||
+        raw === "optimizing" ||
+        raw === "validating" ||
+        raw === "cancelled" ||
+        raw === "failed" ||
+        raw === "complete") {
+        return raw;
+    }
+    return "failed";
+}
+function normalizeAgentRunValidationStatus(value) {
+    const raw = String(value || "").trim().toLowerCase();
+    if (raw === "failed" || raw === "passed") {
+        return raw;
+    }
+    return null;
+}
+function normalizeAgentRunJobStatus(value) {
+    const raw = String(value || "").trim().toLowerCase();
+    if (raw === "queued" || raw === "claimed" || raw === "running" || raw === "complete" || raw === "failed") {
+        return raw;
+    }
+    return "failed";
+}
+function normalizeAgentRunJobType(value) {
+    const raw = String(value || "").trim().toLowerCase();
+    if (raw === "kernel" || raw === "validation" || raw === "evaluation") {
+        return raw;
+    }
+    return "kernel";
+}
+function normalizeWorkerNodeRole(value) {
+    const raw = String(value || "").trim().toLowerCase();
+    return raw === "eval" ? "eval" : "compute";
+}
+function normalizeWorkerNodeStatus(value) {
+    const raw = String(value || "").trim().toLowerCase();
+    return raw === "offline" ? "offline" : "online";
+}
 function mapAgentRun(row) {
-    const rawStatus = row.status;
-    const normalizedStatus = rawStatus === "complete"
-        ? "completed"
-        : rawStatus === "queued"
-            ? "planned"
-            : rawStatus === "cancelling" || rawStatus === "cancelled"
-                ? "paused"
-                : rawStatus;
     return {
         id: row.id,
         projectId: row.project_id,
@@ -377,7 +489,7 @@ function mapAgentRun(row) {
         goal: row.goal,
         providerId: row.provider_id,
         model: row.model || undefined,
-        status: normalizedStatus,
+        status: normalizeAgentRunStatus(row.status),
         currentStepIndex: Number(row.current_step_index) || 0,
         plan: row.plan && typeof row.plan === "object" && !Array.isArray(row.plan)
             ? row.plan
@@ -388,9 +500,22 @@ function mapAgentRun(row) {
         baseCommitHash: row.base_commit_hash,
         currentCommitHash: row.current_commit_hash,
         lastValidCommitHash: row.last_valid_commit_hash,
+        correctionAttempts: Math.max(0, Number(row.correction_attempts) || 0),
+        lastCorrectionReason: row.last_correction_reason,
+        validationStatus: normalizeAgentRunValidationStatus(row.validation_status),
+        validationResult: row.validation_result && typeof row.validation_result === "object" && !Array.isArray(row.validation_result)
+            ? row.validation_result
+            : null,
+        validatedAt: row.validated_at ? toIso(row.validated_at) : null,
         runLockOwner: row.run_lock_owner,
         runLockAcquiredAt: row.run_lock_acquired_at ? toIso(row.run_lock_acquired_at) : null,
+        metadata: row.metadata && typeof row.metadata === "object" && !Array.isArray(row.metadata)
+            ? row.metadata
+            : {},
         errorMessage: row.error_message,
+        errorDetails: row.error_details && typeof row.error_details === "object" && !Array.isArray(row.error_details)
+            ? row.error_details
+            : null,
         createdAt: toIso(row.created_at),
         updatedAt: toIso(row.updated_at),
         finishedAt: row.finished_at ? toIso(row.finished_at) : null
@@ -402,6 +527,7 @@ function mapAgentStep(row) {
         runId: row.run_id,
         projectId: row.project_id,
         stepIndex: Number(row.step_index) || 0,
+        attempt: Math.max(1, Number(row.attempt) || 1),
         stepId: row.step_id,
         type: row.step_type,
         tool: row.tool,
@@ -418,6 +544,34 @@ function mapAgentStep(row) {
         startedAt: toIso(row.started_at),
         finishedAt: toIso(row.finished_at),
         createdAt: toIso(row.created_at)
+    };
+}
+function mapRunJob(row) {
+    return {
+        id: row.id,
+        runId: row.run_id,
+        jobType: normalizeAgentRunJobType(row.job_type),
+        targetRole: normalizeWorkerNodeRole(row.target_role),
+        status: normalizeAgentRunJobStatus(row.status),
+        requiredCapabilities: row.required_capabilities && typeof row.required_capabilities === "object" && !Array.isArray(row.required_capabilities)
+            ? row.required_capabilities
+            : null,
+        assignedNode: row.assigned_node,
+        leaseExpiresAt: row.lease_expires_at ? toIso(row.lease_expires_at) : null,
+        attemptCount: Math.max(0, Number(row.attempt_count) || 0),
+        createdAt: toIso(row.created_at),
+        updatedAt: toIso(row.updated_at)
+    };
+}
+function mapWorkerNode(row) {
+    return {
+        nodeId: row.node_id,
+        role: normalizeWorkerNodeRole(row.role),
+        capabilities: row.capabilities && typeof row.capabilities === "object" && !Array.isArray(row.capabilities)
+            ? row.capabilities
+            : {},
+        lastHeartbeat: toIso(row.last_heartbeat),
+        status: normalizeWorkerNodeStatus(row.status)
     };
 }
 function mapLifecycleRun(row) {
@@ -458,12 +612,12 @@ function mapLifecycleStep(row) {
 export class AppStore {
     workspaceDir;
     pool;
-    constructor(rootDir = process.cwd()) {
+    constructor(rootDir) {
         const databaseUrl = process.env.DATABASE_URL;
         if (!databaseUrl) {
             throw new Error("DATABASE_URL is required.");
         }
-        this.workspaceDir = path.join(rootDir, ".workspace");
+        this.workspaceDir = path.join(resolveWorkspaceRoot(rootDir), ".workspace");
         this.pool = new Pool({
             connectionString: databaseUrl,
             ssl: process.env.DATABASE_SSL === "require"
@@ -475,13 +629,27 @@ export class AppStore {
     }
     async initialize() {
         await ensureDir(this.workspaceDir);
+        await this.pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto`);
         await this.pool.query(schemaSql);
+        await this.migrateRunQueueCapabilitySchema();
+        await this.migrateAgentRunMetadataSchema();
+        await this.migrateLearningTelemetrySchema();
         await this.migrateAgentStateMachineSchema();
+        await this.migrateAgentRunValidationSchema();
+        await this.migrateAgentRunCorrectionTrackingSchema();
+        await this.migrateDeploymentRunPinSchema();
         await this.pruneExpiredSessions();
         await this.markIncompleteDeploymentsFailed();
     }
     async close() {
         await this.pool.end();
+    }
+    async query(text, values) {
+        const result = await this.pool.query(text, values);
+        return result.rows;
+    }
+    async ping() {
+        await this.pool.query("SELECT 1");
     }
     async withTransaction(runner) {
         const client = await this.pool.connect();
@@ -742,18 +910,18 @@ export class AppStore {
         const id = input.deploymentId || randomUUID();
         const now = new Date().toISOString();
         const result = await this.pool.query(`INSERT INTO deployments (
-         id, project_id, org_id, workspace_id, created_by_user_id, status,
+         id, project_id, org_id, workspace_id, created_by_user_id, run_id, commit_hash, status,
          image_repository, image_tag, image_ref, image_digest, registry_host,
          container_name, container_id, container_port, host_port,
          subdomain, public_url, custom_domain, is_active, metadata, logs, error_message,
          created_at, updated_at, finished_at
        )
        VALUES (
-         $1, $2, $3, $4, $5, $6,
-         $7, $8, $9, NULL, $10,
-         NULL, NULL, $11, NULL,
-         $12, $13, $14, FALSE, $15::jsonb, '', NULL,
-         $16::timestamptz, $17::timestamptz, NULL
+         $1, $2, $3, $4, $5, $6, $7, $8,
+         $9, $10, $11, NULL, $12,
+         NULL, NULL, $13, NULL,
+         $14, $15, $16, FALSE, $17::jsonb, '', NULL,
+         $18::timestamptz, $19::timestamptz, NULL
        )
        RETURNING ${deploymentSelectColumns}`, [
             id,
@@ -761,6 +929,8 @@ export class AppStore {
             input.orgId,
             input.workspaceId,
             input.createdByUserId,
+            input.runId ?? null,
+            input.commitHash ?? null,
             input.status,
             input.imageRepository ?? null,
             input.imageTag ?? null,
@@ -915,7 +1085,8 @@ export class AppStore {
        ADD COLUMN IF NOT EXISTS current_commit_hash TEXT,
        ADD COLUMN IF NOT EXISTS last_valid_commit_hash TEXT,
        ADD COLUMN IF NOT EXISTS run_lock_owner TEXT,
-       ADD COLUMN IF NOT EXISTS run_lock_acquired_at TIMESTAMPTZ`);
+       ADD COLUMN IF NOT EXISTS run_lock_acquired_at TIMESTAMPTZ,
+       ADD COLUMN IF NOT EXISTS error_details JSONB`);
         await this.pool.query(`UPDATE agent_runs
        SET
          phase = COALESCE(phase, 'goal'),
@@ -928,6 +1099,8 @@ export class AppStore {
          last_valid_commit_hash = COALESCE(last_valid_commit_hash, current_commit_hash, base_commit_hash),
          status = CASE status
            WHEN 'planned' THEN 'queued'
+           WHEN 'paused' THEN 'cancelled'
+           WHEN 'cancelling' THEN 'cancelled'
            WHEN 'completed' THEN 'complete'
            ELSE status
          END`);
@@ -962,23 +1135,37 @@ export class AppStore {
            EXECUTE format('ALTER TABLE agent_runs DROP CONSTRAINT IF EXISTS %I', con.conname);
          END LOOP;
        END $$;`);
-        await this.pool.query(`ALTER TABLE agent_runs
-       ADD CONSTRAINT agent_runs_status_check
-       CHECK (status IN ('queued', 'running', 'cancelling', 'cancelled', 'failed', 'complete'))`);
-        await this.pool.query(`ALTER TABLE agent_runs
-       ADD CONSTRAINT agent_runs_phase_check
-       CHECK (phase IN ('goal', 'optimization'))`);
+        await this.pool.query(`DO $$
+       BEGIN
+         ALTER TABLE agent_runs
+         ADD CONSTRAINT agent_runs_status_check
+         CHECK (status IN ('queued', 'running', 'correcting', 'optimizing', 'validating', 'cancelled', 'failed', 'complete'));
+       EXCEPTION
+         WHEN duplicate_object THEN NULL;
+       END $$;`);
+        await this.pool.query(`DO $$
+       BEGIN
+         ALTER TABLE agent_runs
+         ADD CONSTRAINT agent_runs_phase_check
+         CHECK (phase IN ('goal', 'optimization'));
+       EXCEPTION
+         WHEN duplicate_object THEN NULL;
+       END $$;`);
         await this.pool.query(`ALTER TABLE agent_steps
+       ADD COLUMN IF NOT EXISTS attempt INTEGER,
        ADD COLUMN IF NOT EXISTS summary TEXT,
        ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ`);
         await this.pool.query(`UPDATE agent_steps
        SET
+         attempt = COALESCE(attempt, 1),
          summary = COALESCE(summary, ''),
          status = CASE status
            WHEN 'completed' THEN 'complete'
            ELSE status
          END`);
         await this.pool.query(`ALTER TABLE agent_steps
+       ALTER COLUMN attempt SET DEFAULT 1,
+       ALTER COLUMN attempt SET NOT NULL,
        ALTER COLUMN summary SET DEFAULT '',
        ALTER COLUMN summary SET NOT NULL`);
         await this.pool.query(`DO $$
@@ -997,12 +1184,147 @@ export class AppStore {
            EXECUTE format('ALTER TABLE agent_steps DROP CONSTRAINT IF EXISTS %I', con.conname);
          END LOOP;
        END $$;`);
-        await this.pool.query(`ALTER TABLE agent_steps
-       ADD CONSTRAINT agent_steps_step_type_check
-       CHECK (step_type IN ('goal', 'correction', 'optimization', 'analyze', 'modify', 'verify'))`);
-        await this.pool.query(`ALTER TABLE agent_steps
-       ADD CONSTRAINT agent_steps_status_check
-       CHECK (status IN ('pending', 'running', 'complete', 'failed', 'completed'))`);
+        await this.pool.query(`DO $$
+       BEGIN
+         ALTER TABLE agent_steps
+         ADD CONSTRAINT agent_steps_step_type_check
+         CHECK (step_type IN ('goal', 'correction', 'optimization', 'analyze', 'modify', 'verify'));
+       EXCEPTION
+         WHEN duplicate_object THEN NULL;
+       END $$;`);
+        await this.pool.query(`DO $$
+       BEGIN
+         ALTER TABLE agent_steps
+         ADD CONSTRAINT agent_steps_status_check
+         CHECK (status IN ('pending', 'running', 'complete', 'failed', 'completed'));
+       EXCEPTION
+         WHEN duplicate_object THEN NULL;
+       END $$;`);
+        await this.pool.query(`DO $$
+       BEGIN
+         ALTER TABLE agent_steps
+         ADD CONSTRAINT agent_steps_attempt_positive_check
+         CHECK (attempt >= 1);
+       EXCEPTION
+         WHEN duplicate_object THEN NULL;
+       END $$;`);
+        await this.pool.query(`DROP INDEX IF EXISTS idx_agent_steps_run_step_index;`);
+        await this.pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_steps_run_step_attempt_unique ON agent_steps (run_id, step_index, attempt);`);
+        await this.pool.query(`CREATE INDEX IF NOT EXISTS idx_agent_steps_run_step_index ON agent_steps (run_id, step_index);`);
+    }
+    async migrateAgentRunValidationSchema() {
+        await this.pool.query(`ALTER TABLE agent_runs
+       ADD COLUMN IF NOT EXISTS validation_status TEXT CHECK (validation_status IN ('failed', 'passed')),
+       ADD COLUMN IF NOT EXISTS validation_result JSONB,
+       ADD COLUMN IF NOT EXISTS validated_at TIMESTAMPTZ`);
+    }
+    async migrateAgentRunCorrectionTrackingSchema() {
+        await this.pool.query(`ALTER TABLE agent_runs
+       ADD COLUMN IF NOT EXISTS correction_attempts INTEGER NOT NULL DEFAULT 0,
+       ADD COLUMN IF NOT EXISTS last_correction_reason TEXT`);
+    }
+    async migrateDeploymentRunPinSchema() {
+        await this.pool.query(`ALTER TABLE deployments
+       ADD COLUMN IF NOT EXISTS run_id UUID,
+       ADD COLUMN IF NOT EXISTS commit_hash TEXT`);
+    }
+    async migrateRunQueueCapabilitySchema() {
+        await this.pool.query(`ALTER TABLE run_jobs
+       ADD COLUMN IF NOT EXISTS required_capabilities JSONB`);
+        await this.pool.query(`UPDATE run_jobs
+       SET required_capabilities = NULL
+       WHERE required_capabilities = 'null'::jsonb`);
+        await this.pool.query(`ALTER TABLE run_jobs
+       DROP CONSTRAINT IF EXISTS run_jobs_required_capabilities_object_check`);
+        await this.pool.query(`ALTER TABLE run_jobs
+       ADD CONSTRAINT run_jobs_required_capabilities_object_check
+       CHECK (required_capabilities IS NULL OR jsonb_typeof(required_capabilities) = 'object')`);
+        await this.pool.query(`CREATE INDEX IF NOT EXISTS idx_run_jobs_required_caps ON run_jobs USING GIN (required_capabilities)`);
+        await this.pool.query(`ALTER TABLE worker_nodes
+       ADD COLUMN IF NOT EXISTS capabilities JSONB`);
+        await this.pool.query(`UPDATE worker_nodes
+       SET capabilities = '{}'::jsonb
+       WHERE capabilities IS NULL`);
+        await this.pool.query(`ALTER TABLE worker_nodes
+       ALTER COLUMN capabilities SET DEFAULT '{}'::jsonb,
+       ALTER COLUMN capabilities SET NOT NULL`);
+    }
+    async migrateAgentRunMetadataSchema() {
+        await this.pool.query(`ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS metadata JSONB`);
+        await this.pool.query(`UPDATE agent_runs
+       SET metadata = '{}'::jsonb
+       WHERE metadata IS NULL`);
+        await this.pool.query(`ALTER TABLE agent_runs
+       ALTER COLUMN metadata SET DEFAULT '{}'::jsonb,
+       ALTER COLUMN metadata SET NOT NULL`);
+    }
+    async migrateLearningTelemetrySchema() {
+        await this.pool.query(`CREATE TABLE IF NOT EXISTS learning_events (
+         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+         run_id UUID NOT NULL,
+         project_id UUID NOT NULL,
+         step_index INT,
+         event_type TEXT NOT NULL,
+         phase TEXT,
+         clusters JSONB,
+         blocking_before INT,
+         blocking_after INT,
+         architecture_collapse BOOLEAN,
+         invariant_count INT,
+         metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+         outcome TEXT NOT NULL,
+         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+       )`);
+        await this.pool.query(`ALTER TABLE learning_events ALTER COLUMN id SET DEFAULT gen_random_uuid()`);
+        await this.pool.query(`ALTER TABLE learning_events ADD COLUMN IF NOT EXISTS project_id UUID`);
+        await this.pool.query(`ALTER TABLE learning_events ADD COLUMN IF NOT EXISTS event_type TEXT`);
+        await this.pool.query(`ALTER TABLE learning_events
+       ADD COLUMN IF NOT EXISTS delta INTEGER,
+       ADD COLUMN IF NOT EXISTS regression_flag BOOLEAN,
+       ADD COLUMN IF NOT EXISTS convergence_flag BOOLEAN,
+       ADD COLUMN IF NOT EXISTS metadata JSONB`);
+        await this.pool.query(`ALTER TABLE learning_events ALTER COLUMN step_index DROP NOT NULL`);
+        await this.pool.query(`UPDATE learning_events
+       SET
+         project_id = COALESCE(learning_events.project_id, agent_runs.project_id),
+         event_type = COALESCE(NULLIF(learning_events.event_type, ''), 'correction')
+       FROM agent_runs
+       WHERE agent_runs.id = learning_events.run_id`);
+        await this.pool.query(`UPDATE learning_events
+       SET outcome = COALESCE(NULLIF(learning_events.outcome, ''), 'noop')`);
+        await this.pool.query(`UPDATE learning_events
+       SET metadata = '{}'::jsonb
+       WHERE metadata IS NULL`);
+        await this.pool.query(`UPDATE learning_events
+       SET
+         delta = CASE
+           WHEN blocking_before IS NOT NULL AND blocking_after IS NOT NULL
+             THEN blocking_before - blocking_after
+           ELSE NULL
+         END,
+         regression_flag = CASE
+           WHEN blocking_before IS NOT NULL AND blocking_after IS NOT NULL
+             THEN blocking_after > blocking_before
+           ELSE FALSE
+         END,
+         convergence_flag = CASE
+           WHEN blocking_after IS NOT NULL
+             THEN blocking_after = 0
+           ELSE FALSE
+         END
+       WHERE delta IS NULL
+          OR regression_flag IS NULL
+          OR convergence_flag IS NULL`);
+        await this.pool.query(`ALTER TABLE learning_events
+       ALTER COLUMN project_id SET NOT NULL,
+       ALTER COLUMN event_type SET NOT NULL,
+       ALTER COLUMN metadata SET DEFAULT '{}'::jsonb,
+       ALTER COLUMN metadata SET NOT NULL,
+       ALTER COLUMN outcome SET NOT NULL`);
+        await this.pool.query(`CREATE INDEX IF NOT EXISTS learning_events_run_idx ON learning_events(run_id)`);
+        await this.pool.query(`CREATE INDEX IF NOT EXISTS learning_events_project_idx ON learning_events(project_id)`);
+        await this.pool.query(`CREATE INDEX IF NOT EXISTS learning_events_outcome_idx ON learning_events(outcome)`);
+        await this.pool.query(`CREATE INDEX IF NOT EXISTS learning_events_clusters_idx ON learning_events USING GIN (clusters)`);
     }
     async createLifecycleRun(input, client) {
         const runId = input.runId || randomUUID();
@@ -1181,26 +1503,20 @@ export class AppStore {
     async createAgentRun(input) {
         const runId = input.runId || randomUUID();
         const now = new Date().toISOString();
-        const normalizedStatus = input.status === "completed"
-            ? "complete"
-            : input.status === "planned"
-                ? "queued"
-                : input.status === "paused"
-                    ? "cancelling"
-                    : input.status;
+        const normalizedStatus = normalizeAgentRunStatus(input.status);
         const result = await this.pool.query(`INSERT INTO agent_runs (
          id, project_id, org_id, workspace_id, created_by_user_id, goal,
          provider_id, model, status, current_step_index, plan, last_step_id,
          run_branch, worktree_path, base_commit_hash, current_commit_hash, last_valid_commit_hash,
-         run_lock_owner, run_lock_acquired_at,
-         error_message, created_at, updated_at, finished_at
+         run_lock_owner, run_lock_acquired_at, metadata,
+         error_message, error_details, created_at, updated_at, finished_at
        )
        VALUES (
          $1, $2, $3, $4, $5, $6,
          $7, $8, $9, $10, $11::jsonb, $12,
          $13, $14, $15, $16, $17,
-         NULL, NULL,
-         $18, $19::timestamptz, $20::timestamptz, $21::timestamptz
+         NULL, NULL, $18::jsonb,
+         $19, $20::jsonb, $21::timestamptz, $22::timestamptz, $23::timestamptz
        )
        RETURNING ${agentRunSelectColumns}`, [
             runId,
@@ -1220,7 +1536,9 @@ export class AppStore {
             input.baseCommitHash ?? null,
             input.currentCommitHash ?? null,
             input.lastValidCommitHash ?? null,
+            JSON.stringify(input.metadata ?? {}),
             input.errorMessage ?? null,
+            JSON.stringify(input.errorDetails ?? null),
             now,
             now,
             input.finishedAt ?? null
@@ -1247,13 +1565,188 @@ export class AppStore {
        LIMIT $2`, [projectId, limit]);
         return result.rows.map((row) => mapAgentRun(row));
     }
+    async enqueueRunJob(input) {
+        const jobId = randomUUID();
+        const now = new Date().toISOString();
+        try {
+            const result = await this.pool.query(`INSERT INTO run_jobs (
+           id, run_id, job_type, target_role, status, required_capabilities, assigned_node, lease_expires_at, attempt_count, created_at, updated_at
+         )
+         VALUES (
+           $1, $2, $3, $4, 'queued', $5::jsonb, NULL, NULL, 0, $6::timestamptz, $7::timestamptz
+         )
+         RETURNING ${runJobSelectColumns}`, [
+                jobId,
+                input.runId,
+                normalizeAgentRunJobType(input.jobType),
+                normalizeWorkerNodeRole(input.targetRole),
+                input.requiredCapabilities ? JSON.stringify(input.requiredCapabilities) : null,
+                now,
+                now
+            ]);
+            return mapRunJob(result.rows[0]);
+        }
+        catch (error) {
+            if (!isPgUniqueViolation(error)) {
+                throw error;
+            }
+            const existing = await this.getActiveRunJobByRunId(input.runId);
+            if (!existing) {
+                throw error;
+            }
+            return existing;
+        }
+    }
+    async getActiveRunJobByRunId(runId) {
+        const result = await this.pool.query(`SELECT ${runJobSelectColumns}
+       FROM run_jobs
+       WHERE run_id = $1
+         AND status IN ('queued', 'claimed', 'running')
+       ORDER BY created_at DESC
+       LIMIT 1`, [runId]);
+        return result.rows[0] ? mapRunJob(result.rows[0]) : undefined;
+    }
+    async claimNextRunJob(input) {
+        const leaseSeconds = Math.max(15, Math.floor(Number(input.leaseSeconds) || 60));
+        const workerCapabilities = JSON.stringify(input.workerCapabilities ?? {});
+        const runIds = [
+            ...(input.runId ? [String(input.runId)] : []),
+            ...((Array.isArray(input.runIds) ? input.runIds : []).map((value) => String(value)).filter(Boolean))
+        ];
+        const runIdFilter = runIds.length > 0 ? Array.from(new Set(runIds)) : null;
+        const result = await this.pool.query(`UPDATE run_jobs
+       SET status = 'claimed',
+           assigned_node = $1,
+           lease_expires_at = NOW() + make_interval(secs => $4::int),
+           attempt_count = attempt_count + 1,
+           updated_at = NOW()
+       WHERE id = (
+         SELECT id
+         FROM run_jobs
+         WHERE target_role = $2
+           AND ($5::uuid[] IS NULL OR run_id = ANY($5::uuid[]))
+           AND (
+             required_capabilities IS NULL
+             OR required_capabilities <@ $3::jsonb
+           )
+           AND EXISTS (
+             SELECT 1
+             FROM worker_nodes
+             WHERE node_id = $1
+               AND role = $2
+               AND status = 'online'
+           )
+           AND (
+             status = 'queued'
+             OR (
+               status IN ('claimed', 'running')
+               AND lease_expires_at IS NOT NULL
+               AND lease_expires_at < NOW()
+             )
+           )
+         ORDER BY created_at ASC
+         FOR UPDATE SKIP LOCKED
+         LIMIT 1
+       )
+       RETURNING ${runJobSelectColumns}`, [input.nodeId, normalizeWorkerNodeRole(input.targetRole), workerCapabilities, leaseSeconds, runIdFilter]);
+        return result.rows[0] ? mapRunJob(result.rows[0]) : undefined;
+    }
+    async markRunJobRunning(jobId, nodeId, leaseSeconds = 60) {
+        const normalizedLeaseSeconds = Math.max(15, Math.floor(Number(leaseSeconds) || 60));
+        const result = await this.pool.query(`UPDATE run_jobs
+       SET status = 'running',
+           lease_expires_at = NOW() + make_interval(secs => $3::int),
+           updated_at = NOW()
+       WHERE id = $1
+         AND assigned_node = $2
+         AND status IN ('claimed', 'running')
+       RETURNING ${runJobSelectColumns}`, [jobId, nodeId, normalizedLeaseSeconds]);
+        return result.rows[0] ? mapRunJob(result.rows[0]) : undefined;
+    }
+    async renewRunJobLease(jobId, nodeId, leaseSeconds = 60) {
+        const normalizedLeaseSeconds = Math.max(15, Math.floor(Number(leaseSeconds) || 60));
+        const result = await this.pool.query(`UPDATE run_jobs
+       SET lease_expires_at = NOW() + make_interval(secs => $3::int),
+           updated_at = NOW()
+       WHERE id = $1
+         AND assigned_node = $2
+         AND status IN ('claimed', 'running')`, [jobId, nodeId, normalizedLeaseSeconds]);
+        return Number(result.rowCount || 0) > 0;
+    }
+    async completeRunJob(jobId, nodeId) {
+        const result = await this.pool.query(`UPDATE run_jobs
+       SET status = 'complete',
+           lease_expires_at = NULL,
+           updated_at = NOW()
+       WHERE id = $1
+         AND assigned_node = $2
+         AND status IN ('claimed', 'running')
+       RETURNING ${runJobSelectColumns}`, [jobId, nodeId]);
+        return result.rows[0] ? mapRunJob(result.rows[0]) : undefined;
+    }
+    async failRunJob(jobId, nodeId) {
+        const result = await this.pool.query(`UPDATE run_jobs
+       SET status = 'failed',
+           lease_expires_at = NULL,
+           updated_at = NOW()
+       WHERE id = $1
+         AND assigned_node = $2
+         AND status IN ('claimed', 'running')
+       RETURNING ${runJobSelectColumns}`, [jobId, nodeId]);
+        return result.rows[0] ? mapRunJob(result.rows[0]) : undefined;
+    }
+    async upsertWorkerNodeHeartbeat(input) {
+        const result = await this.pool.query(`INSERT INTO worker_nodes (
+         node_id, role, capabilities, last_heartbeat, status
+       )
+       VALUES (
+         $1, $2, $3::jsonb, NOW(), $4
+       )
+       ON CONFLICT (node_id) DO UPDATE
+         SET capabilities = EXCLUDED.capabilities,
+             last_heartbeat = NOW(),
+             status = EXCLUDED.status
+         WHERE worker_nodes.role = EXCLUDED.role
+       RETURNING ${workerNodeSelectColumns}`, [
+            input.nodeId,
+            normalizeWorkerNodeRole(input.role),
+            JSON.stringify(input.capabilities ?? {}),
+            normalizeWorkerNodeStatus(input.status ?? "online")
+        ]);
+        if (!result.rows[0]) {
+            throw new Error(`Worker node '${input.nodeId}' is already registered with a different role.`);
+        }
+        return mapWorkerNode(result.rows[0]);
+    }
+    async markWorkerNodeOffline(nodeId) {
+        const result = await this.pool.query(`UPDATE worker_nodes
+       SET status = 'offline',
+           last_heartbeat = NOW()
+       WHERE node_id = $1
+       RETURNING ${workerNodeSelectColumns}`, [nodeId]);
+        return result.rows[0] ? mapWorkerNode(result.rows[0]) : undefined;
+    }
+    async listWorkerNodes(limit = 100) {
+        const result = await this.pool.query(`SELECT ${workerNodeSelectColumns}
+       FROM worker_nodes
+       ORDER BY last_heartbeat DESC, node_id ASC
+       LIMIT $1`, [limit]);
+        return result.rows.map((row) => mapWorkerNode(row));
+    }
+    async listRunJobs(limit = 200) {
+        const result = await this.pool.query(`SELECT ${runJobSelectColumns}
+       FROM run_jobs
+       ORDER BY created_at DESC
+       LIMIT $1`, [limit]);
+        return result.rows.map((row) => mapRunJob(row));
+    }
     async hasActiveAgentRun(projectId) {
         const result = await this.pool.query(`SELECT EXISTS(
          SELECT 1
          FROM agent_runs
          WHERE project_id = $1
            AND provider_id <> 'state-machine'
-           AND status IN ('queued', 'running', 'cancelling')
+           AND status IN ('queued', 'running', 'correcting', 'optimizing', 'validating')
        ) AS exists`, [projectId]);
         return result.rows[0]?.exists === true;
     }
@@ -1265,18 +1758,7 @@ export class AppStore {
         const mapping = {
             status: {
                 column: "status",
-                transform: (value) => {
-                    if (value === "completed") {
-                        return "complete";
-                    }
-                    if (value === "planned") {
-                        return "queued";
-                    }
-                    if (value === "paused") {
-                        return "cancelling";
-                    }
-                    return value;
-                }
+                transform: (value) => normalizeAgentRunStatus(value)
             },
             currentStepIndex: { column: "current_step_index" },
             plan: {
@@ -1290,9 +1772,31 @@ export class AppStore {
             baseCommitHash: { column: "base_commit_hash" },
             currentCommitHash: { column: "current_commit_hash" },
             lastValidCommitHash: { column: "last_valid_commit_hash" },
+            correctionAttempts: { column: "correction_attempts" },
+            lastCorrectionReason: { column: "last_correction_reason" },
+            validationStatus: {
+                column: "validation_status",
+                transform: (value) => normalizeAgentRunValidationStatus(value)
+            },
+            validationResult: {
+                column: "validation_result",
+                cast: "::jsonb",
+                transform: (value) => JSON.stringify(value ?? null)
+            },
+            validatedAt: { column: "validated_at", cast: "::timestamptz" },
             runLockOwner: { column: "run_lock_owner" },
             runLockAcquiredAt: { column: "run_lock_acquired_at", cast: "::timestamptz" },
+            metadata: {
+                column: "metadata",
+                cast: "::jsonb",
+                transform: (value) => JSON.stringify(value ?? {})
+            },
             errorMessage: { column: "error_message" },
+            errorDetails: {
+                column: "error_details",
+                cast: "::jsonb",
+                transform: (value) => JSON.stringify(value ?? null)
+            },
             finishedAt: { column: "finished_at", cast: "::timestamptz" }
         };
         const assignments = [];
@@ -1352,29 +1856,21 @@ export class AppStore {
     async createAgentStep(input) {
         const stepId = randomUUID();
         const createdAt = new Date().toISOString();
-        const result = await this.pool.query(`INSERT INTO agent_steps (
-         id, run_id, project_id, step_index, step_id, step_type, tool,
+        const result = await this.pool.query(`WITH next_attempt AS (
+         SELECT COALESCE(MAX(attempt), 0) + 1 AS value
+         FROM agent_steps
+         WHERE run_id = $2 AND step_index = $4
+       )
+       INSERT INTO agent_steps (
+         id, run_id, project_id, step_index, attempt, step_id, step_type, tool,
          input_payload, output_payload, status, error_message, commit_hash,
          runtime_status, started_at, finished_at, created_at
        )
        VALUES (
-         $1, $2, $3, $4, $5, $6, $7,
+         $1, $2, $3, $4, (SELECT value FROM next_attempt), $5, $6, $7,
          $8::jsonb, $9::jsonb, $10, $11, $12,
          $13, $14::timestamptz, $15::timestamptz, $16::timestamptz
        )
-       ON CONFLICT (run_id, step_index) DO UPDATE
-       SET
-         step_id = EXCLUDED.step_id,
-         step_type = EXCLUDED.step_type,
-         tool = EXCLUDED.tool,
-         input_payload = EXCLUDED.input_payload,
-         output_payload = EXCLUDED.output_payload,
-         status = EXCLUDED.status,
-         error_message = EXCLUDED.error_message,
-         commit_hash = EXCLUDED.commit_hash,
-         runtime_status = EXCLUDED.runtime_status,
-         started_at = EXCLUDED.started_at,
-         finished_at = EXCLUDED.finished_at
        RETURNING ${agentStepSelectColumns}`, [
             stepId,
             input.runId,
@@ -1395,11 +1891,48 @@ export class AppStore {
         ]);
         return mapAgentStep(result.rows[0]);
     }
+    async writeLearningEvent(input) {
+        const derived = deriveLearningEventMetrics(input.blockingBefore ?? null, input.blockingAfter ?? null);
+        await this.pool.query(`INSERT INTO learning_events (
+         run_id,
+         project_id,
+         step_index,
+         event_type,
+         phase,
+         clusters,
+         blocking_before,
+         blocking_after,
+         architecture_collapse,
+         invariant_count,
+         metadata,
+         outcome,
+         delta,
+         regression_flag,
+         convergence_flag
+       )
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11::jsonb, $12, $13, $14, $15)`, [
+            input.runId,
+            input.projectId,
+            input.stepIndex ?? null,
+            input.eventType,
+            input.phase ?? null,
+            input.clusters ? JSON.stringify(input.clusters) : null,
+            input.blockingBefore ?? null,
+            input.blockingAfter ?? null,
+            input.architectureCollapse ?? null,
+            input.invariantCount ?? null,
+            JSON.stringify(input.metadata ?? {}),
+            input.outcome,
+            derived.delta,
+            derived.regressionFlag,
+            derived.convergenceFlag
+        ]);
+    }
     async listAgentStepsByRun(runId) {
         const result = await this.pool.query(`SELECT ${agentStepSelectColumns}
        FROM agent_steps
        WHERE run_id = $1
-       ORDER BY step_index ASC, created_at ASC`, [runId]);
+       ORDER BY step_index ASC, attempt ASC, created_at ASC`, [runId]);
         return result.rows.map((row) => mapAgentStep(row));
     }
     async createSession(input) {

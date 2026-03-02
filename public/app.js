@@ -16,12 +16,28 @@ const state = {
   activeDeploymentId: "",
   deploymentLogs: "",
   agentRuns: [],
+  runHistoryFilters: {
+    search: "",
+    tab: "all",
+    profile: "all"
+  },
+  expandedText: {},
   activeRunId: "",
   activeRunDetail: null,
-  activeRunValidation: null
+  activeRunValidation: null,
+  runDrawerOpen: false,
+  sidebarCollapsed: false,
+  activeStage: "build"
 };
+let uiBusy = false;
+const SIDEBAR_STORAGE_KEY = "deeprun_sidebar_collapsed_v1";
 
 const el = {
+  appShell: document.querySelector(".app-shell"),
+  homeScreen: document.getElementById("home-screen"),
+  dashboardScreen: document.getElementById("dashboard-screen"),
+  sidebarToggle: document.getElementById("sidebar-toggle"),
+  sidebarToggleLabel: document.getElementById("sidebar-toggle-label"),
   authGuest: document.getElementById("auth-guest"),
   authUser: document.getElementById("auth-user"),
   authForm: document.getElementById("auth-form"),
@@ -59,6 +75,10 @@ const el = {
 
   activeProjectName: document.getElementById("active-project-name"),
   activeProjectMeta: document.getElementById("active-project-meta"),
+  dashboardMetrics: document.getElementById("dashboard-metrics"),
+  stageCaption: document.getElementById("stage-caption"),
+  stageNav: document.getElementById("stage-nav"),
+  stageViews: Array.from(document.querySelectorAll(".stage-view")),
   providerSelect: document.getElementById("provider-select"),
   modelInput: document.getElementById("model-input"),
   promptInput: document.getElementById("prompt-input"),
@@ -72,17 +92,33 @@ const el = {
   editorTitle: document.getElementById("editor-title"),
   fileEditor: document.getElementById("file-editor"),
   saveFile: document.getElementById("save-file"),
+  buildOverview: document.getElementById("build-overview"),
+  buildLatestActivity: document.getElementById("build-latest-activity"),
   historyList: document.getElementById("history-list"),
   refreshRuns: document.getElementById("refresh-runs"),
+  runSearchInput: document.getElementById("run-search-input"),
+  runSearchClear: document.getElementById("run-search-clear"),
+  runStatusTabs: document.getElementById("run-status-tabs"),
+  runProfileFilters: document.getElementById("run-profile-filters"),
   runList: document.getElementById("run-list"),
+  validateSummary: document.getElementById("validate-summary"),
   runDetail: document.getElementById("run-detail"),
   validateRun: document.getElementById("validate-run"),
   resumeRun: document.getElementById("resume-run"),
+  runDrawerBackdrop: document.getElementById("run-drawer-backdrop"),
+  runDrawer: document.getElementById("run-drawer"),
+  runDrawerClose: document.getElementById("run-drawer-close"),
+  runDrawerTitle: document.getElementById("run-drawer-title"),
+  runDrawerSubtitle: document.getElementById("run-drawer-subtitle"),
+  runDrawerSummary: document.getElementById("run-drawer-summary"),
+  runDrawerValidation: document.getElementById("run-drawer-validation"),
+  runDrawerSteps: document.getElementById("run-drawer-steps"),
 
   refreshGit: document.getElementById("refresh-git"),
   gitList: document.getElementById("git-list"),
   gitDiff: document.getElementById("git-diff"),
   refreshDeployments: document.getElementById("refresh-deployments"),
+  deployEligibility: document.getElementById("deploy-eligibility"),
   deploymentList: document.getElementById("deployment-list"),
   deploymentLogs: document.getElementById("deployment-logs"),
   manualCommitForm: document.getElementById("manual-commit-form"),
@@ -92,6 +128,12 @@ const el = {
 let refreshInFlight = null;
 let deploymentPollTimer = null;
 let deploymentPollInFlight = false;
+const stageCopy = {
+  build: "Shape the request, choose the model, and queue a governed build.",
+  review: "Inspect files, activity, and commits before you trust the result.",
+  validate: "Use run detail, validation, and stub debt to judge release readiness.",
+  deploy: "Only completed, validated runs should move into production."
+};
 
 function getErrorMessage(error) {
   if (error instanceof Error) {
@@ -221,13 +263,22 @@ function clearSession(resetStatus = true) {
   state.activeDeploymentId = "";
   state.deploymentLogs = "";
   state.agentRuns = [];
+  state.runHistoryFilters = {
+    search: "",
+    tab: "all",
+    profile: "all"
+  };
+  state.expandedText = {};
   state.activeRunId = "";
   state.activeRunDetail = null;
   state.activeRunValidation = null;
+  state.runDrawerOpen = false;
+  state.activeStage = "build";
 
   renderAuthMode();
   renderAuthState();
   renderOrgOptions();
+  renderStageViews();
   renderProjects();
   renderTree();
   renderHistory();
@@ -235,6 +286,7 @@ function clearSession(resetStatus = true) {
   renderRunDetail();
   renderGit();
   renderDeployments();
+  renderDashboardMetrics();
   syncProjectHeader();
 
   if (resetStatus) {
@@ -252,6 +304,157 @@ function getActiveWorkspace() {
     return null;
   }
   return org.workspaces.find((item) => item.id === state.activeWorkspaceId) || null;
+}
+
+function loadSidebarCollapsedPreference() {
+  try {
+    return localStorage.getItem(SIDEBAR_STORAGE_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
+function persistSidebarCollapsedPreference() {
+  try {
+    localStorage.setItem(SIDEBAR_STORAGE_KEY, state.sidebarCollapsed ? "true" : "false");
+  } catch {
+    // Ignore localStorage failures.
+  }
+}
+
+function renderSidebarState() {
+  el.appShell?.classList.toggle("sidebar-collapsed", state.sidebarCollapsed);
+  if (el.sidebarToggle) {
+    el.sidebarToggle.setAttribute("aria-pressed", state.sidebarCollapsed ? "true" : "false");
+  }
+  if (el.sidebarToggleLabel) {
+    el.sidebarToggleLabel.textContent = state.sidebarCollapsed ? "Show Sidebar" : "Hide Sidebar";
+  }
+}
+
+function getRunExecutionProfile(run) {
+  const metadata = run && typeof run.metadata === "object" ? run.metadata : null;
+  const executionConfig = metadata && typeof metadata.executionConfig === "object" ? metadata.executionConfig : null;
+  return executionConfig?.profile || "full";
+}
+
+function getRunStubDebtOpen(run) {
+  const value =
+    run?.stubDebt?.openCount ??
+    run?.stubDebtOpenCount ??
+    run?.stubDebt ??
+    run?.stubDebtCount ??
+    0;
+
+  const number = Number(value);
+  return Number.isFinite(number) ? number : 0;
+}
+
+function formatStatusLabel(value, fallback = "unknown") {
+  const text = String(value || fallback);
+  return text.replaceAll("_", " ");
+}
+
+function formatStatusClass(value, fallback = "unknown") {
+  return String(value || fallback)
+    .trim()
+    .toLowerCase()
+    .replaceAll("_", "-")
+    .replaceAll(" ", "-");
+}
+
+function renderExpandableText(text, key, options = {}) {
+  const {
+    tag = "p",
+    className = "",
+    previewLength = 120
+  } = options;
+
+  const value = String(text || "").trim();
+  if (!value) {
+    return `<${tag} class="${className}">-</${tag}>`;
+  }
+
+  if (value.length <= previewLength) {
+    return `<${tag} class="${className}">${escapeHtml(value)}</${tag}>`;
+  }
+
+  const expanded = Boolean(state.expandedText[key]);
+  const classes = ["expandable-copy", className].filter(Boolean).join(" ");
+
+  return `<div class="expandable-block ${expanded ? "expanded" : ""}">
+    <${tag} class="${classes}">${escapeHtml(value)}</${tag}>
+    <button type="button" class="expand-toggle ghost-btn" data-expand-toggle="${escapeHtml(key)}">${expanded ? "Less" : "More"}</button>
+  </div>`;
+}
+
+function getValidationChip(validationStatus) {
+  if (validationStatus === "passed") {
+    return {
+      label: "validated",
+      className: "validation-passed"
+    };
+  }
+
+  if (validationStatus === "failed") {
+    return {
+      label: "validation failed",
+      className: "validation-failed"
+    };
+  }
+
+  return {
+    label: "not validated",
+    className: "validation-pending"
+  };
+}
+
+function runMatchesTab(run, tab) {
+  if (tab === "active") {
+    return run.status === "queued" || run.status === "running" || run.status === "paused" || run.status === "planned";
+  }
+
+  if (tab === "attention") {
+    return run.status === "failed" || run.status === "cancelled" || run.validationStatus === "failed" || getRunStubDebtOpen(run) > 0;
+  }
+
+  if (tab === "complete") {
+    return run.status === "complete";
+  }
+
+  return true;
+}
+
+function getFilteredRuns() {
+  const search = state.runHistoryFilters.search.trim().toLowerCase();
+  return state.agentRuns.filter((run) => {
+    if (!runMatchesTab(run, state.runHistoryFilters.tab)) {
+      return false;
+    }
+
+    if (state.runHistoryFilters.profile !== "all" && getRunExecutionProfile(run) !== state.runHistoryFilters.profile) {
+      return false;
+    }
+
+    if (!search) {
+      return true;
+    }
+
+    const goal = String(run.goal || "").toLowerCase();
+    const branch = String(run.runBranch || "").toLowerCase();
+    const id = String(run.id || "").toLowerCase();
+    const status = String(run.status || "").toLowerCase();
+    return goal.includes(search) || branch.includes(search) || id.includes(search) || status.includes(search);
+  });
+}
+
+function setRunDrawerOpen(open) {
+  state.runDrawerOpen = open;
+  el.runDrawer?.classList.toggle("hidden", !open);
+  el.runDrawerBackdrop?.classList.toggle("hidden", !open);
+  if (el.runDrawer) {
+    el.runDrawer.setAttribute("aria-hidden", open ? "false" : "true");
+  }
 }
 
 function deploymentIsInProgress(status) {
@@ -317,12 +520,16 @@ function renderAuthState() {
   el.orgCard.classList.toggle("hidden", !authenticated);
   el.createForm.classList.toggle("hidden", !authenticated);
   el.projectsCard.classList.toggle("hidden", !authenticated);
+  el.homeScreen?.classList.toggle("hidden", authenticated);
+  el.dashboardScreen?.classList.toggle("hidden", !authenticated);
 
   if (authenticated) {
     el.authUserInfo.textContent = `${state.user.name} · ${state.user.email}`;
   } else {
     el.authUserInfo.textContent = "";
   }
+
+  renderDashboardMetrics();
 }
 
 function renderOrgOptions() {
@@ -434,6 +641,32 @@ function renderProjects() {
   }
 }
 
+function setActiveStage(stage) {
+  if (!Object.prototype.hasOwnProperty.call(stageCopy, stage)) {
+    return;
+  }
+
+  state.activeStage = stage;
+  renderStageViews();
+}
+
+function renderStageViews() {
+  if (el.stageCaption) {
+    el.stageCaption.textContent = stageCopy[state.activeStage] || stageCopy.build;
+  }
+
+  const buttons = el.stageNav ? Array.from(el.stageNav.querySelectorAll("[data-stage]")) : [];
+  for (const button of buttons) {
+    const isActive = button.getAttribute("data-stage") === state.activeStage;
+    button.classList.toggle("active", isActive);
+    button.setAttribute("aria-pressed", isActive ? "true" : "false");
+  }
+
+  for (const panel of el.stageViews) {
+    panel.classList.toggle("hidden", panel.id !== `stage-${state.activeStage}`);
+  }
+}
+
 function flattenTree(nodes, depth = 0, lines = []) {
   for (const node of nodes) {
     lines.push({
@@ -490,27 +723,42 @@ function renderTree() {
 function renderHistory() {
   if (!state.activeProject) {
     el.historyList.innerHTML = "";
+    if (el.buildLatestActivity) {
+      el.buildLatestActivity.innerHTML = `<div class="history-item empty-state"><p>Select a project to see recent work.</p></div>`;
+    }
     return;
   }
 
   if (!state.activeProject.history.length) {
-    el.historyList.innerHTML = `<div class="history-item"><p>No activity yet.</p></div>`;
+    const empty = `<div class="history-item empty-state"><p>No activity yet.</p></div>`;
+    el.historyList.innerHTML = empty;
+    if (el.buildLatestActivity) {
+      el.buildLatestActivity.innerHTML = empty;
+    }
     return;
   }
 
-  el.historyList.innerHTML = state.activeProject.history
-    .slice(0, 25)
-    .map((item) => {
+  const items = state.activeProject.history;
+  const renderItems = (entries) =>
+    entries
+      .map((item) => {
       const files = item.filesChanged.length ? item.filesChanged.join(", ") : "No file changes";
       const commit = item.commitHash ? `Commit ${item.commitHash}` : "No commit";
+      const summaryKey = `history-summary-${item.createdAt}-${item.kind}`;
+      const filesKey = `history-files-${item.createdAt}-${item.kind}`;
       return `<article class="history-item">
         <strong>${escapeHtml(item.kind.toUpperCase())} · ${escapeHtml(item.provider)}:${escapeHtml(item.model)}</strong>
-        <p>${escapeHtml(item.summary)}</p>
+        ${renderExpandableText(item.summary, summaryKey, { className: "history-copy", previewLength: 140 })}
         <small>${new Date(item.createdAt).toLocaleString()} · ${escapeHtml(commit)}</small>
-        <p>${escapeHtml(files)}</p>
+        ${renderExpandableText(files, filesKey, { className: "history-copy", previewLength: 120 })}
       </article>`;
-    })
-    .join("");
+      })
+      .join("");
+
+  el.historyList.innerHTML = renderItems(items.slice(0, 25));
+  if (el.buildLatestActivity) {
+    el.buildLatestActivity.innerHTML = renderItems(items.slice(0, 3));
+  }
 }
 
 function canResumeRun(run) {
@@ -521,51 +769,291 @@ function canResumeRun(run) {
   return run.status === "failed" || run.status === "paused" || run.status === "planned";
 }
 
+function getSelectedRunForDeploy() {
+  if (!state.activeRunId) {
+    return null;
+  }
+
+  const detailRun = state.activeRunDetail?.run;
+  if (detailRun?.id === state.activeRunId) {
+    return detailRun;
+  }
+
+  return state.agentRuns.find((run) => run.id === state.activeRunId) || null;
+}
+
+function getDeployEligibility() {
+  if (!state.activeProject) {
+    return { ok: false, reason: "Select a project first.", run: null };
+  }
+
+  if (!state.activeRunId) {
+    return { ok: false, reason: "Select a run first.", run: null };
+  }
+
+  const run = getSelectedRunForDeploy();
+  if (!run) {
+    return { ok: false, reason: "Select a run first.", run: null };
+  }
+
+  if (run.status !== "complete") {
+    return { ok: false, reason: "Selected run must be complete before deploy.", run };
+  }
+
+  if (run.validationStatus !== "passed") {
+    return { ok: false, reason: "Selected run must pass validation before deploy.", run };
+  }
+
+  return { ok: true, reason: "", run };
+}
+
+function syncDeployButton() {
+  el.deployBtn.disabled = uiBusy || !getDeployEligibility().ok;
+}
+
+function renderRunHistoryControls() {
+  if (el.runSearchInput) {
+    el.runSearchInput.value = state.runHistoryFilters.search;
+  }
+
+  el.runSearchClear?.classList.toggle("hidden", !state.runHistoryFilters.search.trim());
+
+  const tabButtons = el.runStatusTabs ? Array.from(el.runStatusTabs.querySelectorAll("[data-run-tab]")) : [];
+  for (const button of tabButtons) {
+    button.classList.toggle("active", button.getAttribute("data-run-tab") === state.runHistoryFilters.tab);
+  }
+
+  const profileButtons = el.runProfileFilters ? Array.from(el.runProfileFilters.querySelectorAll("[data-run-profile]")) : [];
+  for (const button of profileButtons) {
+    button.classList.toggle("active", button.getAttribute("data-run-profile") === state.runHistoryFilters.profile);
+  }
+}
+
+function renderRunDrawer() {
+  if (!el.runDrawer) {
+    return;
+  }
+
+  const detail = state.activeRunDetail;
+  const run = detail?.run || null;
+  const steps = Array.isArray(detail?.steps) ? detail.steps.slice(-10) : [];
+  const validation = state.activeRunValidation && state.activeRunValidation.runId === run?.id ? state.activeRunValidation.validation : null;
+  const stubDebt = detail?.stubDebt || null;
+
+  if (!run) {
+    el.runDrawerTitle.textContent = "No run selected";
+    el.runDrawerSubtitle.textContent = "Choose a run from Run History.";
+    el.runDrawerSummary.innerHTML = `<div class="drawer-empty">Select a run to inspect its profile, validation, debt status, and recent steps.</div>`;
+    el.runDrawerValidation.innerHTML = `<div class="drawer-empty">No validation data yet.</div>`;
+    el.runDrawerSteps.innerHTML = `<div class="drawer-empty">No step trace yet.</div>`;
+    setRunDrawerOpen(false);
+    return;
+  }
+
+  el.runDrawerTitle.textContent = `Run ${run.id.slice(0, 8)}`;
+  el.runDrawerSubtitle.innerHTML = renderExpandableText(run.goal || "No goal recorded for this run.", `drawer-goal-${run.id}`, {
+    tag: "span",
+    className: "drawer-subtitle-copy",
+    previewLength: 180
+  });
+
+  const summaryCards = [
+    {
+      label: "Status",
+      value: formatStatusLabel(run.status),
+      detail: `Profile ${getRunExecutionProfile(run)}`
+    },
+    {
+      label: "Branch",
+      value: run.runBranch || "No branch",
+      detail: run.currentCommitHash || "No commit hash yet"
+    },
+    {
+      label: "Validation",
+      value: validation ? (validation.ok ? "Passed" : "Failed") : formatStatusLabel(run.validationStatus || "not run"),
+      detail: validation?.summary || "No stored validation result."
+    },
+    {
+      label: "Stub Debt",
+      value: String(stubDebt?.openCount || 0),
+      detail: stubDebt?.lastPaydownAction || "No paydown activity recorded."
+    }
+  ];
+
+  el.runDrawerSummary.innerHTML = summaryCards
+    .map(
+      (card) => `<article class="drawer-summary-card">
+        <strong>${escapeHtml(card.label)}</strong>
+        <p>${escapeHtml(card.value)}</p>
+        ${renderExpandableText(card.detail, `drawer-summary-${run.id}-${card.label}`, {
+          tag: "small",
+          className: "drawer-detail-copy",
+          previewLength: 110
+        })}
+      </article>`
+    )
+    .join("");
+
+  el.runDrawerValidation.innerHTML = [
+    `<article class="drawer-item">
+      <div class="drawer-item-head">
+        <strong>Validation Summary</strong>
+        <span class="status-pill status-${escapeHtml(
+          formatStatusClass(validation ? (validation.ok ? "passed" : "failed") : run.validationStatus || "queued")
+        )}">${escapeHtml(validation ? (validation.ok ? "passed" : "failed") : formatStatusLabel(run.validationStatus || "not run"))}</span>
+      </div>
+      ${renderExpandableText(validation?.summary || "Validate Output to persist the latest validation snapshot.", `drawer-validation-${run.id}`, {
+        className: "drawer-detail-copy",
+        previewLength: 140
+      })}
+      <small>Current step ${escapeHtml(String(run.currentStepIndex || 0))} · worktree ${escapeHtml(run.worktreePath || "not yet assigned")}</small>
+    </article>`,
+    `<article class="drawer-item">
+      <div class="drawer-item-head">
+        <strong>Debt Resolution</strong>
+      </div>
+      <p>${escapeHtml(String(stubDebt?.openCount || 0))} open debt items</p>
+      ${renderExpandableText(stubDebt?.lastStubPath || stubDebt?.lastPaydownAction || "No debt resolution artifact recorded.", `drawer-debt-${run.id}`, {
+        tag: "small",
+        className: "drawer-detail-copy",
+        previewLength: 110
+      })}
+    </article>`
+  ].join("");
+
+  if (!steps.length) {
+    el.runDrawerSteps.innerHTML = `<div class="drawer-empty">No step trace recorded for this run yet.</div>`;
+  } else {
+    el.runDrawerSteps.innerHTML = steps
+      .map((step) => {
+        const started = step.startedAt || step.started_at || step.createdAt || step.updatedAt || "";
+        const tool = step.tool || step.stepId || "step";
+        const status = formatStatusLabel(step.status || "pending");
+        const commit = step.commitHash ? `commit ${step.commitHash}` : "no commit";
+        return `<article class="drawer-item">
+          <div class="drawer-item-head">
+            <strong>${escapeHtml(tool)}</strong>
+            <span class="status-pill status-${escapeHtml(formatStatusClass(step.status || "queued"))}">${escapeHtml(status)}</span>
+          </div>
+          ${renderExpandableText(commit, `drawer-step-${run.id}-${step.stepIndex || step.stepId || tool}`, {
+            className: "drawer-detail-copy",
+            previewLength: 90
+          })}
+          <small>${escapeHtml(started ? new Date(started).toLocaleString() : "No timestamp")} · step ${escapeHtml(String(step.stepIndex ?? "-"))}</small>
+        </article>`;
+      })
+      .join("");
+  }
+
+  setRunDrawerOpen(state.runDrawerOpen);
+}
+
 function renderAgentRuns() {
+  renderRunHistoryControls();
+
   if (!state.activeProject) {
     el.runList.innerHTML = "";
+    renderDashboardMetrics();
+    renderBuildOverview();
+    renderDeployEligibility();
+    syncDeployButton();
     return;
   }
 
   if (!state.agentRuns.length) {
-    el.runList.innerHTML = `<div class="git-item"><p>No agent runs yet.</p></div>`;
+    el.runList.innerHTML = `<div class="history-item empty-state"><p>No agent runs yet.</p></div>`;
+    renderDashboardMetrics();
+    renderBuildOverview();
+    renderDeployEligibility();
+    syncDeployButton();
     return;
   }
 
-  el.runList.innerHTML = state.agentRuns
+  const filteredRuns = getFilteredRuns();
+  if (!filteredRuns.length) {
+    el.runList.innerHTML = `<div class="history-item empty-state"><p>No runs match the current history filters.</p></div>`;
+    renderDashboardMetrics();
+    renderBuildOverview();
+    renderDeployEligibility();
+    syncDeployButton();
+    return;
+  }
+
+  el.runList.innerHTML = filteredRuns
     .map((run) => {
       const activeClass = run.id === state.activeRunId ? "active" : "";
-      const status = escapeHtml(run.status || "unknown");
       const branch = run.runBranch ? ` · ${escapeHtml(run.runBranch)}` : "";
       const updatedAt = run.updatedAt ? new Date(run.updatedAt).toLocaleString() : "unknown";
       const currentStep = Number.isFinite(run.currentStepIndex) ? run.currentStepIndex : 0;
       const totalSteps = Array.isArray(run.plan?.steps) ? run.plan.steps.length : 0;
+      const stubDebt = getRunStubDebtOpen(run);
+      const profile = getRunExecutionProfile(run);
+      const validationChip = getValidationChip(run.validationStatus);
 
-      return `<article class="git-item deployment-item ${activeClass}">
-        <strong>${escapeHtml(run.id.slice(0, 8))} · ${status}</strong>
-        <small>${updatedAt}${branch}</small>
-        <p>Step ${currentStep}/${totalSteps}</p>
-        <p><button type="button" class="ghost-btn" data-run-id="${run.id}">View</button></p>
+      return `<article class="run-card ${activeClass}" data-run-open="${run.id}">
+        <div class="run-primary">
+          <div>
+            <strong>Run ${escapeHtml(run.id.slice(0, 8))}</strong>
+            <div class="run-secondary">${updatedAt}${branch}</div>
+          </div>
+          <span class="status-pill status-${escapeHtml(formatStatusClass(run.status))}">${escapeHtml(formatStatusLabel(run.status))}</span>
+        </div>
+        <div class="run-chip-row">
+          <span class="run-chip">profile ${escapeHtml(profile)}</span>
+          <span class="run-chip ${escapeHtml(validationChip.className)}">${escapeHtml(validationChip.label)}</span>
+          <span class="run-chip">steps ${escapeHtml(String(currentStep))}/${escapeHtml(String(totalSteps))}</span>
+          <span class="run-chip">${escapeHtml(String(stubDebt))} stub debt</span>
+        </div>
+        <div class="run-meta-row">
+          <span>${escapeHtml(run.runBranch || "No dedicated branch")}</span>
+        </div>
+        ${renderExpandableText(run.goal || "No goal recorded", `run-goal-${run.id}`, {
+          className: "run-goal-copy",
+          previewLength: 120
+        })}
+        <div class="run-actions">
+          <button type="button" class="ghost-btn" data-run-id="${run.id}">Inspect Run</button>
+        </div>
       </article>`;
     })
     .join("");
 
-  const buttons = el.runList.querySelectorAll("[data-run-id]");
-  for (const button of buttons) {
-    button.addEventListener("click", () => {
-      const runId = button.getAttribute("data-run-id");
+  const cards = el.runList.querySelectorAll("[data-run-open]");
+  for (const card of cards) {
+    card.addEventListener("click", () => {
+      const runId = card.getAttribute("data-run-open");
       if (runId) {
-        void loadAgentRunDetail(runId);
+        void loadAgentRunDetail(runId, false, true);
       }
     });
   }
+
+  const buttons = el.runList.querySelectorAll("[data-run-id]");
+  for (const button of buttons) {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const runId = button.getAttribute("data-run-id");
+      if (runId) {
+        void loadAgentRunDetail(runId, false, true);
+      }
+    });
+  }
+
+  renderDashboardMetrics();
+  renderBuildOverview();
+  renderDeployEligibility();
+  syncDeployButton();
 }
 
 function renderRunDetail() {
   if (!state.activeProject || !state.activeRunDetail?.run) {
-    el.runDetail.textContent = "Select a run to view step and validation details.";
+    el.runDetail.textContent = "Select a run to view a quick trace, then open the inspector for the full detail panel.";
     el.validateRun.disabled = true;
     el.resumeRun.disabled = true;
+    renderDashboardMetrics();
+    renderValidateSummary();
+    renderRunDrawer();
+    syncDeployButton();
     return;
   }
 
@@ -578,6 +1066,7 @@ function renderRunDetail() {
   lines.push(`goal: ${run.goal}`);
   lines.push(`currentStepIndex: ${run.currentStepIndex}`);
   lines.push(`runBranch: ${run.runBranch || "-"}`);
+  lines.push(`profile: ${getRunExecutionProfile(run)}`);
   lines.push(`worktreePath: ${run.worktreePath || "-"}`);
   lines.push(`currentCommitHash: ${run.currentCommitHash || "-"}`);
 
@@ -597,9 +1086,9 @@ function renderRunDetail() {
   }
 
   lines.push("");
-  lines.push(`steps (${steps.length}):`);
+  lines.push(`recent steps (${steps.length}):`);
 
-  const recentSteps = steps.slice(-15);
+  const recentSteps = steps.slice(-8);
   for (const step of recentSteps) {
     const commitText = step.commitHash ? ` commit=${step.commitHash}` : "";
     lines.push(`  #${step.stepIndex} ${step.stepId} [${step.status}] ${step.tool}${commitText}`);
@@ -608,6 +1097,10 @@ function renderRunDetail() {
   el.runDetail.textContent = lines.join("\n");
   el.validateRun.disabled = run.status === "running";
   el.resumeRun.disabled = !canResumeRun(run);
+  renderDashboardMetrics();
+  renderValidateSummary();
+  renderRunDrawer();
+  syncDeployButton();
 }
 
 function renderGit() {
@@ -650,12 +1143,16 @@ function renderDeployments() {
   if (!state.activeProject) {
     el.deploymentList.innerHTML = "";
     el.deploymentLogs.textContent = "";
+    renderDashboardMetrics();
+    renderDeployEligibility();
     return;
   }
 
   if (!state.deployments.length) {
     el.deploymentList.innerHTML = `<div class="git-item"><p>No deployments yet.</p></div>`;
     el.deploymentLogs.textContent = "";
+    renderDashboardMetrics();
+    renderDeployEligibility();
     return;
   }
 
@@ -700,6 +1197,9 @@ function renderDeployments() {
   } else {
     el.deploymentLogs.textContent = "Select a deployment to view logs.";
   }
+
+  renderDashboardMetrics();
+  renderDeployEligibility();
 }
 
 function syncProjectHeader() {
@@ -708,6 +1208,10 @@ function syncProjectHeader() {
 
     if (!state.user) {
       el.activeProjectMeta.textContent = "Authenticate and choose a workspace to begin.";
+      renderDashboardMetrics();
+      renderBuildOverview();
+      renderValidateSummary();
+      renderDeployEligibility();
       return;
     }
 
@@ -715,6 +1219,10 @@ function syncProjectHeader() {
     el.activeProjectMeta.textContent = workspace
       ? `Workspace: ${workspace.name} · Create or select a project.`
       : "Select a workspace to begin.";
+    renderDashboardMetrics();
+    renderBuildOverview();
+    renderValidateSummary();
+    renderDeployEligibility();
     return;
   }
 
@@ -725,13 +1233,191 @@ function syncProjectHeader() {
   el.activeProjectMeta.textContent = `${state.activeProject.templateId} • ${workspaceName} • Updated ${new Date(
     state.activeProject.updatedAt
   ).toLocaleString()}`;
+  renderDashboardMetrics();
+  renderBuildOverview();
+  renderValidateSummary();
+  renderDeployEligibility();
 }
 
 function setBusy(busy) {
+  uiBusy = busy;
   el.generateBtn.disabled = busy;
   el.chatBtn.disabled = busy;
-  el.deployBtn.disabled = busy;
   el.saveFile.disabled = busy;
+  renderDashboardMetrics();
+  renderBuildOverview();
+  renderDeployEligibility();
+  syncDeployButton();
+}
+
+function renderDashboardMetrics() {
+  if (!el.dashboardMetrics) {
+    return;
+  }
+
+  if (!state.user) {
+    el.dashboardMetrics.innerHTML = "";
+    return;
+  }
+
+  const inFlightRuns = state.agentRuns.filter((run) => run.status === "queued" || run.status === "running").length;
+  const completedRuns = state.agentRuns.filter((run) => run.status === "complete").length;
+  const passedRuns = state.agentRuns.filter((run) => run.validationStatus === "passed").length;
+  const openStubDebt = state.activeRunDetail?.stubDebt?.openCount ?? state.agentRuns.reduce((sum, run) => sum + getRunStubDebtOpen(run), 0);
+  const deploymentActive = state.deployments.filter((deployment) => deploymentIsInProgress(deployment.status)).length;
+  const selectedProfile = state.activeRunDetail?.run ? getRunExecutionProfile(state.activeRunDetail.run) : "—";
+
+  const cards = [
+    {
+      label: "Queue Pressure",
+      value: String(inFlightRuns),
+      copy: inFlightRuns ? "Queued or running runs still in flight." : "No queued or running work right now.",
+      accent: inFlightRuns ? "amber" : "cyan"
+    },
+    {
+      label: "Validated Runs",
+      value: `${passedRuns}/${completedRuns || 0}`,
+      copy: completedRuns ? "Completed runs that already passed validation." : "No completed runs in this project yet.",
+      accent: passedRuns > 0 ? "green" : "purple"
+    },
+    {
+      label: "Open Stub Debt",
+      value: String(openStubDebt),
+      copy: openStubDebt ? "Provisionally fixed debt still blocks clean promotion." : "No unresolved stub debt on the current run surface.",
+      accent: openStubDebt ? "red" : "green"
+    },
+    {
+      label: "Runtime Surface",
+      value: String(deploymentActive),
+      copy: state.activeProject
+        ? `Selected profile ${selectedProfile}. Active deployments ${deploymentActive}.`
+        : "Select a project to inspect queue, validation, and deployment state.",
+      accent: deploymentActive ? "purple" : "cyan"
+    }
+  ];
+
+  el.dashboardMetrics.innerHTML = cards
+    .map(
+      (card) => `<article class="metric-card">
+        <div class="metric-head">
+          <strong>${escapeHtml(card.label)}</strong>
+          <span class="metric-dot metric-accent-${card.accent}"></span>
+        </div>
+        <p class="metric-value metric-accent-${card.accent}">${escapeHtml(card.value)}</p>
+        <p class="metric-copy">${escapeHtml(card.copy)}</p>
+      </article>`
+    )
+    .join("");
+}
+
+function renderBuildOverview() {
+  if (!el.buildOverview) {
+    return;
+  }
+
+  if (!state.activeProject) {
+    el.buildOverview.innerHTML = `<div class="overview-card"><strong>No active project</strong><p>Pick a workspace project before launching a build.</p></div>`;
+    return;
+  }
+
+  const provider = state.providers.find((entry) => entry.id === (el.providerSelect?.value || state.defaultProviderId));
+  const latestRun = state.agentRuns[0] || null;
+  const latestActivity = state.activeProject.history[0] || null;
+  const latestProfile = latestRun ? getRunExecutionProfile(latestRun) : "ci";
+
+  el.buildOverview.innerHTML = [
+    `<div class="overview-card"><strong>Project</strong><p>${escapeHtml(state.activeProject.name)}</p><small>${escapeHtml(
+      state.activeProject.templateId
+    )}</small></div>`,
+    `<div class="overview-card"><strong>Provider</strong><p>${escapeHtml(provider?.name || "Not configured")}</p><small>${escapeHtml(
+      el.modelInput?.value.trim() || provider?.defaultModel || "Default model"
+    )}</small></div>`,
+    `<div class="overview-card"><strong>Latest run</strong><p>${escapeHtml(formatStatusLabel(latestRun?.status || "No run yet"))}</p>${renderExpandableText(
+      latestRun ? `Run ${latestRun.id.slice(0, 8)} · profile ${latestProfile}` : "Start with a narrow build prompt.",
+      `build-latest-run-${latestRun?.id || "empty"}`,
+      { tag: "small", className: "overview-copy", previewLength: 90 }
+    )}</div>`,
+    `<div class="overview-card"><strong>Last activity</strong>${renderExpandableText(
+      latestActivity?.summary || "No changes recorded yet.",
+      `build-latest-activity-${latestActivity?.createdAt || "empty"}`,
+      { className: "overview-copy", previewLength: 120 }
+    )}<small>${latestActivity ? new Date(latestActivity.createdAt).toLocaleString() : "Ready"}</small></div>`,
+    `<div class="overview-card"><strong>Workspace status</strong><p>${uiBusy ? "Running request" : "Idle"}</p>${renderExpandableText(
+      uiBusy ? "A builder request is currently running." : "Queue a build, inspect files, or validate a run.",
+      `build-workspace-status-${uiBusy ? "busy" : "idle"}`,
+      { tag: "small", className: "overview-copy", previewLength: 90 }
+    )}</div>`
+  ].join("");
+}
+
+function renderValidateSummary() {
+  if (!el.validateSummary) {
+    return;
+  }
+
+  const run = state.activeRunDetail?.run;
+  if (!run) {
+    el.validateSummary.innerHTML = `<div class="overview-card"><strong>No run selected</strong><p>Select a run to inspect validation and correction history.</p></div>`;
+    return;
+  }
+
+  const validation =
+    state.activeRunValidation && state.activeRunValidation.runId === run.id ? state.activeRunValidation.validation : null;
+  const steps = Array.isArray(state.activeRunDetail?.steps) ? state.activeRunDetail.steps : [];
+  const stubDebt = state.activeRunDetail?.stubDebt || null;
+
+  el.validateSummary.innerHTML = [
+    `<div class="overview-card"><strong>Run status</strong><p>${escapeHtml(formatStatusLabel(run.status))}</p><small>Run ${escapeHtml(
+      run.id.slice(0, 8)
+    )}</small></div>`,
+    `<div class="overview-card"><strong>Validation</strong><p>${escapeHtml(
+      validation ? (validation.ok ? "Passed" : "Failed") : run.validationStatus || "Not run"
+    )}</p>${renderExpandableText(validation?.summary || "Use Validate Output to persist the latest check.", `validate-summary-${run.id}`, {
+      tag: "small",
+      className: "overview-copy",
+      previewLength: 110
+    })}</div>`,
+    `<div class="overview-card"><strong>Steps</strong><p>${steps.length}</p><small>Current step ${escapeHtml(
+      String(run.currentStepIndex || 0)
+    )}</small></div>`,
+    `<div class="overview-card"><strong>Stub debt</strong><p>${escapeHtml(String(stubDebt?.openCount || 0))} open</p>${renderExpandableText(
+      stubDebt?.lastPaydownAction || "No paydown activity recorded.",
+      `validate-stub-debt-${run.id}`,
+      { tag: "small", className: "overview-copy", previewLength: 90 }
+    )}</div>`
+  ].join("");
+}
+
+function renderDeployEligibility() {
+  if (!el.deployEligibility) {
+    return;
+  }
+
+  const eligibility = getDeployEligibility();
+  const latestDeployment = state.deployments[0] || null;
+
+  if (!state.activeProject) {
+    el.deployEligibility.innerHTML = `<div class="overview-card"><strong>No project</strong><p>Select a project before evaluating deployment readiness.</p></div>`;
+    return;
+  }
+
+  el.deployEligibility.innerHTML = [
+    `<div class="overview-card"><strong>Eligibility</strong><p>${eligibility.ok ? "Ready to deploy" : "Not ready"}</p>${renderExpandableText(
+      eligibility.reason || "Validated complete run selected.",
+      `deploy-eligibility-${eligibility.run?.id || "none"}`,
+      { tag: "small", className: "overview-copy", previewLength: 110 }
+    )}</div>`,
+    `<div class="overview-card"><strong>Selected run</strong><p>${escapeHtml(
+      eligibility.run ? eligibility.run.id.slice(0, 8) : "None"
+    )}</p><small>${escapeHtml(eligibility.run ? formatStatusLabel(eligibility.run.status) : "Choose a completed validated run.")}</small></div>`,
+    `<div class="overview-card"><strong>Latest deployment</strong><p>${escapeHtml(
+      formatStatusLabel(latestDeployment?.status || "No deployments yet")
+    )}</p>${renderExpandableText(
+      latestDeployment?.publicUrl || latestDeployment?.customDomain || "Queue the first deployment when ready.",
+      `deploy-latest-${latestDeployment?.id || "none"}`,
+      { tag: "small", className: "overview-copy", previewLength: 100 }
+    )}</div>`
+  ].join("");
 }
 
 async function refreshAccount() {
@@ -789,6 +1475,7 @@ async function loadProjects() {
     state.activeRunId = "";
     state.activeRunDetail = null;
     state.activeRunValidation = null;
+    state.runDrawerOpen = false;
     renderProjects();
     renderTree();
     renderHistory();
@@ -817,6 +1504,7 @@ async function loadProjects() {
     state.activeRunId = "";
     state.activeRunDetail = null;
     state.activeRunValidation = null;
+    state.runDrawerOpen = false;
     stopDeploymentPolling();
   }
 
@@ -837,6 +1525,10 @@ async function selectProject(projectId) {
   state.activeFilePath = "";
   el.fileEditor.value = "";
   el.editorTitle.textContent = "Editor";
+  state.activeRunId = "";
+  state.activeRunDetail = null;
+  state.activeRunValidation = null;
+  state.runDrawerOpen = false;
 
   syncProjectHeader();
   renderProjects();
@@ -929,6 +1621,7 @@ async function loadAgentRuns() {
     state.activeRunId = "";
     state.activeRunDetail = null;
     state.activeRunValidation = null;
+    state.runDrawerOpen = false;
     renderAgentRuns();
     renderRunDetail();
     return;
@@ -941,6 +1634,7 @@ async function loadAgentRuns() {
     state.activeRunId = state.agentRuns[0]?.id || "";
     state.activeRunDetail = null;
     state.activeRunValidation = null;
+    state.runDrawerOpen = false;
   }
 
   renderAgentRuns();
@@ -952,7 +1646,7 @@ async function loadAgentRuns() {
   }
 }
 
-async function loadAgentRunDetail(runId, silent = false) {
+async function loadAgentRunDetail(runId, silent = false, openDrawer = false) {
   if (!state.activeProject || !runId) {
     return;
   }
@@ -960,6 +1654,7 @@ async function loadAgentRunDetail(runId, silent = false) {
   const payload = await api(`/api/projects/${state.activeProject.id}/agent/runs/${runId}`);
   state.activeRunId = runId;
   state.activeRunDetail = payload;
+  state.runDrawerOpen = openDrawer || state.runDrawerOpen;
 
   if (state.activeRunValidation && state.activeRunValidation.runId !== runId) {
     state.activeRunValidation = null;
@@ -1135,7 +1830,7 @@ async function handleAuthSubmit(event) {
     el.authForm.reset();
     renderAuthMode();
 
-    setStatus(mode === "login" ? "Signed in." : "Account created and signed in.", "success");
+    setStatus(mode === "login" ? "Operator session active." : "Account created and operator session active.", "success");
   } catch (error) {
     setStatus(getErrorMessage(error), "error");
   }
@@ -1345,8 +2040,9 @@ async function runBuilder(mode) {
 }
 
 async function handleDeploy() {
-  if (!state.activeProject) {
-    setStatus("Select a project first.", "error");
+  const eligibility = getDeployEligibility();
+  if (!eligibility.ok || !eligibility.run || !state.activeProject) {
+    setStatus(eligibility.reason || "Select a valid run to deploy.", "error");
     return;
   }
 
@@ -1359,6 +2055,7 @@ async function handleDeploy() {
     const payload = await api(`/api/projects/${state.activeProject.id}/deployments`, {
       method: "POST",
       body: JSON.stringify({
+        runId: eligibility.run.id,
         customDomain: customDomain || undefined
       })
     });
@@ -1443,6 +2140,22 @@ async function handleManualCommit(event) {
 }
 
 function bindEvents() {
+  el.sidebarToggle?.addEventListener("click", () => {
+    state.sidebarCollapsed = !state.sidebarCollapsed;
+    persistSidebarCollapsedPreference();
+    renderSidebarState();
+  });
+
+  const stageButtons = el.stageNav ? Array.from(el.stageNav.querySelectorAll("[data-stage]")) : [];
+  for (const button of stageButtons) {
+    button.addEventListener("click", () => {
+      const stage = button.getAttribute("data-stage");
+      if (stage) {
+        setActiveStage(stage);
+      }
+    });
+  }
+
   el.authMode.addEventListener("change", () => {
     renderAuthMode();
   });
@@ -1494,6 +2207,11 @@ function bindEvents() {
     if (provider) {
       el.modelInput.placeholder = provider.defaultModel;
     }
+    renderBuildOverview();
+  });
+
+  el.modelInput.addEventListener("input", () => {
+    renderBuildOverview();
   });
 
   el.refreshProjects.addEventListener("click", () => {
@@ -1532,6 +2250,42 @@ function bindEvents() {
     void loadAgentRuns();
   });
 
+  el.runSearchInput?.addEventListener("input", () => {
+    state.runHistoryFilters.search = el.runSearchInput.value;
+    renderAgentRuns();
+  });
+
+  el.runSearchClear?.addEventListener("click", () => {
+    state.runHistoryFilters.search = "";
+    renderAgentRuns();
+  });
+
+  const runTabButtons = el.runStatusTabs ? Array.from(el.runStatusTabs.querySelectorAll("[data-run-tab]")) : [];
+  for (const button of runTabButtons) {
+    button.addEventListener("click", () => {
+      const tab = button.getAttribute("data-run-tab");
+      if (!tab) {
+        return;
+      }
+      state.runHistoryFilters.tab = tab;
+      renderAgentRuns();
+    });
+  }
+
+  const runProfileButtons = el.runProfileFilters
+    ? Array.from(el.runProfileFilters.querySelectorAll("[data-run-profile]"))
+    : [];
+  for (const button of runProfileButtons) {
+    button.addEventListener("click", () => {
+      const profile = button.getAttribute("data-run-profile");
+      if (!profile) {
+        return;
+      }
+      state.runHistoryFilters.profile = profile;
+      renderAgentRuns();
+    });
+  }
+
   el.validateRun.addEventListener("click", () => {
     void handleValidateRunOutput();
   });
@@ -1542,6 +2296,45 @@ function bindEvents() {
 
   el.manualCommitForm.addEventListener("submit", (event) => {
     void handleManualCommit(event);
+  });
+
+  el.runDrawerClose?.addEventListener("click", () => {
+    setRunDrawerOpen(false);
+  });
+
+  el.runDrawerBackdrop?.addEventListener("click", () => {
+    setRunDrawerOpen(false);
+  });
+
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && state.runDrawerOpen) {
+      setRunDrawerOpen(false);
+    }
+  });
+
+  document.addEventListener("click", (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) {
+      return;
+    }
+
+    const toggle = target.closest("[data-expand-toggle]");
+    if (!toggle) {
+      return;
+    }
+
+    const key = toggle.getAttribute("data-expand-toggle");
+    if (!key) {
+      return;
+    }
+
+    state.expandedText[key] = !state.expandedText[key];
+    renderHistory();
+    renderBuildOverview();
+    renderValidateSummary();
+    renderDeployEligibility();
+    renderAgentRuns();
+    renderRunDrawer();
   });
 }
 
@@ -1556,9 +2349,12 @@ async function bootstrapAuthenticated() {
 }
 
 async function bootstrap() {
+  state.sidebarCollapsed = loadSidebarCollapsedPreference();
   bindEvents();
+  renderSidebarState();
   renderAuthMode();
   renderAuthState();
+  renderStageViews();
   renderProjects();
   renderDeployments();
   renderAgentRuns();
@@ -1568,10 +2364,10 @@ async function bootstrap() {
   try {
     setStatus("Restoring session...");
     await bootstrapAuthenticated();
-    setStatus("deeprun ready.", "success");
+    setStatus("DeepRun Factory ready.", "success");
   } catch {
     clearSession(false);
-    setStatus("Sign in or register to start building.");
+    setStatus("Sign in or register to enter the control room.");
   }
 }
 

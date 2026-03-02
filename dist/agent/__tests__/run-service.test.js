@@ -8,7 +8,7 @@ import { AgentRunService } from "../run-service.js";
 import { AppStore } from "../../lib/project-store.js";
 const databaseUrl = process.env.TEST_DATABASE_URL || process.env.DATABASE_URL;
 if (!databaseUrl) {
-    throw new Error("Agent state tests require DATABASE_URL or TEST_DATABASE_URL. Example: postgres://postgres:postgres@localhost:5432/forgeai_test");
+    throw new Error("Agent state tests require DATABASE_URL or TEST_DATABASE_URL. Example: postgres://postgres:postgres@localhost:5432/deeprun_test");
 }
 const requiredDatabaseUrl = databaseUrl;
 function isLocalDatabaseUrl(url) {
@@ -26,7 +26,7 @@ async function createHarness() {
     if (!process.env.DATABASE_SSL && !isLocalDatabaseUrl(requiredDatabaseUrl)) {
         process.env.DATABASE_SSL = "require";
     }
-    const tmpRoot = await mkdtemp(path.join(os.tmpdir(), "forgeai-agent-state-"));
+    const tmpRoot = await mkdtemp(path.join(os.tmpdir(), "deeprun-agent-state-"));
     const store = new AppStore(tmpRoot);
     await store.initialize();
     const suffix = randomUUID().slice(0, 8);
@@ -70,7 +70,7 @@ async function destroyHarness(harness) {
     await harness.store.close();
     await rm(harness.tmpRoot, { recursive: true, force: true });
 }
-test("valid transitions: queued -> running -> cancelling -> cancelled", async () => {
+test("valid transitions: queued -> running -> cancelled", async () => {
     const harness = await createHarness();
     try {
         const run = await harness.service.createRun({
@@ -81,8 +81,6 @@ test("valid transitions: queued -> running -> cancelling -> cancelled", async ()
         });
         const running = await harness.service.markRunRunning(harness.project.id, run.id, "test-transition");
         assert.equal(running.status, "running");
-        const cancelling = await harness.service.markRunCancelling(harness.project.id, run.id, "test-transition");
-        assert.equal(cancelling.status, "cancelling");
         const cancelled = await harness.service.markRunCancelled(harness.project.id, run.id, "test-transition");
         assert.equal(cancelled.status, "cancelled");
         assert.equal(cancelled.stepIndex, 0);
@@ -139,7 +137,7 @@ test("invariant enforcement: step cap fails run before next step", async () => {
         await destroyHarness(harness);
     }
 });
-test("cancellation flow: running -> cancelling -> cancelled on worker tick", async () => {
+test("cancellation flow: running -> cancelled on worker tick", async () => {
     const harness = await createHarness();
     try {
         const run = await harness.service.createRun({
@@ -149,7 +147,7 @@ test("cancellation flow: running -> cancelling -> cancelled on worker tick", asy
             requestId: "test-cancel"
         });
         await harness.service.markRunRunning(harness.project.id, run.id, "test-cancel");
-        await harness.service.markRunCancelling(harness.project.id, run.id, "test-cancel");
+        await harness.service.markRunCancelled(harness.project.id, run.id, "test-cancel");
         const result = await harness.service.executeNextStep({
             projectId: harness.project.id,
             runId: run.id,
@@ -234,7 +232,7 @@ test("optimization phase switch and completion", async () => {
         });
         assert.equal(step1.outcome, "processed");
         assert.equal(step1.run?.phase, "optimization");
-        assert.equal(step1.run?.status, "running");
+        assert.equal(step1.run?.status, "optimizing");
         const step2 = await harness.service.executeNextStep({
             projectId: harness.project.id,
             runId: run.id,

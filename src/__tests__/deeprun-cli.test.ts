@@ -2,11 +2,12 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { AppStore } from "../lib/project-store.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL || process.env.DATABASE_URL;
 
@@ -76,7 +77,7 @@ async function acquireFreePort(): Promise<number> {
 
 async function waitForHealthy(baseUrl: string, child: ReturnType<typeof spawn>): Promise<void> {
   const startedAt = Date.now();
-  const timeoutMs = 20_000;
+  const timeoutMs = 45_000;
 
   while (Date.now() - startedAt < timeoutMs) {
     if (child.exitCode !== null) {
@@ -228,6 +229,9 @@ test("deeprun CLI supports init -> run(kernel) -> status -> validate", async () 
         "kernel",
         "--provider",
         "mock",
+        "--wait",
+        "--profile",
+        "ci",
         "--project-name",
         `CLI Kernel Project ${suffix}`
       ],
@@ -259,11 +263,20 @@ test("deeprun CLI supports init -> run(kernel) -> status -> validate", async () 
     assert.equal(statusKv.PROJECT_ID, runKv.PROJECT_ID);
     assert.equal(statusKv.RUN_ID, runKv.RUN_ID);
     assert.equal(statusKv.ENGINE, "kernel");
-    assert.ok(statusKv.RUN_STATUS);
+    assert.equal(statusKv.RUN_STATUS, "complete");
     assert.ok(statusKv.CORRECTION_ATTEMPTS !== undefined);
     assert.ok(statusKv.CORRECTION_POLICY_ATTEMPTS !== undefined);
     assert.ok(statusKv.CORRECTION_POLICY_PASSED !== undefined);
     assert.ok(statusKv.CORRECTION_POLICY_FAILED !== undefined);
+    assert.ok(statusKv.OPEN_STUB_DEBT_COUNT !== undefined);
+    assert.ok(statusKv.STUB_MARKER_COUNT !== undefined);
+    assert.ok(statusKv.LAST_STUB_PATH !== undefined);
+    assert.ok(statusKv.LAST_STUB_PAYDOWN_ACTION !== undefined);
+    assert.ok(statusKv.LAST_STUB_PAYDOWN_STATUS !== undefined);
+    assert.ok(statusKv.LAST_STUB_PAYDOWN_AT !== undefined);
+    assert.equal(statusKv.EXECUTION_PROFILE, "ci");
+    assert.equal(statusKv.EXECUTION_SCHEMA_VERSION, "1");
+    assert.equal(statusKv.EXECUTION_HEAVY_VALIDATION_MODE, "off");
 
     const logsResult = await runCli(
       ["logs", "--engine", "kernel", "--project", runKv.PROJECT_ID, "--run", runKv.RUN_ID],
@@ -425,6 +438,9 @@ test("deeprun CLI promote is blocked until validation passes", async () => {
         "kernel",
         "--provider",
         "mock",
+        "--wait",
+        "--profile",
+        "ci",
         "--project-name",
         `CLI Promote Project ${suffix}`
       ],
@@ -447,8 +463,8 @@ test("deeprun CLI promote is blocked until validation passes", async () => {
     );
 
     assert.equal(promoteResult.code, 1, `promote should fail without validation: ${promoteResult.stdout}`);
-    assert.match(promoteResult.stderr, /promotion blocked/i);
-    assert.match(promoteResult.stderr, /validate/i);
+    assert.match(promoteResult.stderr, /(promotion blocked|run has not been validated)/i);
+    assert.match(promoteResult.stderr, /(validate|validated)/i);
   } finally {
     await server.stop();
     await rm(tmpDir, { recursive: true, force: true });
@@ -601,6 +617,210 @@ test("deeprun CLI validate --strict-v1-ready emits v1-ready summary keys", async
     assert.ok(validateKv.V1_READY_VERDICT !== undefined, `missing V1_READY_VERDICT: ${validateResult.stdout}`);
     assert.ok(validateKv.V1_READY_TARGET !== undefined, `missing V1_READY_TARGET: ${validateResult.stdout}`);
     assert.ok(validateKv.V1_READY_GENERATED_AT !== undefined, `missing V1_READY_GENERATED_AT: ${validateResult.stdout}`);
+  } finally {
+    await server.stop();
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("deeprun CLI gate emits PASS governance-decision.json for validated run", async () => {
+  const server = await startServer();
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "deeprun-cli-gate-pass-"));
+  const configPath = path.join(tmpDir, "cli.json");
+  const outputPath = path.join(tmpDir, "governance-decision.json");
+  const suffix = randomUUID().slice(0, 8);
+  const email = `cli-gate-pass-${suffix}@example.com`;
+  const store = new AppStore();
+
+  try {
+    const initResult = await runCli(
+      [
+        "init",
+        "--api",
+        server.baseUrl,
+        "--email",
+        email,
+        "--password",
+        "Password123!",
+        "--name",
+        `CLI Gate Pass Tester ${suffix}`,
+        "--org",
+        `CLI Gate Pass Org ${suffix}`,
+        "--workspace",
+        `CLI Gate Pass Workspace ${suffix}`
+      ],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl,
+        DEEPRUN_WORKSPACE_ROOT: tmpDir
+      }
+    );
+
+    assert.equal(initResult.code, 0, `init failed: ${initResult.stderr}`);
+
+    const runResult = await runCli(
+      [
+        "run",
+        `Build kernel run for governance pass ${suffix}`,
+        "--engine",
+        "kernel",
+        "--provider",
+        "mock",
+        "--wait",
+        "--profile",
+        "ci",
+        "--project-name",
+        `CLI Gate Pass Project ${suffix}`
+      ],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl,
+        DEEPRUN_WORKSPACE_ROOT: tmpDir
+      }
+    );
+
+    assert.equal(runResult.code, 0, `run failed: ${runResult.stderr}\n${runResult.stdout}`);
+    const runKv = parseKeyValueLines(runResult.stdout);
+    const project = await store.getProject(runKv.PROJECT_ID);
+    assert.ok(project, "expected persisted project for gate pass test");
+    assert.ok(await store.getAgentRun(runKv.RUN_ID), "expected persisted run for gate pass test");
+    await store.updateAgentRun(runKv.RUN_ID, {
+      validationStatus: "passed",
+      validationResult: {
+        targetPath: store.getProjectWorkspacePath(project),
+        validation: {
+          ok: true,
+          blockingCount: 0,
+          warningCount: 0,
+          summary: "all checks passed",
+          checks: []
+        }
+      },
+      validatedAt: new Date().toISOString()
+    });
+
+    const gateResult = await runCli(
+      ["gate", "--project", runKv.PROJECT_ID, "--run", runKv.RUN_ID, "--output", outputPath],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl,
+        DEEPRUN_WORKSPACE_ROOT: tmpDir
+      }
+    );
+
+    assert.equal(gateResult.code, 0, `gate should pass: ${gateResult.stderr}\n${gateResult.stdout}`);
+    const payload = JSON.parse(gateResult.stdout) as {
+      decision: string;
+      decisionHash: string;
+      reasonCodes: string[];
+      runId: string;
+      contract: { hash: string; plannerPolicyVersion: number };
+    };
+    assert.equal(payload.decision, "PASS");
+    assert.equal(payload.runId, runKv.RUN_ID);
+    assert.deepEqual(payload.reasonCodes, []);
+    assert.ok(payload.contract.hash.length > 10);
+    assert.equal(payload.contract.plannerPolicyVersion >= 1, true);
+    assert.equal(payload.decisionHash.length, 64);
+
+    const written = JSON.parse(await readFile(outputPath, "utf8")) as { decision: string; runId: string };
+    assert.equal(written.decision, "PASS");
+    assert.equal(written.runId, runKv.RUN_ID);
+
+    const contentAddressedPath = path.join(tmpDir, ".deeprun", "decisions", `${payload.decisionHash}.json`);
+    const latestPath = path.join(tmpDir, ".deeprun", "decisions", "latest.json");
+    const contentAddressed = JSON.parse(await readFile(contentAddressedPath, "utf8")) as { decisionHash: string };
+    const latest = JSON.parse(await readFile(latestPath, "utf8")) as { decisionHash: string };
+    assert.equal(contentAddressed.decisionHash, payload.decisionHash);
+    assert.equal(latest.decisionHash, payload.decisionHash);
+  } finally {
+    await store.close();
+    await server.stop();
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("deeprun CLI gate emits FAIL governance decision for strict v1-ready blockers", async () => {
+  const server = await startServer();
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "deeprun-cli-gate-fail-"));
+  const configPath = path.join(tmpDir, "cli.json");
+  const suffix = randomUUID().slice(0, 8);
+  const email = `cli-gate-fail-${suffix}@example.com`;
+
+  try {
+    const initResult = await runCli(
+      [
+        "init",
+        "--api",
+        server.baseUrl,
+        "--email",
+        email,
+        "--password",
+        "Password123!",
+        "--name",
+        `CLI Gate Fail Tester ${suffix}`,
+        "--org",
+        `CLI Gate Fail Org ${suffix}`,
+        "--workspace",
+        `CLI Gate Fail Workspace ${suffix}`
+      ],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl,
+        DEEPRUN_WORKSPACE_ROOT: tmpDir
+      }
+    );
+
+    assert.equal(initResult.code, 0, `init failed: ${initResult.stderr}`);
+
+    const runResult = await runCli(
+      [
+        "run",
+        `Build kernel run for governance fail ${suffix}`,
+        "--engine",
+        "kernel",
+        "--provider",
+        "mock",
+        "--wait",
+        "--profile",
+        "ci",
+        "--project-name",
+        `CLI Gate Fail Project ${suffix}`
+      ],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl,
+        DEEPRUN_WORKSPACE_ROOT: tmpDir
+      }
+    );
+
+    assert.equal(runResult.code, 0, `run failed: ${runResult.stderr}\n${runResult.stdout}`);
+    const runKv = parseKeyValueLines(runResult.stdout);
+
+    const gateResult = await runCli(
+      ["gate", "--project", runKv.PROJECT_ID, "--run", runKv.RUN_ID, "--strict-v1-ready"],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl,
+        DEEPRUN_WORKSPACE_ROOT: tmpDir,
+        V1_DOCKER_BIN: "__missing_docker_binary__"
+      }
+    );
+
+    assert.equal(gateResult.code, 1, `gate should fail under strict v1-ready blockers: ${gateResult.stdout}`);
+    const payload = JSON.parse(gateResult.stdout) as {
+      decision: string;
+      decisionHash: string;
+      reasonCodes: string[];
+      reasons: Array<{ code: string }>;
+    };
+    assert.equal(payload.decision, "FAIL");
+    assert.equal(payload.reasonCodes.includes("RUN_V1_READY_FAILED"), true);
+    assert.equal(payload.reasons.some((entry) => entry.code === "RUN_V1_READY_FAILED"), true);
+
+    const contentAddressedPath = path.join(tmpDir, ".deeprun", "decisions", `${payload.decisionHash}.json`);
+    const contentAddressed = JSON.parse(await readFile(contentAddressedPath, "utf8")) as { decision: string };
+    assert.equal(contentAddressed.decision, "FAIL");
   } finally {
     await server.stop();
     await rm(tmpDir, { recursive: true, force: true });

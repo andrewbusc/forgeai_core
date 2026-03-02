@@ -1,26 +1,28 @@
 import "dotenv/config";
 import cors from "cors";
 import express from "express";
+import type { Server as HttpServer } from "node:http";
 import { promises as fs } from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { ZodError, z } from "zod";
 import { FileSession } from "./agent/fs/file-session.js";
-import { runGeneration } from "./lib/generator.js";
 import { buildTree, ensureDir, pathExists, readTextFile, safeResolvePath } from "./lib/fs-utils.js";
 import { AppStore } from "./lib/project-store.js";
 import { ProviderRegistry } from "./lib/providers.js";
+import { workspacePath } from "./lib/workspace.js";
 import { AgentKernel } from "./agent/kernel.js";
 import { AgentRunService } from "./agent/run-service.js";
 import { AgentRunWorker } from "./agent/run-worker.js";
 import { runV1ReadinessCheck, V1ReadinessReport } from "./agent/validation/check-v1-ready.js";
+import { buildGovernanceDecision } from "./governance/decision.js";
 import { getTemplate, listTemplates } from "./templates/catalog.js";
 import { hashPassword, verifyPassword } from "./lib/auth.js";
 import { slugify } from "./lib/strings.js";
-import { createAutoCommit, listCommits, readDiff } from "./lib/git-versioning.js";
+import { createAutoCommit, listCommits, readCurrentCommitHash, readDiff } from "./lib/git-versioning.js";
 import { Deployment, MembershipRole, Project, ProjectTemplateId, PublicUser } from "./types.js";
 import {
   createAccessToken,
@@ -86,13 +88,41 @@ const generateSchema = z.object({
   model: z.string().max(100).optional()
 });
 
+const executionValidationModeSchema = z.enum(["off", "warn", "enforce"]);
+
 const createAgentRunSchema = z.object({
   goal: z.string().min(4).max(24_000),
   provider: z.string().optional(),
-  model: z.string().max(100).optional()
+  model: z.string().max(100).optional(),
+  profile: z.enum(["full", "ci", "smoke"]).default("full"),
+  lightValidationMode: executionValidationModeSchema.optional(),
+  heavyValidationMode: executionValidationModeSchema.optional(),
+  maxRuntimeCorrectionAttempts: z.number().int().min(0).max(5).optional(),
+  maxHeavyCorrectionAttempts: z.number().int().min(0).max(3).optional(),
+  correctionPolicyMode: executionValidationModeSchema.optional(),
+  correctionConvergenceMode: executionValidationModeSchema.optional(),
+  plannerTimeoutMs: z.number().int().min(1_000).max(300_000).optional()
+});
+
+const resumeAgentRunSchema = z.object({
+  profile: z.enum(["full", "ci", "smoke"]).optional(),
+  lightValidationMode: executionValidationModeSchema.optional(),
+  heavyValidationMode: executionValidationModeSchema.optional(),
+  maxRuntimeCorrectionAttempts: z.number().int().min(0).max(5).optional(),
+  maxHeavyCorrectionAttempts: z.number().int().min(0).max(3).optional(),
+  correctionPolicyMode: executionValidationModeSchema.optional(),
+  correctionConvergenceMode: executionValidationModeSchema.optional(),
+  plannerTimeoutMs: z.number().int().min(1_000).max(300_000).optional(),
+  overrideExecutionConfig: z.boolean().default(false),
+  fork: z.boolean().default(false)
 });
 
 const validateAgentRunSchema = z.object({
+  strictV1Ready: z.boolean().default(false)
+});
+
+const governanceDecisionRequestSchema = z.object({
+  runId: z.string().uuid(),
   strictV1Ready: z.boolean().default(false)
 });
 
@@ -118,16 +148,33 @@ const gitCommitSchema = z.object({
 });
 
 const createDeploymentSchema = z.object({
+  runId: z.string().uuid(),
   customDomain: z.string().trim().max(255).optional(),
   containerPort: z.number().int().min(1).max(65535).optional()
 });
 
 const app = express();
+app.disable("x-powered-by");
+
 const store = new AppStore();
 const providers = new ProviderRegistry();
-const agentKernel = new AgentKernel({ store });
+const agentKernel = new AgentKernel({ store, providers });
 const agentRunService = new AgentRunService(store);
 const agentRunWorker = new AgentRunWorker(agentRunService);
+const serverStartedAtMs = Date.now();
+let httpServer: HttpServer | null = null;
+let storeClosed = false;
+let serverLifecycleState: "starting" | "ready" | "draining" | "stopped" = "starting";
+let shutdownPromise: Promise<void> | null = null;
+
+function resolveProviderIdOrHttpError(provider: string | undefined | null): string {
+  try {
+    return providers.resolveProviderId(provider);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Invalid provider.";
+    throw new HttpError(400, message);
+  }
+}
 
 const corsAllowedOrigins = (process.env.CORS_ALLOWED_ORIGINS || "")
   .split(",")
@@ -149,9 +196,90 @@ function parseSameSite(value: string | undefined): "Lax" | "Strict" | "None" {
   return "Lax";
 }
 
+function parsePositiveIntEnv(value: string | undefined, fallback: number, min: number): number {
+  const parsed = Number(value);
+
+  if (!Number.isFinite(parsed) || parsed < min) {
+    return fallback;
+  }
+
+  return Math.floor(parsed);
+}
+
+function parseBooleanEnv(value: string | undefined, fallback = false): boolean {
+  const trimmed = value?.trim().toLowerCase();
+
+  if (!trimmed) {
+    return fallback;
+  }
+
+  if (trimmed === "true" || trimmed === "1" || trimmed === "yes" || trimmed === "on") {
+    return true;
+  }
+
+  if (trimmed === "false" || trimmed === "0" || trimmed === "no" || trimmed === "off") {
+    return false;
+  }
+
+  return fallback;
+}
+
+function parseTrustProxy(value: string | undefined): boolean | number | string | string[] {
+  const trimmed = value?.trim();
+
+  if (!trimmed || trimmed === "false") {
+    return false;
+  }
+
+  if (trimmed === "true") {
+    return true;
+  }
+
+  if (/^\d+$/.test(trimmed)) {
+    return Number(trimmed);
+  }
+
+  if (trimmed.includes(",")) {
+    return trimmed
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+  }
+
+  return trimmed;
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      reject(new Error(message));
+    }, timeoutMs);
+
+    timeout.unref();
+
+    promise.then(
+      (value) => {
+        clearTimeout(timeout);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      }
+    );
+  });
+}
+
 const cookieSecure = process.env.COOKIE_SECURE === "true" || process.env.NODE_ENV === "production";
 const cookieSameSite = parseSameSite(process.env.COOKIE_SAMESITE);
 const cookieDomain = process.env.COOKIE_DOMAIN || undefined;
+const trustProxy = parseTrustProxy(process.env.TRUST_PROXY);
+const readinessDbTimeoutMs = parsePositiveIntEnv(process.env.READINESS_DB_TIMEOUT_MS, 2000, 250);
+const shutdownGraceMs = parsePositiveIntEnv(process.env.SHUTDOWN_GRACE_MS, 15000, 1000);
+const metricsEnabled = parseBooleanEnv(process.env.METRICS_ENABLED, false);
+const metricsAuthToken = (process.env.METRICS_AUTH_TOKEN || "").trim();
+
+app.set("trust proxy", trustProxy);
 
 if (cookieSameSite === "None" && !cookieSecure) {
   throw new Error("COOKIE_SAMESITE=None requires COOKIE_SECURE=true.");
@@ -179,6 +307,22 @@ const deploymentConfig = {
 
 const deploymentJobsByProject = new Set<string>();
 const customDomainRegex = /^(?=.{3,255}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
+const metricsHistogramBucketBoundsMs = [10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000] as const;
+const metricsHistogramBuckets = metricsHistogramBucketBoundsMs.map((upperBoundMs) => ({
+  upperBoundMs,
+  count: 0
+}));
+const metricsStatusCounts = new Map<string, number>();
+const metricsMethodCounts = new Map<string, number>();
+let metricsHttpRequestsTotal = 0;
+let metricsHttpRequestsInFlight = 0;
+let metricsHttpRequestDurationCount = 0;
+let metricsHttpRequestDurationMsSum = 0;
+let metricsReadinessChecksTotal = 0;
+let metricsReadinessFailuresTotal = 0;
+let metricsReadinessLastDurationMs = 0;
+let metricsReadinessLastOk = false;
+let metricsReadinessHasSample = false;
 
 app.use(
   cors({
@@ -201,12 +345,23 @@ app.use(
 
 app.use(express.json({ limit: "10mb" }));
 
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("X-Permitted-Cross-Domain-Policies", "none");
+
+  if (req.secure) {
+    res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  }
+
+  next();
+});
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const rootDir = path.resolve(__dirname, "..");
 const publicDir = path.join(rootDir, "public");
-
-app.use(express.static(publicDir));
 
 interface AuthState {
   user: PublicUser;
@@ -236,6 +391,18 @@ interface BootstrapCertificationSummary {
   violations: Array<Record<string, unknown>>;
 }
 
+function buildValidationResultPayload(input: {
+  targetPath: string;
+  validation: ValidationSummaryLike;
+  v1Ready?: V1ReadinessReport | null;
+}): Record<string, unknown> {
+  return {
+    targetPath: input.targetPath,
+    validation: input.validation,
+    ...(input.v1Ready ? { v1Ready: input.v1Ready } : {})
+  };
+}
+
 interface ValidationCheckResult {
   id: string;
   status: "pass" | "fail" | "skip";
@@ -251,25 +418,14 @@ interface ValidationSummaryLike {
   checks: ValidationCheckResult[];
 }
 
-interface ProjectValidationSnapshot {
-  source: string;
-  runId: string | null;
-  targetPath: string | null;
-  validatedAt: string;
-  validation: ValidationSummaryLike;
-  v1Ready: {
-    ok: boolean;
-    verdict: "YES" | "NO";
-    generatedAt: string;
-  } | null;
-}
-
 class HttpError extends Error {
   readonly status: number;
+  readonly details?: unknown;
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, details?: unknown) {
     super(message);
     this.status = status;
+    this.details = details;
   }
 }
 
@@ -342,6 +498,169 @@ function getRequestId(req: express.Request): string {
   return (req as AppRequest).requestId || "unknown";
 }
 
+function incrementCounter(map: Map<string, number>, key: string): void {
+  map.set(key, (map.get(key) || 0) + 1);
+}
+
+function recordHttpRequestMetric(method: string, statusCode: number, durationMs: number): void {
+  metricsHttpRequestsTotal += 1;
+  metricsHttpRequestDurationCount += 1;
+  metricsHttpRequestDurationMsSum += durationMs;
+
+  const statusClass = `${Math.floor(Math.max(100, statusCode) / 100)}xx`;
+  incrementCounter(metricsStatusCounts, statusClass);
+  incrementCounter(metricsMethodCounts, method.toUpperCase());
+
+  for (const bucket of metricsHistogramBuckets) {
+    if (durationMs <= bucket.upperBoundMs) {
+      bucket.count += 1;
+    }
+  }
+}
+
+function recordReadinessProbeMetric(ok: boolean, durationMs: number): void {
+  metricsReadinessChecksTotal += 1;
+  if (!ok) {
+    metricsReadinessFailuresTotal += 1;
+  }
+
+  metricsReadinessLastOk = ok;
+  metricsReadinessLastDurationMs = durationMs;
+  metricsReadinessHasSample = true;
+}
+
+function escapePrometheusLabelValue(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/\n/g, "\\n").replace(/"/g, '\\"');
+}
+
+function formatPrometheusMetricLine(
+  metricName: string,
+  value: string | number,
+  labels?: Record<string, string>
+): string {
+  if (!labels || !Object.keys(labels).length) {
+    return `${metricName} ${String(value)}`;
+  }
+
+  const rendered = Object.entries(labels)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, raw]) => `${key}="${escapePrometheusLabelValue(raw)}"`)
+    .join(",");
+
+  return `${metricName}{${rendered}} ${String(value)}`;
+}
+
+function isMetricsAuthorized(req: express.Request): boolean {
+  if (!metricsAuthToken) {
+    return true;
+  }
+
+  const header = req.headers.authorization;
+  if (typeof header !== "string" || !header.startsWith("Bearer ")) {
+    return false;
+  }
+
+  const provided = Buffer.from(header.slice("Bearer ".length), "utf8");
+  const expected = Buffer.from(metricsAuthToken, "utf8");
+
+  if (provided.length !== expected.length) {
+    return false;
+  }
+
+  return timingSafeEqual(provided, expected);
+}
+
+function renderPrometheusMetrics(): string {
+  const lines: string[] = [];
+  const memory = process.memoryUsage();
+  const uptimeSeconds = (Date.now() - serverStartedAtMs) / 1000;
+  const lifecycleStates: Array<"starting" | "ready" | "draining" | "stopped"> = [
+    "starting",
+    "ready",
+    "draining",
+    "stopped"
+  ];
+
+  lines.push("# HELP deeprun_process_uptime_seconds Process uptime in seconds.");
+  lines.push("# TYPE deeprun_process_uptime_seconds gauge");
+  lines.push(formatPrometheusMetricLine("deeprun_process_uptime_seconds", uptimeSeconds.toFixed(3)));
+
+  lines.push("# HELP deeprun_process_resident_memory_bytes Resident set size in bytes.");
+  lines.push("# TYPE deeprun_process_resident_memory_bytes gauge");
+  lines.push(formatPrometheusMetricLine("deeprun_process_resident_memory_bytes", memory.rss));
+
+  lines.push("# HELP deeprun_process_heap_used_bytes V8 heap used in bytes.");
+  lines.push("# TYPE deeprun_process_heap_used_bytes gauge");
+  lines.push(formatPrometheusMetricLine("deeprun_process_heap_used_bytes", memory.heapUsed));
+
+  lines.push("# HELP deeprun_server_lifecycle_state Current lifecycle state of the API process.");
+  lines.push("# TYPE deeprun_server_lifecycle_state gauge");
+  for (const state of lifecycleStates) {
+    lines.push(
+      formatPrometheusMetricLine("deeprun_server_lifecycle_state", serverLifecycleState === state ? 1 : 0, { state })
+    );
+  }
+
+  lines.push("# HELP deeprun_http_requests_total Total HTTP requests handled (excluding /metrics).");
+  lines.push("# TYPE deeprun_http_requests_total counter");
+  lines.push(formatPrometheusMetricLine("deeprun_http_requests_total", metricsHttpRequestsTotal));
+
+  lines.push("# HELP deeprun_http_requests_by_method_total HTTP requests by method (excluding /metrics).");
+  lines.push("# TYPE deeprun_http_requests_by_method_total counter");
+  for (const [method, count] of [...metricsMethodCounts.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+    lines.push(formatPrometheusMetricLine("deeprun_http_requests_by_method_total", count, { method }));
+  }
+
+  lines.push("# HELP deeprun_http_requests_by_status_class_total HTTP requests by status class (excluding /metrics).");
+  lines.push("# TYPE deeprun_http_requests_by_status_class_total counter");
+  for (const [statusClass, count] of [...metricsStatusCounts.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+    lines.push(formatPrometheusMetricLine("deeprun_http_requests_by_status_class_total", count, { status_class: statusClass }));
+  }
+
+  lines.push("# HELP deeprun_http_requests_in_flight Currently in-flight HTTP requests.");
+  lines.push("# TYPE deeprun_http_requests_in_flight gauge");
+  lines.push(formatPrometheusMetricLine("deeprun_http_requests_in_flight", metricsHttpRequestsInFlight));
+
+  lines.push("# HELP deeprun_http_request_duration_ms Request duration histogram in milliseconds (excluding /metrics).");
+  lines.push("# TYPE deeprun_http_request_duration_ms histogram");
+  for (const bucket of metricsHistogramBuckets) {
+    lines.push(
+      formatPrometheusMetricLine("deeprun_http_request_duration_ms_bucket", bucket.count, {
+        le: String(bucket.upperBoundMs)
+      })
+    );
+  }
+  lines.push(formatPrometheusMetricLine("deeprun_http_request_duration_ms_bucket", metricsHttpRequestDurationCount, { le: "+Inf" }));
+  lines.push(formatPrometheusMetricLine("deeprun_http_request_duration_ms_sum", metricsHttpRequestDurationMsSum.toFixed(3)));
+  lines.push(formatPrometheusMetricLine("deeprun_http_request_duration_ms_count", metricsHttpRequestDurationCount));
+
+  lines.push("# HELP deeprun_readiness_checks_total Total readiness probe executions.");
+  lines.push("# TYPE deeprun_readiness_checks_total counter");
+  lines.push(formatPrometheusMetricLine("deeprun_readiness_checks_total", metricsReadinessChecksTotal));
+
+  lines.push("# HELP deeprun_readiness_failures_total Total failed readiness probe executions.");
+  lines.push("# TYPE deeprun_readiness_failures_total counter");
+  lines.push(formatPrometheusMetricLine("deeprun_readiness_failures_total", metricsReadinessFailuresTotal));
+
+  lines.push("# HELP deeprun_readiness_last_check_success Last readiness probe result (1=ok, 0=failed, -1=no samples).");
+  lines.push("# TYPE deeprun_readiness_last_check_success gauge");
+  lines.push(
+    formatPrometheusMetricLine("deeprun_readiness_last_check_success", metricsReadinessHasSample ? (metricsReadinessLastOk ? 1 : 0) : -1)
+  );
+
+  lines.push("# HELP deeprun_readiness_last_check_duration_ms Last readiness probe duration in milliseconds.");
+  lines.push("# TYPE deeprun_readiness_last_check_duration_ms gauge");
+  lines.push(
+    formatPrometheusMetricLine(
+      "deeprun_readiness_last_check_duration_ms",
+      metricsReadinessHasSample ? metricsReadinessLastDurationMs.toFixed(3) : 0
+    )
+  );
+
+  lines.push("");
+  return lines.join("\n");
+}
+
 app.use((req, res, next) => {
   const requestIdHeader = req.headers["x-request-id"];
   const requestId = typeof requestIdHeader === "string" && requestIdHeader ? requestIdHeader : randomUUID();
@@ -350,6 +669,11 @@ app.use((req, res, next) => {
   res.setHeader("x-request-id", requestId);
 
   const startedAt = Date.now();
+  metricsHttpRequestsInFlight += 1;
+
+  res.once("close", () => {
+    metricsHttpRequestsInFlight = Math.max(0, metricsHttpRequestsInFlight - 1);
+  });
 
   logInfo("http.request", {
     requestId,
@@ -359,18 +683,40 @@ app.use((req, res, next) => {
   });
 
   res.on("finish", () => {
+    const durationMs = Date.now() - startedAt;
+
+    if (req.path !== "/metrics") {
+      recordHttpRequestMetric(req.method, res.statusCode, durationMs);
+    }
+
     logInfo("http.response", {
       requestId,
       method: req.method,
       path: req.path,
       statusCode: res.statusCode,
-      durationMs: Date.now() - startedAt,
+      durationMs,
       userId: (req as AppRequest).auth?.user.id || null
     });
   });
 
   next();
 });
+
+function isOperationalProbePath(pathname: string): boolean {
+  return pathname === "/api/health" || pathname === "/api/ready" || pathname === "/metrics";
+}
+
+app.use((req, res, next) => {
+  if (serverLifecycleState !== "draining" || isOperationalProbePath(req.path)) {
+    next();
+    return;
+  }
+
+  res.setHeader("Connection", "close");
+  res.status(503).json({ error: "Server is shutting down." });
+});
+
+app.use(express.static(publicDir));
 
 async function enforceRateLimit(
   req: express.Request,
@@ -710,104 +1056,6 @@ function extractValidationViolations(
   return violations;
 }
 
-function extractLatestProjectValidation(project: Project): ProjectValidationSnapshot | null {
-  for (const entry of project.history) {
-    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
-      continue;
-    }
-
-    const metadata =
-      entry.metadata && typeof entry.metadata === "object" && !Array.isArray(entry.metadata)
-        ? (entry.metadata as Record<string, unknown>)
-        : null;
-
-    if (!metadata) {
-      continue;
-    }
-
-    const validation =
-      metadata.validation && typeof metadata.validation === "object" && !Array.isArray(metadata.validation)
-        ? (metadata.validation as Record<string, unknown>)
-        : null;
-
-    if (!validation || typeof validation.ok !== "boolean") {
-      continue;
-    }
-
-    const checks: ValidationCheckResult[] = [];
-    const rawChecks = Array.isArray(validation.checks) ? validation.checks : [];
-    for (const rawCheck of rawChecks) {
-      if (!rawCheck || typeof rawCheck !== "object" || Array.isArray(rawCheck)) {
-        continue;
-      }
-
-      const check = rawCheck as Record<string, unknown>;
-      const id = typeof check.id === "string" ? check.id.trim() : "";
-      const status = typeof check.status === "string" ? check.status.trim() : "";
-      const message = typeof check.message === "string" ? check.message.trim() : "";
-
-      if (!id || !message || (status !== "pass" && status !== "fail" && status !== "skip")) {
-        continue;
-      }
-
-      const details =
-        check.details && typeof check.details === "object" && !Array.isArray(check.details)
-          ? (check.details as Record<string, unknown>)
-          : undefined;
-
-      checks.push({
-        id,
-        status,
-        message,
-        ...(details ? { details } : {})
-      });
-    }
-
-    const blockingCount = Number(validation.blockingCount);
-    const warningCount = Number(validation.warningCount);
-    const summary = typeof validation.summary === "string" && validation.summary.trim() ? validation.summary.trim() : "";
-    const validatedAt =
-      typeof metadata.validatedAt === "string" && metadata.validatedAt.trim() ? metadata.validatedAt : entry.createdAt;
-    const source = typeof metadata.source === "string" && metadata.source.trim() ? metadata.source.trim() : "unknown";
-    const runId = typeof metadata.runId === "string" && metadata.runId.trim() ? metadata.runId.trim() : null;
-    const targetPath = typeof metadata.targetPath === "string" && metadata.targetPath.trim() ? metadata.targetPath : null;
-    const v1ReadyRaw =
-      metadata.v1Ready && typeof metadata.v1Ready === "object" && !Array.isArray(metadata.v1Ready)
-        ? (metadata.v1Ready as Record<string, unknown>)
-        : null;
-    const v1ReadyOk = typeof v1ReadyRaw?.ok === "boolean" ? v1ReadyRaw.ok : null;
-    const v1ReadyVerdict = typeof v1ReadyRaw?.verdict === "string" ? v1ReadyRaw.verdict.trim().toUpperCase() : "";
-    const v1ReadyGeneratedAt =
-      typeof v1ReadyRaw?.generatedAt === "string" && v1ReadyRaw.generatedAt.trim()
-        ? v1ReadyRaw.generatedAt
-        : validatedAt;
-
-    return {
-      source,
-      runId,
-      targetPath,
-      validatedAt,
-      validation: {
-        ok: validation.ok,
-        blockingCount: Number.isFinite(blockingCount) && blockingCount >= 0 ? Math.floor(blockingCount) : 0,
-        warningCount: Number.isFinite(warningCount) && warningCount >= 0 ? Math.floor(warningCount) : 0,
-        summary,
-        checks
-      },
-      v1Ready:
-        v1ReadyOk === null
-          ? null
-          : {
-              ok: v1ReadyOk,
-              verdict: v1ReadyVerdict === "YES" ? "YES" : "NO",
-              generatedAt: v1ReadyGeneratedAt
-            }
-    };
-  }
-
-  return null;
-}
-
 async function persistValidationHistoryEntry(input: {
   project: Project;
   runId: string;
@@ -885,6 +1133,15 @@ async function runBootstrapCertification(input: {
       Number(validated.run.currentStepIndex || 0),
       Array.isArray(validated.run.plan?.steps) ? validated.run.plan.steps.length : 0
     );
+    const validationResultPayload = buildValidationResultPayload({
+      targetPath: validated.targetPath,
+      validation: validated.validation
+    });
+    await store.updateAgentRun(validated.run.id, {
+      validationStatus: validated.validation.ok ? "passed" : "failed",
+      validationResult: validationResultPayload,
+      validatedAt
+    });
     const certificationStep = await store.createAgentStep({
       runId: validated.run.id,
       projectId: validated.run.projectId,
@@ -930,6 +1187,29 @@ async function runBootstrapCertification(input: {
       const run = await store.getAgentRunById(input.project.id, input.runId);
 
       if (run) {
+        await store.updateAgentRun(run.id, {
+          validationStatus: "failed",
+          validationResult: buildValidationResultPayload({
+            targetPath: store.getProjectWorkspacePath(input.project),
+            validation: {
+              ok: false,
+              blockingCount: 1,
+              warningCount: 0,
+              summary: "Bootstrap certification execution failed.",
+              checks: [
+                {
+                  id: "certification",
+                  status: "fail",
+                  message,
+                  details: {
+                    source: "bootstrap"
+                  }
+                }
+              ]
+            }
+          }),
+          validatedAt
+        });
         const stepIndex = Math.max(
           Number(run.currentStepIndex || 0),
           Array.isArray(run.plan?.steps) ? run.plan.steps.length : 0
@@ -1035,6 +1315,232 @@ async function persistBootstrapCertificationHistory(input: {
     createdAt: input.certification.validatedAt
   });
   latestProject.history = latestProject.history.slice(0, 80);
+
+  await store.updateProject(latestProject);
+  return latestProject;
+}
+
+function buildBuilderSyntheticPlan(input: {
+  prompt: string;
+  providerId: string;
+  model?: string;
+  mode: "generate" | "chat";
+}): {
+  goal: string;
+  steps: Array<{
+    id: string;
+    type: "modify";
+    tool: "ai_mutation";
+    mutates: true;
+    input: Record<string, unknown>;
+  }>;
+} {
+  return {
+    goal: input.prompt,
+    steps: [
+      {
+        id: "step-1",
+        type: "modify",
+        tool: "ai_mutation",
+        mutates: true,
+        input: {
+          prompt: input.prompt,
+          provider: input.providerId,
+          ...(input.model ? { model: input.model } : {}),
+          mode: input.mode
+        }
+      }
+    ]
+  };
+}
+
+function buildManualFileWriteSyntheticPlan(input: {
+  path: string;
+  content: string;
+}): {
+  goal: string;
+  steps: Array<{
+    id: string;
+    type: "modify";
+    tool: "manual_file_write";
+    mutates: true;
+    input: Record<string, unknown>;
+  }>;
+} {
+  return {
+    goal: `Manual file edit: ${input.path}`,
+    steps: [
+      {
+        id: "step-1",
+        type: "modify",
+        tool: "manual_file_write",
+        mutates: true,
+        input: {
+          path: input.path,
+          content: input.content
+        }
+      }
+    ]
+  };
+}
+
+function deriveManualFileWriteResultFromRun(input: {
+  detail: Awaited<ReturnType<AgentKernel["startRunWithPlan"]>>;
+  path: string;
+}): {
+  commitHash: string | null;
+  filesChanged: string[];
+  stepId: string;
+} {
+  const run = input.detail.run;
+  const sortedSteps = [...input.detail.steps].sort(
+    (left, right) => left.stepIndex - right.stepIndex || left.attempt - right.attempt || left.createdAt.localeCompare(right.createdAt)
+  );
+  const step = [...sortedSteps].reverse().find((entry) => entry.tool === "manual_file_write");
+
+  if (!step) {
+    throw new Error("Manual file save run completed without a manual_file_write step record.");
+  }
+
+  if (run.status !== "complete" || step.status !== "completed") {
+    throw new Error(step.errorMessage || run.errorMessage || `Manual file save failed for '${input.path}'.`);
+  }
+
+  const output = step.outputPayload && typeof step.outputPayload === "object" ? step.outputPayload : {};
+  const filesChanged = Array.isArray(output.stagedDiffs)
+    ? output.stagedDiffs
+        .map((entry) => {
+          if (!entry || typeof entry !== "object") {
+            return null;
+          }
+          const path = (entry as { path?: unknown }).path;
+          return typeof path === "string" ? path : null;
+        })
+        .filter((value): value is string => Boolean(value))
+    : [];
+
+  return {
+    commitHash: step.commitHash || run.currentCommitHash || run.baseCommitHash || null,
+    filesChanged,
+    stepId: step.stepId
+  };
+}
+
+function deriveBuilderResultFromRun(input: {
+  detail: Awaited<ReturnType<AgentKernel["startRunWithPlan"]>>;
+  fallbackMode: "generate" | "chat";
+}): {
+  summary: string;
+  filesChanged: string[];
+  commands: string[];
+  commitHash: string | null;
+  stepId: string;
+  providerId: string;
+  model: string;
+} {
+  const run = input.detail.run;
+  const sortedSteps = [...input.detail.steps].sort(
+    (left, right) => left.stepIndex - right.stepIndex || left.attempt - right.attempt || left.createdAt.localeCompare(right.createdAt)
+  );
+  const mutationStep = [...sortedSteps].reverse().find((step) => step.tool === "ai_mutation");
+
+  if (!mutationStep) {
+    throw new HttpError(500, "Builder run finished without an ai_mutation step record.");
+  }
+
+  if (run.status !== "complete" || mutationStep.status !== "completed") {
+    const reason =
+      mutationStep.errorMessage || run.errorMessage || `Builder ${input.fallbackMode} run did not complete successfully.`;
+    throw new HttpError(409, `${reason} (runId=${run.id})`);
+  }
+
+  const output = mutationStep.outputPayload && typeof mutationStep.outputPayload === "object" ? mutationStep.outputPayload : {};
+  const summary =
+    typeof output.summary === "string" && output.summary.trim()
+      ? output.summary.trim()
+      : `Builder ${input.fallbackMode} completed.`;
+  const commands = Array.isArray(output.runCommands)
+    ? output.runCommands.filter((entry): entry is string => typeof entry === "string")
+    : [];
+  const filesChanged = Array.isArray(output.stagedDiffs)
+    ? output.stagedDiffs
+        .map((entry) => {
+          if (!entry || typeof entry !== "object") {
+            return null;
+          }
+          const path = (entry as { path?: unknown }).path;
+          return typeof path === "string" ? path : null;
+        })
+        .filter((value): value is string => Boolean(value))
+    : [];
+  const resolvedModel =
+    typeof output.model === "string" && output.model.trim()
+      ? output.model.trim()
+      : run.model || "unknown";
+
+  return {
+    summary,
+    filesChanged,
+    commands,
+    commitHash: mutationStep.commitHash || run.currentCommitHash || run.baseCommitHash || null,
+    stepId: mutationStep.stepId,
+    providerId: run.providerId,
+    model: resolvedModel
+  };
+}
+
+async function persistBuilderActivityMirror(input: {
+  project: Project;
+  prompt: string;
+  mode: "generate" | "chat";
+  result: {
+    summary: string;
+    filesChanged: string[];
+    commands: string[];
+    commitHash: string | null;
+    stepId: string;
+    providerId: string;
+    model: string;
+  };
+  runId: string;
+}): Promise<Project> {
+  const latestProject = (await store.getProject(input.project.id)) || input.project;
+  const createdAt = new Date().toISOString();
+
+  latestProject.messages.push(
+    {
+      role: "user",
+      content: input.prompt,
+      createdAt
+    },
+    {
+      role: "assistant",
+      content: input.result.summary,
+      createdAt
+    }
+  );
+
+  latestProject.history.unshift({
+    id: randomUUID(),
+    kind: input.mode,
+    prompt: input.prompt,
+    summary: input.result.summary,
+    provider: input.result.providerId,
+    model: input.result.model,
+    filesChanged: input.result.filesChanged,
+    commands: input.result.commands,
+    commitHash: input.result.commitHash || undefined,
+    metadata: {
+      source: "agent_run_builder",
+      runId: input.runId,
+      stepId: input.result.stepId
+    },
+    createdAt
+  });
+
+  latestProject.updatedAt = createdAt;
+  latestProject.history = latestProject.history.slice(0, 80);
+  latestProject.messages = latestProject.messages.slice(-80);
 
   await store.updateProject(latestProject);
   return latestProject;
@@ -1269,7 +1775,7 @@ EXPOSE ${input.containerPort}
 CMD ["sh", "-lc", "${escapeDoubleQuotes(startCommand)}"]
 `;
 
-  const generatedDir = path.join(rootDir, ".data", "deploy", "dockerfiles");
+  const generatedDir = workspacePath(".data", "deploy", "dockerfiles");
   await ensureDir(generatedDir);
   const generatedPath = path.join(generatedDir, `${input.deploymentId}.Dockerfile`);
   await fs.writeFile(generatedPath, generatedDockerfile, "utf8");
@@ -1512,9 +2018,107 @@ async function runDeploymentPipeline(input: {
   }
 }
 
+app.get("/metrics", (req, res) => {
+  if (!metricsEnabled) {
+    res.status(404).type("text/plain; charset=utf-8").send("Not found\n");
+    return;
+  }
+
+  if (!isMetricsAuthorized(req)) {
+    res.setHeader("WWW-Authenticate", "Bearer");
+    res.status(401).type("text/plain; charset=utf-8").send("Unauthorized\n");
+    return;
+  }
+
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
+  res.send(renderPrometheusMetrics());
+});
+
+app.get("/internal/workers", async (req, res, next) => {
+  try {
+    if (!isMetricsAuthorized(req)) {
+      res.setHeader("WWW-Authenticate", "Bearer");
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
+    const workers = await store.listWorkerNodes();
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ workers });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/internal/run-jobs", async (req, res, next) => {
+  try {
+    if (!isMetricsAuthorized(req)) {
+      res.setHeader("WWW-Authenticate", "Bearer");
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
+    const jobs = await store.listRunJobs();
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ jobs });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/ready", async (_req, res) => {
+  const startedAt = Date.now();
+  const now = new Date().toISOString();
+
+  if (serverLifecycleState !== "ready") {
+    recordReadinessProbeMetric(false, Date.now() - startedAt);
+    res.status(503).json({
+      ok: false,
+      state: serverLifecycleState,
+      db: "unknown",
+      now
+    });
+    return;
+  }
+
+  try {
+    await withTimeout(
+      store.ping(),
+      readinessDbTimeoutMs,
+      `Database readiness check timed out after ${readinessDbTimeoutMs}ms.`
+    );
+
+    recordReadinessProbeMetric(true, Date.now() - startedAt);
+
+    res.json({
+      ok: true,
+      state: serverLifecycleState,
+      db: "ok",
+      now
+    });
+  } catch (error) {
+    recordReadinessProbeMetric(false, Date.now() - startedAt);
+    logWarn("server.readiness_failed", {
+      ...serializeError(error)
+    });
+
+    res.status(503).json({
+      ok: false,
+      state: serverLifecycleState,
+      db: "error",
+      error: error instanceof Error ? error.message : String(error),
+      now
+    });
+  }
+});
+
 app.get("/api/health", (_req, res) => {
   res.json({
     ok: true,
+    state: serverLifecycleState,
+    draining: serverLifecycleState === "draining",
+    uptimeSec: Math.floor((Date.now() - serverStartedAtMs) / 1000),
     now: new Date().toISOString()
   });
 });
@@ -1873,7 +2477,7 @@ app.post("/api/projects/bootstrap/backend", authRequired, async (req, res, next)
     const auth = getAuth(req);
     const requestId = getRequestId(req);
     const parsed = bootstrapBackendSchema.parse(req.body ?? {});
-    const providerId = providers.resolveProviderId(parsed.provider);
+    const providerId = resolveProviderIdOrHttpError(parsed.provider);
     const { workspace } = await requireWorkspaceAccess(auth.user.id, parsed.workspaceId);
 
     await enforceRateLimit(req, res, {
@@ -1970,67 +2574,42 @@ app.get("/api/projects/:projectId/file", authRequired, async (req, res, next) =>
 app.put("/api/projects/:projectId/file", authRequired, async (req, res, next) => {
   try {
     const auth = getAuth(req);
+    const requestId = getRequestId(req);
     const project = await requireProjectAccess(auth.user.id, req.params.projectId);
     await assertNoActiveAgentRunMutation(project.id);
 
     const parsed = updateFileSchema.parse(req.body ?? {});
-    const projectRoot = store.getProjectWorkspacePath(project);
-    const fileSession = await FileSession.create({
-      projectId: project.id,
-      projectRoot,
-      options: {
-        maxFilesPerStep: 1,
-        maxTotalDiffBytes: Number(process.env.AGENT_FS_MAX_TOTAL_DIFF_BYTES || 400_000),
-        maxFileBytes: Number(process.env.AGENT_FS_MAX_FILE_BYTES || 1_500_000),
-        allowEnvMutation: true
+    const plan = buildManualFileWriteSyntheticPlan({
+      path: parsed.path,
+      content: parsed.content
+    });
+    const detail = await agentKernel.startRunWithPlan({
+      project,
+      createdByUserId: auth.user.id,
+      goal: plan.goal,
+      providerId: "system",
+      model: "manual",
+      plan,
+      requestId,
+      executionMode: "project",
+      executionProfile: "builder",
+      metadata: {
+        source: "manual_file_save",
+        path: parsed.path
       }
     });
-    const current = await fileSession.read(parsed.path);
-    let commitHash: string | null = null;
-    let filesChanged: string[] = [];
-
-    if (!(current.exists && current.content === parsed.content)) {
-      const stepId = "manual-edit";
-      fileSession.beginStep(stepId, 0);
-
-      try {
-        if (current.exists) {
-          if (!current.contentHash) {
-            throw new Error(`Could not resolve content hash for '${parsed.path}'.`);
-          }
-          await fileSession.stageChange({
-            path: parsed.path,
-            type: "update",
-            newContent: parsed.content,
-            oldContentHash: current.contentHash
-          });
-        } else {
-          await fileSession.stageChange({
-            path: parsed.path,
-            type: "create",
-            newContent: parsed.content
-          });
-        }
-
-        fileSession.validateStep();
-        await fileSession.applyStepChanges();
-        commitHash = await fileSession.commitStep({
-          agentRunId: `manual-edit-${project.id}`,
-          stepIndex: 0,
-          stepId,
-          summary: parsed.path
-        });
-        filesChanged = fileSession.getLastCommittedDiffs().map((entry) => entry.path);
-      } catch (error) {
-        await fileSession.abortStep().catch(() => undefined);
-        throw error;
-      }
-    }
+    const manualResult = deriveManualFileWriteResultFromRun({
+      detail,
+      path: parsed.path
+    });
+    const commitHash = manualResult.commitHash;
+    const filesChanged = manualResult.filesChanged;
 
     const now = new Date().toISOString();
+    const latestProject = (await store.getProject(project.id)) || project;
 
-    project.updatedAt = now;
-    project.history.unshift({
+    latestProject.updatedAt = now;
+    latestProject.history.unshift({
       id: randomUUID(),
       kind: "manual-edit",
       prompt: `Manual edit: ${parsed.path}`,
@@ -2040,11 +2619,16 @@ app.put("/api/projects/:projectId/file", authRequired, async (req, res, next) =>
       filesChanged,
       commands: [],
       commitHash: commitHash ?? undefined,
+      metadata: {
+        source: "agent_run_manual_edit",
+        runId: detail.run.id,
+        stepId: manualResult.stepId
+      },
       createdAt: now
     });
-    project.history = project.history.slice(0, 80);
+    latestProject.history = latestProject.history.slice(0, 80);
 
-    await store.updateProject(project);
+    await store.updateProject(latestProject);
 
     res.json({ ok: true, commitHash });
   } catch (error) {
@@ -2070,7 +2654,7 @@ app.post("/api/projects/:projectId/agent/runs", authRequired, async (req, res, n
     const project = await requireProjectAccess(auth.user.id, req.params.projectId);
     await assertNoActiveAgentRunMutation(project.id);
     const parsed = createAgentRunSchema.parse(req.body ?? {});
-    const providerId = providers.resolveProviderId(parsed.provider);
+    const providerId = resolveProviderIdOrHttpError(parsed.provider);
 
     await enforceRateLimit(req, res, {
       key: `generate:${auth.user.id}`,
@@ -2079,16 +2663,30 @@ app.post("/api/projects/:projectId/agent/runs", authRequired, async (req, res, n
       reason: "Generation rate limit reached. Try again shortly."
     });
 
-    const run = await agentKernel.startRun({
+    const run = await agentKernel.queueRun({
       project,
       createdByUserId: auth.user.id,
       goal: parsed.goal,
       providerId,
       model: parsed.model,
-      requestId
+      requestId,
+      executionConfig: {
+        profile: parsed.profile,
+        ...(parsed.lightValidationMode ? { lightValidationMode: parsed.lightValidationMode } : {}),
+        ...(parsed.heavyValidationMode ? { heavyValidationMode: parsed.heavyValidationMode } : {}),
+        ...(typeof parsed.maxRuntimeCorrectionAttempts === "number"
+          ? { maxRuntimeCorrectionAttempts: parsed.maxRuntimeCorrectionAttempts }
+          : {}),
+        ...(typeof parsed.maxHeavyCorrectionAttempts === "number"
+          ? { maxHeavyCorrectionAttempts: parsed.maxHeavyCorrectionAttempts }
+          : {}),
+        ...(parsed.correctionPolicyMode ? { correctionPolicyMode: parsed.correctionPolicyMode } : {}),
+        ...(parsed.correctionConvergenceMode ? { correctionConvergenceMode: parsed.correctionConvergenceMode } : {}),
+        ...(typeof parsed.plannerTimeoutMs === "number" ? { plannerTimeoutMs: parsed.plannerTimeoutMs } : {})
+      }
     });
 
-    res.status(201).json(run);
+    res.status(202).json(run);
   } catch (error) {
     next(error);
   }
@@ -2127,6 +2725,7 @@ app.post("/api/projects/:projectId/agent/runs/:runId/resume", authRequired, asyn
     const auth = getAuth(req);
     const requestId = getRequestId(req);
     const project = await requireProjectAccess(auth.user.id, req.params.projectId);
+    const parsed = resumeAgentRunSchema.parse(req.body ?? {});
 
     await enforceRateLimit(req, res, {
       key: `generate:${auth.user.id}`,
@@ -2137,19 +2736,51 @@ app.post("/api/projects/:projectId/agent/runs/:runId/resume", authRequired, asyn
 
     let detail;
     try {
-      detail = await agentKernel.resumeRun({
+      detail = await agentKernel.queueResumeRun({
         project,
         runId: req.params.runId,
-        requestId
+        requestId,
+        createdByUserId: auth.user.id,
+        executionConfig: {
+          ...(parsed.profile ? { profile: parsed.profile } : {}),
+          ...(parsed.lightValidationMode ? { lightValidationMode: parsed.lightValidationMode } : {}),
+          ...(parsed.heavyValidationMode ? { heavyValidationMode: parsed.heavyValidationMode } : {}),
+          ...(typeof parsed.maxRuntimeCorrectionAttempts === "number"
+            ? { maxRuntimeCorrectionAttempts: parsed.maxRuntimeCorrectionAttempts }
+            : {}),
+          ...(typeof parsed.maxHeavyCorrectionAttempts === "number"
+            ? { maxHeavyCorrectionAttempts: parsed.maxHeavyCorrectionAttempts }
+            : {}),
+          ...(parsed.correctionPolicyMode ? { correctionPolicyMode: parsed.correctionPolicyMode } : {}),
+          ...(parsed.correctionConvergenceMode ? { correctionConvergenceMode: parsed.correctionConvergenceMode } : {}),
+          ...(typeof parsed.plannerTimeoutMs === "number" ? { plannerTimeoutMs: parsed.plannerTimeoutMs } : {})
+        },
+        overrideExecutionConfig: parsed.overrideExecutionConfig,
+        fork: parsed.fork
       });
     } catch (error) {
       if (error instanceof Error && error.message === "Agent run not found.") {
         throw new HttpError(404, "Agent run not found.");
       }
+      if (
+        error instanceof Error &&
+        error.message.startsWith("Execution config mismatch.")
+      ) {
+        throw new HttpError(
+          409,
+          error.message,
+          error instanceof Error && "diff" in error
+            ? {
+                diff: (error as { diff?: unknown }).diff,
+                persisted: (error as { persisted?: unknown }).persisted,
+                requested: (error as { requested?: unknown }).requested
+              }
+            : undefined
+        );
+      }
       throw error;
     }
-
-    res.json(detail);
+    res.status(parsed.fork ? 201 : detail.queuedJob ? 202 : 200).json(detail);
   } catch (error) {
     next(error);
   }
@@ -2222,26 +2853,43 @@ app.post("/api/projects/:projectId/agent/runs/:runId/validate", authRequired, as
       }
     }
 
+    const validationResultPayload = buildValidationResultPayload({
+      targetPath: result.targetPath,
+      validation: result.validation,
+      v1Ready
+    });
+
+    const persistedRun =
+      (await store.updateAgentRun(result.run.id, {
+        validationStatus: result.validation.ok ? "passed" : "failed",
+        validationResult: validationResultPayload,
+        validatedAt
+      })) || result.run;
+    const persistedResult = {
+      ...result,
+      run: persistedRun
+    };
+
     void persistValidationHistoryEntry({
       project,
-      runId: result.run.id,
+      runId: persistedResult.run.id,
       source: "agent_validate",
-      targetPath: result.targetPath,
+      targetPath: persistedResult.targetPath,
       validatedAt,
-      validation: result.validation,
+      validation: persistedResult.validation,
       v1Ready,
-      runCommitHash: result.run.currentCommitHash || result.run.baseCommitHash || null
+      runCommitHash: persistedResult.run.currentCommitHash || persistedResult.run.baseCommitHash || null
     }).catch((error) => {
       logWarn("agent.validate.history_persist_failed", {
         requestId,
         projectId: project.id,
-        runId: result.run.id,
+        runId: persistedResult.run.id,
         ...serializeError(error)
       });
     });
 
     res.json({
-      ...result,
+      ...persistedResult,
       ...(v1Ready ? { v1Ready } : {})
     });
   } catch (error) {
@@ -2390,6 +3038,28 @@ app.post("/api/projects/:projectId/agent/state-runs/:runId/tick", authRequired, 
   }
 });
 
+app.post("/api/projects/:projectId/governance/decision", authRequired, async (req, res, next) => {
+  try {
+    const auth = getAuth(req);
+    const project = await requireProjectAccess(auth.user.id, req.params.projectId);
+    const parsed = governanceDecisionRequestSchema.parse(req.body ?? {});
+    const detail = await agentKernel.getRunWithSteps(project.id, parsed.runId);
+
+    if (!detail) {
+      throw new HttpError(404, "Agent run not found.");
+    }
+
+    res.json(
+      buildGovernanceDecision({
+        detail,
+        strictV1Ready: parsed.strictV1Ready
+      })
+    );
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/api/projects/:projectId/deployments", authRequired, async (req, res, next) => {
   try {
     const auth = getAuth(req);
@@ -2399,28 +3069,57 @@ app.post("/api/projects/:projectId/deployments", authRequired, async (req, res, 
 
     const customDomain = sanitizeCustomDomain(parsed.customDomain);
     const containerPort = getContainerPort(parsed.containerPort);
-    const latestProject = (await store.getProject(project.id)) || project;
-    const latestValidation = extractLatestProjectValidation(latestProject);
+    const run = await store.getAgentRun(parsed.runId);
     const requireV1ReadyForPromote = process.env.DEEPRUN_PROMOTE_REQUIRE_V1_READY === "true";
 
-    if (!latestValidation?.validation.ok) {
-      const summary = latestValidation?.validation.summary || "No passing validation record exists for this project.";
-      const runHint = latestValidation?.runId ? ` --run ${latestValidation.runId}` : "";
-      throw new HttpError(
-        409,
-        `Project promotion blocked: ${summary} Run 'deeprun validate --project ${project.id}${runHint}' and retry promote after VALIDATION_OK=true.`
-      );
+    if (!run) {
+      throw new HttpError(404, "Agent run not found.");
     }
 
-    if (requireV1ReadyForPromote && latestValidation.v1Ready?.ok !== true) {
-      const runHint = latestValidation.runId ? ` --run ${latestValidation.runId}` : "";
-      const v1Summary = latestValidation.v1Ready
-        ? `Latest v1-ready verdict is ${latestValidation.v1Ready.verdict}.`
-        : "No v1-ready report exists in project history.";
-      throw new HttpError(
-        409,
-        `Project promotion blocked: ${v1Summary} Run 'deeprun validate --project ${project.id}${runHint} --strict-v1-ready' and retry promote after V1_READY_OK=true.`
-      );
+    if (run.projectId !== project.id) {
+      throw new HttpError(409, "Run does not belong to this project.");
+    }
+
+    if (run.status !== "complete") {
+      throw new HttpError(409, "Run is not complete.");
+    }
+
+    if (!run.validationStatus) {
+      throw new HttpError(409, "Run has not been validated.");
+    }
+
+    if (run.validationStatus !== "passed") {
+      throw new HttpError(409, "Run validation failed.");
+    }
+
+    if (!run.currentCommitHash) {
+      throw new HttpError(409, "Run does not have a pinned commit hash.");
+    }
+
+    const runValidationResult =
+      run.validationResult && typeof run.validationResult === "object" && !Array.isArray(run.validationResult)
+        ? run.validationResult
+        : null;
+    const v1ReadyRaw =
+      runValidationResult &&
+      typeof runValidationResult.v1Ready === "object" &&
+      runValidationResult.v1Ready !== null &&
+      !Array.isArray(runValidationResult.v1Ready)
+        ? (runValidationResult.v1Ready as Record<string, unknown>)
+        : null;
+    const v1ReadyOk = typeof v1ReadyRaw?.ok === "boolean" ? v1ReadyRaw.ok : null;
+
+    if (requireV1ReadyForPromote && v1ReadyOk !== true) {
+      if (v1ReadyOk === false) {
+        throw new HttpError(409, "Run v1-ready validation failed.");
+      }
+      throw new HttpError(409, "Run has not been strict v1-ready validated.");
+    }
+
+    const projectPath = store.getProjectWorkspacePath(project);
+    const workspaceHead = await readCurrentCommitHash(projectPath);
+    if (!workspaceHead || workspaceHead !== run.currentCommitHash) {
+      throw new HttpError(409, "Workspace HEAD has drifted from run commit.");
     }
 
     if (deploymentJobsByProject.has(project.id) || (await store.hasInProgressDeployment(project.id))) {
@@ -2437,6 +3136,8 @@ app.post("/api/projects/:projectId/deployments", authRequired, async (req, res, 
       orgId: project.orgId,
       workspaceId: project.workspaceId,
       createdByUserId: auth.user.id,
+      runId: run.id,
+      commitHash: run.currentCommitHash,
       status: "queued",
       subdomain,
       publicUrl,
@@ -2444,7 +3145,9 @@ app.post("/api/projects/:projectId/deployments", authRequired, async (req, res, 
       containerPort,
       metadata: {
         requestedBy: auth.user.id,
-        requestId
+        requestId,
+        runId: run.id,
+        commitHash: run.currentCommitHash
       }
     });
 
@@ -2543,7 +3246,7 @@ app.post("/api/projects/:projectId/generate", authRequired, async (req, res, nex
     });
 
     const parsed = generateSchema.parse(req.body ?? {});
-    const providerId = providers.resolveProviderId(parsed.provider);
+    const providerId = resolveProviderIdOrHttpError(parsed.provider);
 
     logInfo("generation.started", {
       requestId,
@@ -2556,14 +3259,35 @@ app.post("/api/projects/:projectId/generate", authRequired, async (req, res, nex
 
     const startedAt = Date.now();
 
-    const result = await runGeneration({
-      store,
-      registry: providers,
+    const run = await agentKernel.startRunWithPlan({
       project,
-      prompt: parsed.prompt,
+      createdByUserId: auth.user.id,
+      goal: parsed.prompt,
       providerId,
       model: parsed.model,
-      kind: "generate"
+      requestId,
+      executionMode: "project",
+      executionProfile: "builder",
+      metadata: {
+        source: "builder_generate"
+      },
+      plan: buildBuilderSyntheticPlan({
+        prompt: parsed.prompt,
+        providerId,
+        model: parsed.model,
+        mode: "generate"
+      })
+    });
+    const result = deriveBuilderResultFromRun({
+      detail: run,
+      fallbackMode: "generate"
+    });
+    await persistBuilderActivityMirror({
+      project,
+      prompt: parsed.prompt,
+      mode: "generate",
+      result,
+      runId: run.run.id
     });
 
     logInfo("generation.completed", {
@@ -2575,7 +3299,8 @@ app.post("/api/projects/:projectId/generate", authRequired, async (req, res, nex
       model: parsed.model || null,
       filesChangedCount: result.filesChanged.length,
       durationMs: Date.now() - startedAt,
-      commitHash: result.commitHash
+      commitHash: result.commitHash,
+      runId: run.run.id
     });
 
     res.json({
@@ -2604,7 +3329,7 @@ app.post("/api/projects/:projectId/chat", authRequired, async (req, res, next) =
       ...req.body,
       prompt: req.body?.message ?? req.body?.prompt
     });
-    const providerId = providers.resolveProviderId(parsed.provider);
+    const providerId = resolveProviderIdOrHttpError(parsed.provider);
 
     logInfo("generation.started", {
       requestId,
@@ -2617,14 +3342,35 @@ app.post("/api/projects/:projectId/chat", authRequired, async (req, res, next) =
 
     const startedAt = Date.now();
 
-    const result = await runGeneration({
-      store,
-      registry: providers,
+    const run = await agentKernel.startRunWithPlan({
       project,
-      prompt: parsed.prompt,
+      createdByUserId: auth.user.id,
+      goal: parsed.prompt,
       providerId,
       model: parsed.model,
-      kind: "chat"
+      requestId,
+      executionMode: "project",
+      executionProfile: "builder",
+      metadata: {
+        source: "builder_chat"
+      },
+      plan: buildBuilderSyntheticPlan({
+        prompt: parsed.prompt,
+        providerId,
+        model: parsed.model,
+        mode: "chat"
+      })
+    });
+    const result = deriveBuilderResultFromRun({
+      detail: run,
+      fallbackMode: "chat"
+    });
+    await persistBuilderActivityMirror({
+      project,
+      prompt: parsed.prompt,
+      mode: "chat",
+      result,
+      runId: run.run.id
     });
 
     logInfo("generation.completed", {
@@ -2636,7 +3382,8 @@ app.post("/api/projects/:projectId/chat", authRequired, async (req, res, next) =
       model: parsed.model || null,
       filesChangedCount: result.filesChanged.length,
       durationMs: Date.now() - startedAt,
-      commitHash: result.commitHash
+      commitHash: result.commitHash,
+      runId: run.run.id
     });
 
     res.json({
@@ -2715,10 +3462,14 @@ app.use((error: unknown, req: express.Request, res: express.Response, _next: exp
     logError("http.error", {
       requestId,
       statusCode: error.status,
+      details: error.details,
       ...serializeError(error)
     });
 
-    return res.status(error.status).json({ error: error.message });
+    return res.status(error.status).json({
+      error: error.message,
+      ...(error.details !== undefined ? { details: error.details } : {})
+    });
   }
 
   logError("http.error.unhandled", {
@@ -2733,18 +3484,117 @@ async function main(): Promise<void> {
   await store.initialize();
 
   const port = Number(process.env.PORT || 3000);
-  app.listen(port, () => {
-    logInfo("server.started", {
-      port,
-      origins: corsAllowedOrigins
+  httpServer = await new Promise<HttpServer>((resolve, reject) => {
+    const server = app.listen(port, () => resolve(server));
+    server.once("error", reject);
+  });
+
+  serverLifecycleState = "ready";
+
+  logInfo("server.started", {
+    port,
+    origins: corsAllowedOrigins,
+    trustProxy
+  });
+  console.log(`deeprun running at http://localhost:${port}`);
+}
+
+function closeHttpServer(server: HttpServer): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    server.close((error) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+
+      resolve();
     });
-    console.log(`deeprun running at http://localhost:${port}`);
   });
 }
 
-main().catch((error) => {
+async function closeStoreOnce(): Promise<void> {
+  if (storeClosed) {
+    return;
+  }
+
+  await store.close();
+  storeClosed = true;
+}
+
+async function shutdown(signal: NodeJS.Signals): Promise<void> {
+  if (shutdownPromise) {
+    await shutdownPromise;
+    return;
+  }
+
+  shutdownPromise = (async () => {
+    const startedAt = Date.now();
+    serverLifecycleState = "draining";
+
+    logInfo("server.shutdown_started", {
+      signal,
+      graceMs: shutdownGraceMs
+    });
+
+    const forceExitTimer = setTimeout(() => {
+      logError("server.shutdown_timeout", {
+        signal,
+        graceMs: shutdownGraceMs
+      });
+      process.exit(1);
+    }, shutdownGraceMs);
+
+    forceExitTimer.unref();
+
+    try {
+      if (httpServer) {
+        httpServer.closeIdleConnections?.();
+        await closeHttpServer(httpServer);
+      }
+
+      await closeStoreOnce();
+      serverLifecycleState = "stopped";
+
+      logInfo("server.shutdown_complete", {
+        signal,
+        durationMs: Date.now() - startedAt
+      });
+      process.exit(0);
+    } catch (error) {
+      logError("server.shutdown_failed", {
+        signal,
+        durationMs: Date.now() - startedAt,
+        ...serializeError(error)
+      });
+      process.exit(1);
+    } finally {
+      clearTimeout(forceExitTimer);
+    }
+  })();
+
+  await shutdownPromise;
+}
+
+process.once("SIGTERM", () => {
+  void shutdown("SIGTERM");
+});
+
+process.once("SIGINT", () => {
+  void shutdown("SIGINT");
+});
+
+main().catch(async (error) => {
   logError("server.start_failed", {
     ...serializeError(error)
   });
+
+  try {
+    await closeStoreOnce();
+  } catch (closeError) {
+    logError("server.start_failed_cleanup", {
+      ...serializeError(closeError)
+    });
+  }
+
   process.exit(1);
 });

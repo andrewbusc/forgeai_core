@@ -47,11 +47,24 @@ export async function pathExists(targetPath: string): Promise<boolean> {
   }
 }
 
+export function compareNormalizedPaths(left: string, right: string): number {
+  const normalizedLeft = left.normalize("NFC").replaceAll("\\", "/");
+  const normalizedRight = right.normalize("NFC").replaceAll("\\", "/");
+
+  if (normalizedLeft < normalizedRight) {
+    return -1;
+  }
+  if (normalizedLeft > normalizedRight) {
+    return 1;
+  }
+  return 0;
+}
+
 export async function buildTree(rootDir: string, currentDir = rootDir): Promise<FileTreeNode[]> {
   const entries = await fs.readdir(currentDir, { withFileTypes: true });
   const nodes: FileTreeNode[] = [];
 
-  for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+  for (const entry of entries.sort((a, b) => compareNormalizedPaths(a.name, b.name))) {
     if (entry.name === "node_modules" || entry.name.startsWith(".")) {
       continue;
     }
@@ -92,7 +105,7 @@ export async function collectFiles(
 
     const entries = await fs.readdir(dir, { withFileTypes: true });
 
-    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+    for (const entry of entries.sort((a, b) => compareNormalizedPaths(a.name, b.name))) {
       if (files.length >= maxFiles) {
         return;
       }
