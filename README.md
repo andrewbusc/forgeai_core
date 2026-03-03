@@ -35,20 +35,26 @@ deeprun validates AI-generated code before it reaches your pipeline.
 ### Installation
 
 ```bash
-npm install -g deeprun
+git clone https://github.com/andrewbusc/_deeprun.git
+cd _deeprun
+npm install
+npm run build
 ```
 
-Or via Docker:
+Then run commands via:
 
 ```bash
-docker pull ghcr.io/deeprun/deeprun:v1
+npm run deeprun -- <command>
 ```
 
 ### Add to CI
 
 ```yaml
 - name: deeprun Governance Gate
-  run: deeprun gate --strict-v1-ready
+  run: |
+    npm install
+    npm run build
+    npm run deeprun -- gate --strict-v1-ready
 ```
 
 ### Example Output
@@ -88,8 +94,8 @@ deeprun is a governance layer, not a CI system.
 
 **1. AI-Generated Backend Validation**
 ```bash
-deeprun bootstrap "Build SaaS backend with auth"
-deeprun validate --strict-v1-ready
+npm run deeprun -- bootstrap "Build SaaS backend with auth"
+npm run deeprun -- validate --strict-v1-ready
 ```
 
 **2. CI Gate for AI-Assisted PRs**
@@ -100,12 +106,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: deeprun gate --strict-v1-ready
+      - run: npm install && npm run build
+      - run: npm run deeprun -- gate --strict-v1-ready
 ```
 
 **3. Reliability Benchmarking**
 ```bash
-deeprun benchmark --iterations 10 --min-pass-rate 0.95
+npm run benchmark:reliability -- --iterations 10 --min-pass-rate 0.95
 ```
 
 ## Core Concepts
@@ -145,11 +152,11 @@ See [docs/contracts/](docs/contracts/) for detailed specifications.
 ## CLI Commands
 
 ```bash
-deeprun init                    # Initialize session
-deeprun bootstrap <prompt>      # Generate backend + start run
-deeprun status                  # Check run status
-deeprun validate                # Run validation gates
-deeprun promote                 # Deploy to production
+npm run deeprun -- init                    # Initialize session
+npm run deeprun -- bootstrap <prompt>      # Generate backend + start run
+npm run deeprun -- status                  # Check run status
+npm run deeprun -- validate                # Run validation gates
+npm run deeprun -- promote                 # Deploy to production
 ```
 
 Full CLI reference: [docs/cli.md](docs/cli.md)
