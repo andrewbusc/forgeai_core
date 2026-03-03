@@ -388,6 +388,8 @@ button:disabled {
   grid-template-rows: auto 1fr;
   gap: 0.85rem;
   min-height: 0;
+  max-width: 1400px;
+  margin: 0 auto;
 }
 
 .workspace-toolbar {
