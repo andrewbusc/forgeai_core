@@ -41,10 +41,22 @@ npm install
 npm run build
 ```
 
-Then run commands via:
+### Setup
 
+1. Start the server:
 ```bash
-npm run deeprun -- <command>
+npm run dev
+```
+
+2. In a new terminal, initialize CLI session:
+```bash
+npm run deeprun -- init --api http://127.0.0.1:3000 --email user@example.com --password password
+```
+
+3. Generate a backend:
+```bash
+npm run deeprun -- bootstrap "Build SaaS backend with auth"
+npm run deeprun -- validate --strict-v1-ready
 ```
 
 ### Add to CI
@@ -94,6 +106,7 @@ deeprun is a governance layer, not a CI system.
 
 **1. AI-Generated Backend Validation**
 ```bash
+# After running init
 npm run deeprun -- bootstrap "Build SaaS backend with auth"
 npm run deeprun -- validate --strict-v1-ready
 ```
