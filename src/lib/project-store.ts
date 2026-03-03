@@ -495,7 +495,7 @@ last_analyzed_at, created_at, updated_at
 `;
 
 const lifecycleRunSelectColumns = `
-id, project_id, org_id, workspace_id, created_by_user_id, goal, phase, status,
+id, project_id, org_id, workspace_id, created_by_user_id, graph_id, goal, phase, status,
 step_index, corrections_used, optimization_steps_used, max_steps, max_corrections,
 max_optimizations, error_message, created_at, updated_at
 `;
@@ -687,6 +687,7 @@ interface DbLifecycleRunRow {
   org_id: string;
   workspace_id: string;
   created_by_user_id: string;
+  graph_id: string;
   goal: string;
   phase: AgentRunPhase;
   status: AgentRunLifecycleStatus;
@@ -1060,6 +1061,7 @@ function mapLifecycleRun(row: DbLifecycleRunRow): AgentLifecycleRun {
     orgId: row.org_id,
     workspaceId: row.workspace_id,
     createdByUserId: row.created_by_user_id,
+    graphId: row.graph_id,
     goal: row.goal,
     phase: row.phase,
     status: row.status,
@@ -1092,7 +1094,7 @@ function mapLifecycleStep(row: DbLifecycleStepRow): AgentLifecycleStep {
 
 export class AppStore {
   private readonly workspaceDir: string;
-  private readonly pool: Pool;
+  readonly pool: Pool;
 
   constructor(rootDir?: string) {
     const databaseUrl = process.env.DATABASE_URL;
@@ -1128,6 +1130,7 @@ export class AppStore {
       await this.migrateAgentRunValidationSchema(client);
       await this.migrateAgentRunCorrectionTrackingSchema(client);
       await this.migrateDeploymentRunPinSchema(client);
+      await this.migrateExecutionGraphSchema(client);
       await this.pruneExpiredSessions(client);
       await this.markIncompleteDeploymentsFailed(client);
     } finally {
@@ -2013,6 +2016,115 @@ export class AppStore {
     );
   }
 
+  async migrateExecutionGraphSchema(client?: PoolClient): Promise<void> {
+    await this.runQuery(
+      `DO $$
+       BEGIN
+         IF EXISTS (
+           SELECT 1 FROM information_schema.tables
+           WHERE table_name = 'execution_graphs'
+         ) AND NOT EXISTS (
+           SELECT 1 FROM information_schema.columns
+           WHERE table_name = 'execution_graphs' AND column_name = 'project_id'
+         ) THEN
+           DROP TABLE IF EXISTS execution_graphs CASCADE;
+         END IF;
+       END $$;`,
+      [],
+      client
+    );
+
+    await this.runQuery(
+      `CREATE TABLE IF NOT EXISTS execution_graphs (
+         id UUID PRIMARY KEY,
+         project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+         org_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+         workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+         created_by_user_id UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+         graph_identity_hash TEXT NOT NULL,
+         graph_schema_version INTEGER NOT NULL,
+         graph_policy_descriptor JSONB NOT NULL,
+         status TEXT NOT NULL CHECK (status IN ('created', 'running', 'complete', 'failed')),
+         created_at TIMESTAMPTZ NOT NULL,
+         updated_at TIMESTAMPTZ NOT NULL
+       )`,
+      [],
+      client
+    );
+
+    await this.runQuery(
+      `CREATE INDEX IF NOT EXISTS idx_execution_graphs_project_id ON execution_graphs (project_id)`,
+      [],
+      client
+    );
+
+    await this.runQuery(
+      `CREATE INDEX IF NOT EXISTS idx_execution_graphs_identity_hash ON execution_graphs (graph_identity_hash)`,
+      [],
+      client
+    );
+
+    await this.runQuery(
+      `CREATE INDEX IF NOT EXISTS idx_execution_graphs_status ON execution_graphs (status)`,
+      [],
+      client
+    );
+
+    await this.runQuery(
+      `ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS graph_id UUID`,
+      [],
+      client
+    );
+
+    await this.runQuery(
+      `DO $$
+       BEGIN
+         IF EXISTS (
+           SELECT 1
+           FROM information_schema.columns
+           WHERE table_name = 'agent_runs'
+             AND column_name = 'graph_id'
+             AND is_nullable = 'NO'
+         ) THEN
+           ALTER TABLE agent_runs ALTER COLUMN graph_id DROP NOT NULL;
+         END IF;
+       END $$;`,
+      [],
+      client
+    );
+
+    await this.runQuery(
+      `DO $$
+       BEGIN
+         ALTER TABLE agent_runs
+         DROP CONSTRAINT IF EXISTS agent_runs_graph_id_fkey;
+       EXCEPTION
+         WHEN undefined_object THEN NULL;
+       END $$;`,
+      [],
+      client
+    );
+
+    await this.runQuery(
+      `DO $$
+       BEGIN
+         ALTER TABLE agent_runs
+         ADD CONSTRAINT agent_runs_graph_id_fkey
+         FOREIGN KEY (graph_id) REFERENCES execution_graphs(id) ON DELETE SET NULL;
+       EXCEPTION
+         WHEN duplicate_object THEN NULL;
+       END $$;`,
+      [],
+      client
+    );
+
+    await this.runQuery(
+      `CREATE INDEX IF NOT EXISTS idx_agent_runs_graph_id ON agent_runs (graph_id)`,
+      [],
+      client
+    );
+  }
+
   async migrateRunQueueCapabilitySchema(client?: PoolClient): Promise<void> {
     await this.runQuery(
       `ALTER TABLE run_jobs
@@ -2194,18 +2306,18 @@ export class AppStore {
 
     const result = await this.runQuery<DbLifecycleRunRow>(
       `INSERT INTO agent_runs (
-         id, project_id, org_id, workspace_id, created_by_user_id, goal,
+         id, project_id, org_id, workspace_id, created_by_user_id, graph_id, goal,
          phase, status, step_index, corrections_used, optimization_steps_used,
          max_steps, max_corrections, max_optimizations,
          provider_id, model, current_step_index, plan, last_step_id, error_message,
          created_at, updated_at, finished_at
        )
        VALUES (
-         $1, $2, $3, $4, $5, $6,
-         $7, $8, $9, $10, $11,
-         $12, $13, $14,
-         'state-machine', NULL, $9, '{}'::jsonb, NULL, $15,
-         $16::timestamptz, $17::timestamptz, NULL
+         $1, $2, $3, $4, $5, $6, $7,
+         $8, $9, $10, $11, $12,
+         $13, $14, $15,
+         'state-machine', NULL, $10, '{}'::jsonb, NULL, $16,
+         $17::timestamptz, $18::timestamptz, NULL
        )
        RETURNING ${lifecycleRunSelectColumns}`,
       [
@@ -2214,6 +2326,7 @@ export class AppStore {
         input.orgId,
         input.workspaceId,
         input.createdByUserId,
+        input.graphId,
         input.goal,
         input.phase,
         input.status,

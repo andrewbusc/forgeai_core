@@ -102,6 +102,7 @@ async function destroyHarness(harness: Harness): Promise<void> {
         project: harness.project,
         createdByUserId: harness.userId,
         goal: "Transition test",
+        graphId: randomUUID(),
         requestId: "test-transition"
       });
 
@@ -124,6 +125,7 @@ async function destroyHarness(harness: Harness): Promise<void> {
         project: harness.project,
         createdByUserId: harness.userId,
         goal: "Invalid transition test",
+        graphId: randomUUID(),
         requestId: "test-invalid"
       });
 
@@ -147,6 +149,7 @@ async function destroyHarness(harness: Harness): Promise<void> {
         project: harness.project,
         createdByUserId: harness.userId,
         goal: "Step cap test",
+        graphId: randomUUID(),
         maxSteps: 1,
         maxOptimizations: 10,
         requestId: "test-step-cap"
@@ -181,6 +184,7 @@ async function destroyHarness(harness: Harness): Promise<void> {
         project: harness.project,
         createdByUserId: harness.userId,
         goal: "Cancel test",
+        graphId: randomUUID(),
         requestId: "test-cancel"
       });
 
@@ -209,6 +213,7 @@ async function destroyHarness(harness: Harness): Promise<void> {
         project: harness.project,
         createdByUserId: harness.userId,
         goal: "Resume test",
+        graphId: randomUUID(),
         requestId: "test-resume"
       });
 
@@ -233,6 +238,7 @@ async function destroyHarness(harness: Harness): Promise<void> {
         project: harness.project,
         createdByUserId: harness.userId,
         goal: "Idempotency test",
+        graphId: randomUUID(),
         requestId: "test-idempotency"
       });
 
@@ -269,6 +275,7 @@ async function destroyHarness(harness: Harness): Promise<void> {
         project: harness.project,
         createdByUserId: harness.userId,
         goal: "Optimization test",
+        graphId: randomUUID(),
         maxSteps: 20,
         maxOptimizations: 2,
         requestId: "test-optimization"
@@ -329,6 +336,7 @@ async function destroyHarness(harness: Harness): Promise<void> {
         project: harness.project,
         createdByUserId: harness.userId,
         goal: "Canonical transition cancel",
+        graphId: randomUUID(),
         requestId: "test-canonical-cancel"
       });
       const cancelledRunning = await harness.service.markRunRunning(
@@ -348,6 +356,7 @@ async function destroyHarness(harness: Harness): Promise<void> {
         project: harness.project,
         createdByUserId: harness.userId,
         goal: "Canonical transition resume",
+        graphId: randomUUID(),
         requestId: "test-canonical-resume"
       });
       const resumedRunning = await harness.service.markRunRunning(
@@ -370,6 +379,7 @@ async function destroyHarness(harness: Harness): Promise<void> {
         project: harness.project,
         createdByUserId: harness.userId,
         goal: "Canonical transition optimization",
+        graphId: randomUUID(),
         maxSteps: 10,
         maxOptimizations: 1,
         requestId: "test-canonical-optimization"

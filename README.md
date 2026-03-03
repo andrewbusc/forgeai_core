@@ -1,733 +1,220 @@
-deeprun Canonical Backend – v1 Architecture Contract
-Purpose
+# deeprun
 
-This repository defines the canonical backend architecture used by deeprun v1.
+**A deterministic governance layer for AI-assisted CI workflows.**
 
-All generated backends must conform to this contract.
+## The Problem
 
-This document is not optional guidance.
-It is the enforced architectural specification.
+AI-generated code in CI can:
+- Pass locally but fail unpredictably in production
+- Retry indefinitely without clear failure boundaries
+- Produce nondeterministic artifacts across runs
+- Drift silently across tool upgrades
 
-deeprun’s “ships v1 ready” claim depends on adherence to these rules.
+deeprun enforces:
+- Bounded correction with hard limits
+- Deterministic execution identity
+- Machine-readable PASS/FAIL decisions
+- Replayable governance results
 
-Run Lifecycle Contract
+## Where It Sits
 
-All deeprun run engines use the same canonical status machine:
+```
+AI Tool → deeprun → CI Pipeline → Deploy
+```
 
-queued
-running
-correcting
-optimizing
-validating
-complete
-failed
-cancelled
+Or as a CI gate:
 
-Legacy statuses (planned, paused, completed, cancelling) are migrated to canonical values.
+```
+Pull Request → deeprun (governance gate) → CI status check → Merge
+```
 
-Scope
+deeprun validates AI-generated code before it reaches your pipeline.
 
-deeprun v1 generates:
+## Quick Start
 
-Single-tenant API backends
+### Installation
 
-Production-ready
+```bash
+npm install -g deeprun
+```
 
-Dockerized
+Or via Docker:
 
-Fully typed
+```bash
+docker pull ghcr.io/deeprun/deeprun:v1
+```
 
-Security-hardened
+### Add to CI
 
-Test-enforced
+```yaml
+- name: deeprun Governance Gate
+  run: deeprun gate --strict-v1-ready
+```
 
-It does not generate:
+### Example Output
 
-Frontend applications
+```json
+{
+  "decision": "FAIL",
+  "reasonCodes": ["RUN_VALIDATION_FAILED"],
+  "executionIdentityHash": "fff55f87868878e82470cf2b8ca6a5dd7c9a24c1a57eb1a7bef2bf071bd5d3e3",
+  "artifacts": ["validation-report.json"],
+  "correctionAttempts": 3,
+  "maxCorrectionsReached": true
+}
+```
 
-Multi-tenant systems
+If the decision is `PASS`, the code is safe to deploy.
 
-Event-driven architectures
+## What v1 Does
 
-Plugin systems
+✅ Blocks unsafe AI-assisted PRs  
+✅ Produces deterministic governance decisions  
+✅ Emits structured artifacts and execution trace  
+✅ Runs on-premises (no external dependencies)  
+✅ Enforces architectural contracts on generated code  
+✅ Validates Docker builds and health checks  
 
-Multiple framework variants
+## What v1 Does NOT Do
 
-Stack is frozen for v1.
+❌ Distributed orchestration  
+❌ Parallel graph execution  
+❌ Planner auto-branching  
+❌ CI pipeline replacement  
 
-Technology Stack (Immutable for v1)
+deeprun is a governance layer, not a CI system.
 
-Node 20+
+## Use Cases
 
-TypeScript (strict mode enabled)
+**1. AI-Generated Backend Validation**
+```bash
+deeprun bootstrap "Build SaaS backend with auth"
+deeprun validate --strict-v1-ready
+```
 
-Fastify
+**2. CI Gate for AI-Assisted PRs**
+```yaml
+on: pull_request
+jobs:
+  governance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: deeprun gate --strict-v1-ready
+```
 
-Prisma
+**3. Reliability Benchmarking**
+```bash
+deeprun benchmark --iterations 10 --min-pass-rate 0.95
+```
 
-PostgreSQL
+## Core Concepts
 
-Zod
+### Deterministic Execution Identity
 
-Vitest
+Every run produces a frozen execution identity hash. Same input → same hash → same decision.
 
-Pino
+### Bounded Correction
 
-JWT-based authentication
+AI correction attempts are hard-limited. No infinite retry loops.
 
-Explicit Prisma migrations
+### Machine-Readable Decisions
 
-Explicit seed script
+All governance decisions are structured JSON with reason codes, not prose.
 
-Dockerized deployment
+### Replayable Governance
 
-No framework variation is allowed in v1.
+Execution traces can be replayed to verify decision integrity.
 
-Project Structure
-src/
-  server.ts
-  app.ts
+## Installation & Setup
 
-  config/
-    env.ts
-    logger.ts
+See [docs/installation.md](docs/installation.md) for detailed setup instructions.
 
-  db/
-    prisma.ts
+For operators: [docs/operator-guide.md](docs/operator-guide.md)
 
-  errors/
-    BaseAppError.ts
-    DomainError.ts
-    ValidationError.ts
-    NotFoundError.ts
-    UnauthorizedError.ts
-    ConflictError.ts
-    InfrastructureError.ts
-    errorHandler.ts
+## Architecture
 
-  middleware/
+deeprun enforces a canonical backend architecture contract. Generated backends must:
+- Boot without manual edits
+- Pass all validation gates (light → heavy → v1-ready)
+- Build successfully in Docker
+- Return 200 from `/health` endpoint
 
-  modules/
-    <module>/
-      <module>.entity.ts
-      <module>.dto.ts
-      <module>.schema.ts
-      <module>.repository.ts
-      <module>.service.ts
-      <module>.controller.ts
-      <module>.routes.ts
-      <module>.test.ts
+See [docs/contracts/](docs/contracts/) for detailed specifications.
 
-tests/
-  integration/
+## CLI Commands
 
-prisma/
-Dockerfile
-.env.example
+```bash
+deeprun init                    # Initialize session
+deeprun bootstrap <prompt>      # Generate backend + start run
+deeprun status                  # Check run status
+deeprun validate                # Run validation gates
+deeprun promote                 # Deploy to production
+```
 
+Full CLI reference: [docs/cli.md](docs/cli.md)
 
-Structure must not drift.
+## CI Integration
 
-Architectural Layers
-Controller Layer
+deeprun provides GitHub Actions workflows:
+- **CI Gate**: Type checking, tests, validation
+- **V1 Ready Gate**: Docker build + health check
+- **Reliability Benchmark**: Pass rate measurement
 
-Responsibilities:
+See [.github/workflows/](.github/workflows/) for examples.
 
-Parse request
+## Reliability Metrics
 
-Validate input using Zod
+deeprun measures a single north star metric:
 
-Call service
+**% of generated backends that deploy and boot without human edits**
 
-Map domain entity to response DTO
+Run the benchmark:
 
-Return response
+```bash
+npm run benchmark:reliability
+```
 
-Controllers must not:
+## Design Principles
 
-Access Prisma
+### Execution Contract Immutability
 
-Contain business logic
+The execution contract is frozen at v1. Changes require new major version.
 
-Perform authorization decisions
+### Correction Policy Enforcement
 
-Throw raw Error
+Correction attempts are classified, bounded, and auditable.
 
-Service Layer
+### Graph Governance
 
-Responsibilities:
+Execution graphs have deterministic identity. Drift is detectable.
 
-Business logic
+### Fail-Fast Boot Sequence
 
-Authorization enforcement
+Runtime compatibility is validated before the HTTP server starts.
 
-Domain rule validation
+## Development
 
-Throw typed DomainError subclasses
+```bash
+git clone https://github.com/yourusername/deeprun.git
+cd deeprun
+npm install
+npm run dev
+```
 
-Return domain entities
+Run tests:
 
-Services must not:
-
-Import Prisma
-
-Import Fastify types
-
-Access request/response objects
-
-Return HTTP DTOs
-
-Repository Layer
-
-Responsibilities:
-
-Database access via Prisma
-
-Map DB records to domain entities
-
-Throw InfrastructureError on DB failures
-
-Repositories must not:
-
-Contain business logic
-
-Perform authorization
-
-Return Prisma models directly
-
-Domain Entities
-
-Plain TypeScript interfaces
-
-No methods
-
-No constructors
-
-No embedded logic
-
-All behavior belongs in services.
-
-Dependency Rules
-
-No circular dependencies
-
-No cross-module imports without explicit injection
-
-Services use constructor injection
-
-No IoC containers
-
-No hidden singletons (except prisma and logger)
-
-Dependency graph must remain acyclic.
-
-Authentication & Authorization
-
-JWT-based stateless authentication
-
-Roles stored in database
-
-Role included in JWT payload
-
-Auth middleware validates JWT
-
-Authorization enforced in service layer
-
-Dynamic roles supported
-
-Single-tenant only
-
-Validation
-
-Zod schemas per module
-
-Shared across layers
-
-Validate structure only
-
-Business validation belongs in service layer
-
-Error System
-
-Error hierarchy:
-
-BaseAppError
-
-DomainError
-
-ValidationError
-
-NotFoundError
-
-UnauthorizedError
-
-ConflictError
-
-InfrastructureError
-
-Central error handler:
-
-Maps errors to HTTP codes
-
-Sanitizes output
-
-Logs structured metadata
-
-Hides stack trace in production
-
-Raw Error must never reach client.
-
-Security Baseline
-
-Mandatory:
-
-Helmet
-
-Rate limiting
-
-Explicit CORS configuration
-
-Environment variable validation on boot
-
-Strong password hashing
-
-JWT secret validation
-
-No wildcard CORS
-
-No stack traces in production
-
-No sensitive data in logs
-
-Logging
-
-Structured JSON logs (Pino)
-
-Request-scoped IDs
-
-No console.log
-
-Environment-aware formatting
-
-Error type classification
-
-Logging is mandatory and must be structured.
-
-Database Discipline
-
-Explicit migration command required
-
-No auto-migration at server boot
-
-Explicit, idempotent seed script
-
-Prisma schema must align with domain entities
-
-Testing Requirements
-
-Each module must include:
-
-Service success test
-
-Validation failure test
-
-Authorization test
-
-NotFound or conflict test
-
-Integration test must:
-
-Boot application
-
-Validate /health endpoint
-
-No module exists without tests.
-
-Type Safety
-
-TypeScript strict mode enabled
-
-noImplicitAny enabled
-
-No implicit any allowed
-
-Explicit any allowed only when intentional
-
-Production Readiness Criteria
-
-A generated backend is considered v1 ready only if:
-
-Compiles without type errors
-
-Passes all tests
-
-Boots successfully
-
-Health endpoint returns 200
-
-Security invariants are satisfied
-
-Docker image builds successfully
-
-Prohibited Patterns
-
-The following are not allowed in v1:
-
-Event bus architecture
-
-Multi-tenant logic
-
-Circular dependencies
-
-Cross-module direct imports
-
-Rich domain classes
-
-Auto-migrate on boot
-
-Raw Error throws
-
-Wildcard CORS
-
-Hidden runtime configuration
-
-Definition of Done
-
-deeprun v1 must generate backends that:
-
-Require zero manual edits to boot
-
-Pass validation and tests
-
-Conform to this contract
-
-Are production deployable
-
-Anything less does not meet the v1 standard.
-
-Runtime Enforcement Anchors (deeprun Engine)
-
-Contract and graph validation are implemented in:
-
-src/agent/validation/contract.ts
-src/agent/validation/path-utils.ts
-src/agent/validation/collect-files.ts
-src/agent/validation/graph-builder.ts
-src/agent/validation/failure-parser.ts
-src/agent/validation/structural-validator.ts
-src/agent/validation/ast-validator.ts
-src/agent/validation/security-validator.ts
-src/agent/validation/project-validator.ts
-
-Mutation boundary and transactional step application are implemented in:
-
-src/agent/fs/types.ts
-src/agent/fs/diff-engine.ts
-src/agent/fs/validator.ts
-src/agent/fs/file-session.ts
-
-Non-agent project mutation routes also use this boundary:
-`POST /api/projects` (scaffold), `PUT /api/projects/:projectId/file`, and generation/chat flows via `src/lib/generator.ts`.
-
-Agent runtime integration points:
-
-Mutating tools propose changes (no direct writes):
-src/agent/tools/write-file.ts
-src/agent/tools/apply-patch.ts
-
-Kernel transaction + light validation before commit:
-src/agent/kernel.ts
-
-Canonical status definitions:
-src/agent/run-status.ts
-
-Step log discipline:
-
-Agent step records are append-only.
-Retries/replays at the same `step_index` are recorded as incrementing `attempt` entries.
-No existing step record is overwritten.
-
-Correction safety:
-
-Correction steps must produce real staged diffs and a commit; no-op/silent patch corrections are rejected.
-Correction attempts are exposed as first-class telemetry in run detail responses and CLI status/log output.
-Each correction carries classified intent, bounded constraint metadata, and final step outcome.
-Correction policy gate evaluates deterministic integrity rules and can hard-fail malformed correction attempts.
-
-Environment knobs:
-
-AGENT_FS_MAX_FILES_PER_STEP
-AGENT_FS_MAX_TOTAL_DIFF_BYTES
-AGENT_FS_MAX_FILE_BYTES
-AGENT_FS_ALLOW_ENV_MUTATION
-AGENT_LIGHT_VALIDATION_MODE (off | warn | enforce)
-AGENT_RUN_LOCK_STALE_SECONDS
-AGENT_HEAVY_VALIDATION_MODE (off | warn | enforce)
-AGENT_CORRECTION_POLICY_MODE (off | warn | enforce)
-AGENT_GOAL_MAX_CORRECTIONS
-AGENT_OPTIMIZATION_MAX_CORRECTIONS
-AGENT_RUNTIME_MAX_CORRECTIONS (legacy alias for goal max)
-AGENT_HEAVY_MAX_CORRECTIONS
-AGENT_CORRECTION_CONVERGENCE_MODE (off | warn | enforce)
-AGENT_HEAVY_INSTALL_DEPS
-AGENT_HEAVY_BUILD_TIMEOUT_MS
-DEEPRUN_PROMOTE_REQUIRE_V1_READY
-
-V1 readiness gate knobs:
-
-V1_DOCKER_BIN
-V1_DOCKER_BUILD_TIMEOUT_MS
-V1_DOCKER_BOOT_TIMEOUT_MS
-V1_DOCKER_CONTAINER_PORT
-V1_DOCKER_HEALTH_PATH
-V1_DOCKER_KEEP_IMAGE
-V1_DOCKER_RUN_MIGRATION
-V1_DOCKER_MIGRATION_SCRIPT
-V1_DOCKER_MIGRATION_DATABASE_URL
-V1_DOCKER_MIGRATION_TIMEOUT_MS
-
-Run execution isolation:
-
-Each run is executed in `run/<runId>` branch worktree under:
-`<projectRoot>/.deeprun/worktrees/<runId>`
-
-Fork endpoint (step commit-based):
-
-`POST /api/projects/:projectId/agent/runs/:runId/fork/:stepId`
-
-Validate run output endpoint (isolated heavy validation):
-
-`POST /api/projects/:projectId/agent/runs/:runId/validate`
-
-Run detail telemetry:
-
-`GET /api/projects/:projectId/agent/runs/:runId` includes:
-- `telemetry.corrections[]` timeline entries
-- `telemetry.correctionPolicies[]` policy verdict timeline entries
-- step-level `correctionTelemetry` on correction steps
-- step-level `correctionPolicy` verdicts on correction steps
-
-Backend bootstrap endpoint (canonical template + immediate kernel run):
-
-`POST /api/projects/bootstrap/backend`
-
-CLI wrapper:
-
-`npm run agent:validate-run -- <projectId> <runId>`
-
-Local architecture check command:
-
-npm run check:architecture -- /path/to/project
-
-Binary YES/NO readiness gate:
-
-npm run check:v1-ready -- /path/to/project
-
-`check:v1-ready` runs:
-heavy validation (architecture + production config checks + install + typecheck + build + tests + boot),
-then Docker image build + optional containerized migration dry run + container `/health` boot check.
-
-Server Integration Test Commands
-
-npm run test:providers
-npm run test:server-routes
-npm run test:server-agent-state
-npm run test:server-agent-kernel
-npm run test:server-all
-npm run test:bootstrap
-
-`test:server-all` runs all server route integration suites as a single regression gate.
-`test:bootstrap` runs the backend bootstrap API + CLI integration suites.
-
-CI Gate
-
-GitHub Actions workflow: `.github/workflows/ci.yml`
-
-This is a reusable workflow (called by `Release Gate`) and can also be run manually (`workflow_dispatch`).
-It provisions PostgreSQL and executes:
-
+```bash
 npm run test:ci
-
-`test:ci` includes bootstrap coverage through:
-
-- `src/__tests__/agent-kernel-routes.test.ts` (`/api/projects/bootstrap/backend`)
-- `src/__tests__/deeprun-cli.test.ts` (`deeprun bootstrap`)
-
-Local equivalent:
-
-npm run test:ci
-
-Reliability CI Gate
-
-GitHub Actions workflow: `.github/workflows/reliability.yml`
-
-Triggers:
-
-- nightly schedule (`0 6 * * *` UTC)
-- manual dispatch (`workflow_dispatch`)
-- reusable `workflow_call` (used by `Release Gate`)
-
-Behavior:
-
-- Starts deeprun API against PostgreSQL service.
-- Runs `npm run benchmark:reliability`.
-- Retries benchmark once automatically if the first attempt fails (transient hardening).
-- Uploads `.deeprun/reliability-report.json` and server logs as workflow artifacts.
-- `Release Gate` PR/push smoke mode uses strict thresholds:
-  - `iterations=1`
-  - `min_pass_rate=1.0`
-  - `strict_v1_ready=true`
-- Nightly/manual defaults:
-  - `iterations=10`
-  - `min_pass_rate=0.95`
-
-Reliability Benchmark (North Star Metric)
-
-Run repeated canonical bootstrap generations and calculate pass rate:
-
-npm run benchmark:reliability -- --email you@example.com --password 'Password123!' --iterations 10 --strict-v1-ready=true --min-pass-rate 0.95 --output .deeprun/reliability-report.json
-
-What this does:
-
-- Authenticates (register-or-login).
-- Runs `POST /api/projects/bootstrap/backend` for each sample.
-- Uses bootstrap certification as the base pass/fail gate.
-- Optionally runs full `check:v1-ready` per sample when `--strict-v1-ready=true`.
-- Emits structured JSON with `passRate`, `passCount`, `failCount`, and per-run diagnostics.
-- Heavy validation uses an isolated PostgreSQL schema per run by default (or `AGENT_HEAVY_DATABASE_URL` if provided) to avoid control-plane table collisions.
-
-This is the direct measurement for:
-
-`% of generated backends that deploy and boot in a clean environment without human edits`
-
-V1 Readiness Workflow
-
-GitHub Actions gate: `.github/workflows/v1-ready.yml`
-
-Triggers:
-
-- manual dispatch (`workflow_dispatch`)
-- reusable `workflow_call` (used by `Release Gate`)
-
-Behavior:
-
-- If `target_path` is provided, validates that path.
-- If `target_path` is empty, scaffolds a deterministic `canonical-backend` target at `.deeprun/v1-ready-target`.
-- Executes `npm run check:v1-ready -- <target_path>`.
-- Uploads `.deeprun/v1-ready-report.json` as a workflow artifact.
-
-Manual dispatch inputs:
-
-- `target_path` (optional)
-- `template_id` (used only when `target_path` is empty; defaults to `canonical-backend`)
-
-Release Gate (Required Merge Gate)
-
-GitHub Actions gate: `.github/workflows/release-gate.yml`
-
-Triggers:
-
-- `pull_request`
-- `push` to `main`
-- manual dispatch (`workflow_dispatch`)
-
-It orchestrates three required jobs:
-
-- `CI`
-- `V1 Ready Gate`
-- `Reliability Benchmark`
-
-It also supports an optional heavier job:
-
-- `Deployment Dry Run` (runs automatically on `push` to `main`; optional on manual dispatch via `run_deployment_dry_run=true`)
-
-Branch protection recommendation for `main`:
-
-- Require status checks: `Release Gate / CI`
-- Require status checks: `Release Gate / V1 Ready Gate`
-- Require status checks: `Release Gate / Reliability Benchmark`
-- Keep `Release Gate / Deployment Dry Run` non-required initially (heavier runtime); promote to required after stability is proven.
-
-Local equivalent (matches CI default behavior):
-
 npm run test:v1-ready
+```
 
-Manual local commands:
+## License
 
-npm run prepare:v1-ready-target -- --output .deeprun/v1-ready-target
-npm run check:v1-ready -- .deeprun/v1-ready-target
+MIT
 
-Direct path validation:
+## Status
 
-npm run check:v1-ready -- <target_path>
+v1.0.0 - Production Ready
 
-Deployment Dry Run Workflow (Containerized Production Boot)
-
-GitHub Actions gate: `.github/workflows/deployment-dry-run.yml`
-
-Triggers:
-
-- nightly schedule (`0 7 * * *` UTC)
-- manual dispatch (`workflow_dispatch`)
-- reusable `workflow_call`
-
-Behavior:
-
-- Scaffolds canonical backend target by default (or validates a provided `target_path`)
-- Runs containerized deployment dry run using `check:v1-ready`
-- Verifies:
-  - Docker image build
-  - containerized migration run
-  - production-mode container boot
-  - `/health` returns success
-- Uploads `.deeprun/deployment-dry-run-report.json` and generated target (when scaffolded) as artifacts
-
-Manual dispatch inputs:
-
-- `target_path` (optional)
-- `template_id` (used only when `target_path` is empty; defaults to `canonical-backend`)
-
-Local equivalent:
-
-npm run test:deployment-dry-run
-
-CLI Commands (deeprun)
-
-Run via npm script:
-
-npm run deeprun -- <command> [args]
-
-Core commands:
-
-npm run deeprun -- init --api http://127.0.0.1:3000 --email you@example.com --password 'Password123!'
-npm run deeprun -- bootstrap "Build SaaS backend with auth"
-npm run deeprun -- run "Build SaaS backend with auth"
-npm run deeprun -- status
-npm run deeprun -- status --watch --verbose
-npm run deeprun -- logs
-npm run deeprun -- continue
-npm run deeprun -- branch --engine kernel
-npm run deeprun -- fork <stepId>
-npm run deeprun -- validate
-npm run deeprun -- validate --strict-v1-ready
-npm run deeprun -- promote
-npm run deeprun -- promote --strict-v1-ready
-
-Notes:
-
-- Session/config persists at `.deeprun/cli.json` (override with `DEEPRUN_CLI_CONFIG`).
-- `bootstrap` always creates a new `canonical-backend` project and starts a kernel run in one call.
-- `bootstrap` is strict: it exits non-zero if post-bootstrap certification reports `CERTIFICATION_OK=false`.
-- If `--provider` is omitted, deeprun uses server-side default provider selection (`DEEPRUN_DEFAULT_PROVIDER` override, otherwise first configured real provider, else `mock`).
-- Default output is concise; add `--verbose` for expanded request and step details.
-- Kernel `status` reports correction-policy counters (`CORRECTION_POLICY_*`) and last-policy summary keys.
-- Kernel `logs` includes correction-policy totals and per-step policy verdict lines when present.
-- `promote` is validation-gated: deployment is blocked unless the latest project validation record has `ok=true`.
-- Run `deeprun validate --project <projectId> --run <runId>` and confirm `VALIDATION_OK=true` before `deeprun promote`.
-- `validate --strict-v1-ready` also runs full v1-ready checks (heavy + Docker) and emits `V1_READY_*` keys.
-- Set `DEEPRUN_PROMOTE_REQUIRE_V1_READY=true` to require latest `V1_READY_OK=true` before `promote`.
-- `promote --strict-v1-ready` runs a strict preflight (`validate --strict-v1-ready`) before deployment and exits non-zero when preflight fails.
-
-CLI integration test:
-
-npm run test:cli
+All critical blockers resolved. System enforces runtime compatibility, schema migrations are idempotent, and error handling is production-hardened.

@@ -418,21 +418,49 @@ export interface AgentRunExecutionConfig {
   allowEnvMutation: boolean;
 }
 
+export interface AgentRunExecutionPolicyVersions {
+  determinismPolicyVersion: number;
+  normalizationPolicyVersion: number;
+  plannerPolicyVersion: number;
+  correctionRecipeVersion: number;
+  validationPolicyVersion: number;
+  governancePolicyVersion: number;
+}
+
+export interface AgentRunExecutionContractMaterialV1 {
+  executionContractSchemaVersion: 1;
+  normalizedExecutionConfig: AgentRunExecutionConfig;
+  determinismPolicyVersion: number;
+  plannerPolicyVersion: number;
+  correctionRecipeVersion: number;
+  validationPolicyVersion: number;
+  randomnessSeed: string;
+}
+
+export interface AgentRunExecutionContractMaterialV2 {
+  executionContractSchemaVersion: 2;
+  normalizedExecutionConfig: AgentRunExecutionConfig;
+  randomnessSeed: string;
+  policyVersions: AgentRunExecutionPolicyVersions;
+}
+
+export type AgentRunExecutionContractMaterial =
+  | AgentRunExecutionContractMaterialV1
+  | AgentRunExecutionContractMaterialV2;
+
 export interface AgentRunExecutionContract {
   schemaVersion: number;
   hash: string;
-  material: {
-    executionContractSchemaVersion: number;
-    normalizedExecutionConfig: AgentRunExecutionConfig;
-    determinismPolicyVersion: number;
-    plannerPolicyVersion: number;
-    correctionRecipeVersion: number;
-    validationPolicyVersion: number;
-    randomnessSeed: string;
-  };
+  material: AgentRunExecutionContractMaterial;
   effectiveConfig: AgentRunExecutionConfig;
   fallbackUsed: boolean;
   fallbackFields: Array<keyof AgentRunExecutionConfig>;
+  support?: {
+    supported: boolean;
+    code?: "UNSUPPORTED_CONTRACT";
+    message?: string;
+    details?: Record<string, unknown>;
+  };
 }
 
 export function withAgentStepCapabilities(step: AgentStep): AgentStep {

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
+import { executionContractPolicyVersions, executionContractRandomnessSeed } from "../agent/execution-contract.js";
 import { AgentKernel } from "../agent/kernel.js";
 import { RunWaitTimeoutError, waitForRunTerminal, type RunWaitMode } from "../agent/queue/run-wait.js";
 import { persistGovernanceDecision, type GovernanceDecisionPayload } from "../governance/decision.js";
@@ -794,14 +795,12 @@ async function requestGovernanceDecision(input: {
   client: ApiClient;
   projectId: string;
   runId: string;
-  strictV1Ready: boolean;
 }): Promise<GovernanceDecisionPayload> {
   return input.client.requestOk<GovernanceDecisionPayload>(
     "POST",
     `/api/projects/${input.projectId}/governance/decision`,
     {
-      runId: input.runId,
-      strictV1Ready: input.strictV1Ready
+      runId: input.runId
     }
   );
 }
@@ -818,8 +817,15 @@ function kernelRunHasStrictV1Ready(detail: KernelRunDetail): boolean {
     !Array.isArray(validationResult.v1Ready)
       ? (validationResult.v1Ready as Record<string, unknown>)
       : null;
+  const governance =
+    validationResult &&
+    typeof validationResult.governance === "object" &&
+    validationResult.governance !== null &&
+    !Array.isArray(validationResult.governance)
+      ? (validationResult.governance as Record<string, unknown>)
+      : null;
 
-  return typeof v1Ready?.ok === "boolean";
+  return governance?.strictV1Ready === true && typeof v1Ready?.ok === "boolean";
 }
 
 function ensureConfig(config: CliConfig | undefined): CliConfig {
@@ -1679,8 +1685,7 @@ async function handleGate(input: {
   const decision = await requestGovernanceDecision({
     client,
     projectId,
-    runId,
-    strictV1Ready
+    runId
   });
   await persistGovernanceDecision({
     decision

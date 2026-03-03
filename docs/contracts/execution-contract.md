@@ -35,8 +35,10 @@ Persisted metadata keys:
 - `effectiveExecutionConfig`
 - `executionContractFallbackUsed`
 - `executionContractFallbackFields`
+- `executionContractSupport`
 
 `effectiveExecutionConfig` is the normalized snapshot. `executionConfig` is kept in sync with it for compatibility.
+`executionContractSupport` is the persisted support verdict used by workers and governance instead of live recomputation at decision time.
 
 ## Contract Material
 
@@ -72,6 +74,8 @@ Rule:
   - `plannerPolicyVersion`
   - `correctionRecipeVersion`
   - `validationPolicyVersion`
+
+The audited mapping from policy-driving symbols to versioned contract material lives in [contract-material-audit.md](/home/ab/compute-storage/Data/01_Projects/_Projects/_deeprun/docs/contracts/contract-material-audit.md) and is machine-checked in test.
 
 ## Resolution Order
 

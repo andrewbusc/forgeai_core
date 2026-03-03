@@ -39,10 +39,14 @@ import { isExecutingAgentRunStatus } from "./run-status.js";
 import { createDefaultAgentToolRegistry } from "./tools/index.js";
 import {
   buildExecutionContractMaterial,
+  buildExecutionContractMaterialForSchema,
+  executionContractPolicyVersions,
+  executionContractRandomnessSeed,
   ExecutionConfigEnvFallback,
   buildExecutionContract,
   evaluateExecutionContractSupport,
   ExecutionContractMismatchError,
+  hashExecutionContractMaterial,
   persistedExecutionConfigNeedsNormalization,
   resolveExecutionConfig as resolveExecutionConfigContract
 } from "./execution-contract.js";
@@ -384,6 +388,12 @@ export class AgentKernel {
     effectiveConfig: AgentRunExecutionConfig | null;
     fallbackUsed: boolean | null;
     fallbackFields: Array<keyof AgentRunExecutionConfig>;
+    support: {
+      supported: boolean;
+      code?: "UNSUPPORTED_CONTRACT";
+      message?: string;
+      details?: Record<string, unknown>;
+    } | null;
   } {
     const record = this.toRecord(metadata) || {};
     const schemaVersion =
@@ -396,6 +406,18 @@ export class AgentKernel {
     const fallbackFields = Array.isArray(record.executionContractFallbackFields)
       ? record.executionContractFallbackFields.filter((field): field is keyof AgentRunExecutionConfig => typeof field === "string")
       : [];
+    const supportRecord = this.toRecord(record.executionContractSupport);
+    const support =
+      supportRecord && typeof supportRecord.supported === "boolean"
+        ? {
+            supported: supportRecord.supported,
+            ...(supportRecord.code === "UNSUPPORTED_CONTRACT" ? { code: "UNSUPPORTED_CONTRACT" as const } : {}),
+            ...(typeof supportRecord.message === "string" && supportRecord.message.trim()
+              ? { message: supportRecord.message.trim() }
+              : {}),
+            ...(this.toRecord(supportRecord.details) ? { details: this.toRecord(supportRecord.details) || undefined } : {})
+          }
+        : null;
     const material =
       materialRecord &&
       typeof materialRecord.executionContractSchemaVersion === "number" &&
@@ -405,24 +427,57 @@ export class AgentKernel {
             normalizedExecutionConfig: this.resolveExecutionConfig({
               executionConfig: this.toRecord(materialRecord.normalizedExecutionConfig)
             }),
-            determinismPolicyVersion:
-              typeof materialRecord.determinismPolicyVersion === "number"
-                ? Math.floor(materialRecord.determinismPolicyVersion)
-                : 0,
-            plannerPolicyVersion:
-              typeof materialRecord.plannerPolicyVersion === "number"
-                ? Math.floor(materialRecord.plannerPolicyVersion)
-                : 0,
-            correctionRecipeVersion:
-              typeof materialRecord.correctionRecipeVersion === "number"
-                ? Math.floor(materialRecord.correctionRecipeVersion)
-                : 0,
-            validationPolicyVersion:
-              typeof materialRecord.validationPolicyVersion === "number"
-                ? Math.floor(materialRecord.validationPolicyVersion)
-                : 0,
-            randomnessSeed:
-              typeof materialRecord.randomnessSeed === "string" ? materialRecord.randomnessSeed : "unknown"
+            ...(Math.floor(materialRecord.executionContractSchemaVersion) === 1
+              ? {
+                  determinismPolicyVersion:
+                    typeof materialRecord.determinismPolicyVersion === "number"
+                      ? Math.floor(materialRecord.determinismPolicyVersion)
+                      : 0,
+                  plannerPolicyVersion:
+                    typeof materialRecord.plannerPolicyVersion === "number"
+                      ? Math.floor(materialRecord.plannerPolicyVersion)
+                      : 0,
+                  correctionRecipeVersion:
+                    typeof materialRecord.correctionRecipeVersion === "number"
+                      ? Math.floor(materialRecord.correctionRecipeVersion)
+                      : 0,
+                  validationPolicyVersion:
+                    typeof materialRecord.validationPolicyVersion === "number"
+                      ? Math.floor(materialRecord.validationPolicyVersion)
+                      : 0,
+                  randomnessSeed:
+                    typeof materialRecord.randomnessSeed === "string" ? materialRecord.randomnessSeed : "unknown"
+                }
+              : {
+                  randomnessSeed:
+                    typeof materialRecord.randomnessSeed === "string" ? materialRecord.randomnessSeed : "unknown",
+                  policyVersions: {
+                    determinismPolicyVersion:
+                      typeof this.toRecord(materialRecord.policyVersions)?.determinismPolicyVersion === "number"
+                        ? Math.floor(Number(this.toRecord(materialRecord.policyVersions)?.determinismPolicyVersion))
+                        : 0,
+                    normalizationPolicyVersion:
+                      typeof this.toRecord(materialRecord.policyVersions)?.normalizationPolicyVersion === "number"
+                        ? Math.floor(Number(this.toRecord(materialRecord.policyVersions)?.normalizationPolicyVersion))
+                        : 0,
+                    plannerPolicyVersion:
+                      typeof this.toRecord(materialRecord.policyVersions)?.plannerPolicyVersion === "number"
+                        ? Math.floor(Number(this.toRecord(materialRecord.policyVersions)?.plannerPolicyVersion))
+                        : 0,
+                    correctionRecipeVersion:
+                      typeof this.toRecord(materialRecord.policyVersions)?.correctionRecipeVersion === "number"
+                        ? Math.floor(Number(this.toRecord(materialRecord.policyVersions)?.correctionRecipeVersion))
+                        : 0,
+                    validationPolicyVersion:
+                      typeof this.toRecord(materialRecord.policyVersions)?.validationPolicyVersion === "number"
+                        ? Math.floor(Number(this.toRecord(materialRecord.policyVersions)?.validationPolicyVersion))
+                        : 0,
+                    governancePolicyVersion:
+                      typeof this.toRecord(materialRecord.policyVersions)?.governancePolicyVersion === "number"
+                        ? Math.floor(Number(this.toRecord(materialRecord.policyVersions)?.governancePolicyVersion))
+                        : 0
+                  }
+                })
           }
         : null;
 
@@ -432,7 +487,8 @@ export class AgentKernel {
       material,
       effectiveConfig,
       fallbackUsed,
-      fallbackFields
+      fallbackFields,
+      support
     };
   }
 
@@ -441,6 +497,7 @@ export class AgentKernel {
     executionConfig: AgentRunExecutionConfig
   ): Record<string, unknown> {
     const contract = buildExecutionContract(executionConfig);
+    const support = evaluateExecutionContractSupport(contract.material);
     return {
       ...(this.toRecord(metadata) || {}),
       executionConfig: contract.effectiveConfig,
@@ -449,7 +506,8 @@ export class AgentKernel {
       executionContractMaterial: contract.material,
       effectiveExecutionConfig: contract.effectiveConfig,
       executionContractFallbackUsed: contract.fallbackUsed,
-      executionContractFallbackFields: contract.fallbackFields
+      executionContractFallbackFields: contract.fallbackFields,
+      executionContractSupport: support
     };
   }
 
@@ -457,6 +515,7 @@ export class AgentKernel {
     metadata: Record<string, unknown> | undefined | null,
     resolvedContract: ReturnType<AgentKernel["resolveExecutionContract"]>["requestedContract"]
   ): Record<string, unknown> {
+    const support = evaluateExecutionContractSupport(resolvedContract.material);
     return {
       ...(this.toRecord(metadata) || {}),
       executionConfig: resolvedContract.effectiveConfig,
@@ -465,7 +524,8 @@ export class AgentKernel {
       executionContractMaterial: resolvedContract.material,
       effectiveExecutionConfig: resolvedContract.effectiveConfig,
       executionContractFallbackUsed: resolvedContract.fallbackUsed,
-      executionContractFallbackFields: resolvedContract.fallbackFields
+      executionContractFallbackFields: resolvedContract.fallbackFields,
+      executionContractSupport: support
     };
   }
 
@@ -483,11 +543,16 @@ export class AgentKernel {
       return;
     }
 
+    const expectedMaterial = buildExecutionContractMaterialForSchema({
+      config: resolvedContract.effectiveConfig,
+      contractSchemaVersion: stored.schemaVersion
+    });
+
     if (
-      stored.schemaVersion !== resolvedContract.schemaVersion ||
-      stored.hash !== resolvedContract.hash ||
+      stored.schemaVersion !== expectedMaterial.executionContractSchemaVersion ||
       JSON.stringify(stored.effectiveConfig) !== JSON.stringify(resolvedContract.effectiveConfig) ||
-      (stored.material !== null && JSON.stringify(stored.material) !== JSON.stringify(resolvedContract.material))
+      stored.hash !== hashExecutionContractMaterial(expectedMaterial) ||
+      (stored.material !== null && JSON.stringify(stored.material) !== JSON.stringify(expectedMaterial))
     ) {
       throw new Error(
         `CONTRACT_MISMATCH: stored execution contract metadata does not match persisted normalized config for run ${run.id}.`
@@ -500,7 +565,7 @@ export class AgentKernel {
     resolvedContract: ReturnType<AgentKernel["resolveExecutionContract"]>["persistedContract"]
   ): void {
     const stored = this.readExecutionContractMetadata(run.metadata);
-    const support = evaluateExecutionContractSupport(stored.material || resolvedContract.material);
+    const support = stored.support || evaluateExecutionContractSupport(stored.material || resolvedContract.material);
     if (!support.supported) {
       throw new Error(`UNSUPPORTED_CONTRACT: ${support.message || `worker cannot execute run ${run.id}`}`);
     }
@@ -539,6 +604,7 @@ export class AgentKernel {
       storedContractMetadata.hash === null ||
       storedContractMetadata.effectiveConfig === null ||
       storedContractMetadata.fallbackUsed === null ||
+      storedContractMetadata.support === null ||
       persistedExecutionConfigNeedsNormalization(
         rawPersistedExecutionConfig,
         resolvedContract.persistedExecutionConfig,
@@ -2918,9 +2984,10 @@ export class AgentKernel {
             hash: storedContract.hash,
             material: storedContract.material || recomputedContract.material,
             effectiveConfig: storedContract.effectiveConfig,
-            fallbackUsed: storedContract.fallbackUsed,
-            fallbackFields: storedContract.fallbackFields
-          }
+          fallbackUsed: storedContract.fallbackUsed,
+          fallbackFields: storedContract.fallbackFields,
+          ...(storedContract.support ? { support: storedContract.support } : {})
+        }
         : recomputedContract;
 
     return {
@@ -5402,6 +5469,7 @@ export class AgentKernel {
       storedContract.hash === null ||
       storedContract.effectiveConfig === null ||
       storedContract.fallbackUsed === null ||
+      storedContract.support === null ||
       persistedExecutionConfigNeedsNormalization(
         this.toRecord(this.toRecord(normalizedRun.metadata)?.executionConfig),
         resolvedExecutionConfig,

@@ -19,6 +19,7 @@ export interface AgentLifecycleRun {
   orgId: string;
   workspaceId: string;
   createdByUserId: string;
+  graphId: string;
   goal: string;
   phase: AgentRunPhase;
   status: AgentRunLifecycleStatus;
@@ -52,6 +53,7 @@ export interface CreateLifecycleRunInput {
   orgId: string;
   workspaceId: string;
   createdByUserId: string;
+  graphId: string;
   goal: string;
   phase: AgentRunPhase;
   status: AgentRunLifecycleStatus;

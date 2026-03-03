@@ -4,13 +4,20 @@ import {
   CORRECTION_RECIPE_VERSION,
   DETERMINISM_POLICY_VERSION,
   EXECUTION_CONTRACT_RANDOMNESS_SEED,
+  GOVERNANCE_POLICY_VERSION,
+  NORMALIZATION_POLICY_VERSION,
   PLANNER_POLICY_VERSION,
+  POLICY_REGISTRY,
   SUPPORTED_EXECUTION_CONTRACT_RANGES,
   VALIDATION_POLICY_VERSION
 } from "./contract-policy.js";
 import {
   AgentRunExecutionContract,
   AgentRunExecutionConfig,
+  AgentRunExecutionContractMaterial,
+  AgentRunExecutionContractMaterialV1,
+  AgentRunExecutionContractMaterialV2,
+  AgentRunExecutionPolicyVersions,
   AgentRunExecutionProfile,
   AgentRunExecutionValidationMode,
   agentRunExecutionProfileSchema,
@@ -18,6 +25,7 @@ import {
 } from "./types.js";
 
 export const EXECUTION_CONFIG_SCHEMA_VERSION = 1 as const;
+export const EXECUTION_CONTRACT_SCHEMA_VERSION = 2 as const;
 
 export const executionConfigSchema = z.object({
   schemaVersion: z.literal(EXECUTION_CONFIG_SCHEMA_VERSION),
@@ -158,15 +166,7 @@ function stableJson(value: unknown): string {
   return `{${entries.map(([key, entry]) => `${JSON.stringify(key)}:${stableJson(entry)}`).join(",")}}`;
 }
 
-export interface ExecutionContractMaterial {
-  executionContractSchemaVersion: number;
-  normalizedExecutionConfig: AgentRunExecutionConfig;
-  determinismPolicyVersion: number;
-  plannerPolicyVersion: number;
-  correctionRecipeVersion: number;
-  validationPolicyVersion: number;
-  randomnessSeed: string;
-}
+export type ExecutionContractMaterial = AgentRunExecutionContractMaterial;
 
 export interface ExecutionContractSupportResult {
   supported: boolean;
@@ -179,16 +179,70 @@ export function stableExecutionContractJson(value: unknown): string {
   return stableJson(value);
 }
 
-export function buildExecutionContractMaterial(config: AgentRunExecutionConfig): ExecutionContractMaterial {
+export function executionContractPolicyVersions(material: ExecutionContractMaterial): AgentRunExecutionPolicyVersions {
+  if ("policyVersions" in material) {
+    return material.policyVersions;
+  }
+
   return {
-    executionContractSchemaVersion: EXECUTION_CONFIG_SCHEMA_VERSION,
-    normalizedExecutionConfig: executionConfigSchema.parse(config),
-    determinismPolicyVersion: DETERMINISM_POLICY_VERSION,
-    plannerPolicyVersion: PLANNER_POLICY_VERSION,
-    correctionRecipeVersion: CORRECTION_RECIPE_VERSION,
-    validationPolicyVersion: VALIDATION_POLICY_VERSION,
-    randomnessSeed: EXECUTION_CONTRACT_RANDOMNESS_SEED
+    determinismPolicyVersion: material.determinismPolicyVersion,
+    normalizationPolicyVersion: 1,
+    plannerPolicyVersion: material.plannerPolicyVersion,
+    correctionRecipeVersion: material.correctionRecipeVersion,
+    validationPolicyVersion: material.validationPolicyVersion,
+    governancePolicyVersion: 1
   };
+}
+
+export function executionContractRandomnessSeed(material: ExecutionContractMaterial): string {
+  return material.randomnessSeed;
+}
+
+export function buildExecutionIdentityMaterial(input: {
+  schemaVersion: number;
+  normalizedExecutionConfig: AgentRunExecutionConfig;
+  randomnessSeed: string;
+}): AgentRunExecutionContractMaterialV2 {
+  return {
+    executionContractSchemaVersion: EXECUTION_CONTRACT_SCHEMA_VERSION,
+    normalizedExecutionConfig: executionConfigSchema.parse(input.normalizedExecutionConfig),
+    randomnessSeed: input.randomnessSeed,
+    policyVersions: {
+      determinismPolicyVersion: DETERMINISM_POLICY_VERSION,
+      normalizationPolicyVersion: NORMALIZATION_POLICY_VERSION,
+      plannerPolicyVersion: PLANNER_POLICY_VERSION,
+      correctionRecipeVersion: CORRECTION_RECIPE_VERSION,
+      validationPolicyVersion: VALIDATION_POLICY_VERSION,
+      governancePolicyVersion: GOVERNANCE_POLICY_VERSION
+    }
+  };
+}
+
+export function buildExecutionContractMaterial(config: AgentRunExecutionConfig): ExecutionContractMaterial {
+  return buildExecutionIdentityMaterial({
+    schemaVersion: EXECUTION_CONTRACT_SCHEMA_VERSION,
+    normalizedExecutionConfig: config,
+    randomnessSeed: EXECUTION_CONTRACT_RANDOMNESS_SEED
+  });
+}
+
+export function buildExecutionContractMaterialForSchema(input: {
+  config: AgentRunExecutionConfig;
+  contractSchemaVersion: number;
+}): ExecutionContractMaterial {
+  if (input.contractSchemaVersion === 1) {
+    return {
+      executionContractSchemaVersion: 1,
+      normalizedExecutionConfig: executionConfigSchema.parse(input.config),
+      determinismPolicyVersion: DETERMINISM_POLICY_VERSION,
+      plannerPolicyVersion: PLANNER_POLICY_VERSION,
+      correctionRecipeVersion: CORRECTION_RECIPE_VERSION,
+      validationPolicyVersion: VALIDATION_POLICY_VERSION,
+      randomnessSeed: EXECUTION_CONTRACT_RANDOMNESS_SEED
+    };
+  }
+
+  return buildExecutionContractMaterial(input.config);
 }
 
 export function hashExecutionContractMaterial(material: ExecutionContractMaterial): string {
@@ -203,7 +257,7 @@ function buildContractSnapshot(
 ): AgentRunExecutionContract {
   const material = buildExecutionContractMaterial(config);
   return {
-    schemaVersion: EXECUTION_CONFIG_SCHEMA_VERSION,
+    schemaVersion: EXECUTION_CONTRACT_SCHEMA_VERSION,
     hash: hashExecutionContractMaterial(material),
     material,
     effectiveConfig: config,
@@ -213,6 +267,7 @@ function buildContractSnapshot(
 }
 
 export function evaluateExecutionContractSupport(material: ExecutionContractMaterial): ExecutionContractSupportResult {
+  const policyVersions = executionContractPolicyVersions(material);
   const unsupportedFields: string[] = [];
 
   if (!SUPPORTED_EXECUTION_CONTRACT_RANGES.schemaVersions.includes(material.executionContractSchemaVersion)) {
@@ -220,20 +275,26 @@ export function evaluateExecutionContractSupport(material: ExecutionContractMate
       `executionContractSchemaVersion=${material.executionContractSchemaVersion}`
     );
   }
-  if (!SUPPORTED_EXECUTION_CONTRACT_RANGES.determinismPolicyVersions.includes(material.determinismPolicyVersion)) {
-    unsupportedFields.push(`determinismPolicyVersion=${material.determinismPolicyVersion}`);
+  if (!SUPPORTED_EXECUTION_CONTRACT_RANGES.determinismPolicyVersions.includes(policyVersions.determinismPolicyVersion)) {
+    unsupportedFields.push(`determinismPolicyVersion=${policyVersions.determinismPolicyVersion}`);
   }
-  if (!SUPPORTED_EXECUTION_CONTRACT_RANGES.plannerPolicyVersions.includes(material.plannerPolicyVersion)) {
-    unsupportedFields.push(`plannerPolicyVersion=${material.plannerPolicyVersion}`);
+  if (!SUPPORTED_EXECUTION_CONTRACT_RANGES.normalizationPolicyVersions.includes(policyVersions.normalizationPolicyVersion)) {
+    unsupportedFields.push(`normalizationPolicyVersion=${policyVersions.normalizationPolicyVersion}`);
   }
-  if (!SUPPORTED_EXECUTION_CONTRACT_RANGES.correctionRecipeVersions.includes(material.correctionRecipeVersion)) {
-    unsupportedFields.push(`correctionRecipeVersion=${material.correctionRecipeVersion}`);
+  if (!SUPPORTED_EXECUTION_CONTRACT_RANGES.plannerPolicyVersions.includes(policyVersions.plannerPolicyVersion)) {
+    unsupportedFields.push(`plannerPolicyVersion=${policyVersions.plannerPolicyVersion}`);
   }
-  if (!SUPPORTED_EXECUTION_CONTRACT_RANGES.validationPolicyVersions.includes(material.validationPolicyVersion)) {
-    unsupportedFields.push(`validationPolicyVersion=${material.validationPolicyVersion}`);
+  if (!SUPPORTED_EXECUTION_CONTRACT_RANGES.correctionRecipeVersions.includes(policyVersions.correctionRecipeVersion)) {
+    unsupportedFields.push(`correctionRecipeVersion=${policyVersions.correctionRecipeVersion}`);
   }
-  if (!SUPPORTED_EXECUTION_CONTRACT_RANGES.randomnessSeeds.includes(material.randomnessSeed)) {
-    unsupportedFields.push(`randomnessSeed=${material.randomnessSeed}`);
+  if (!SUPPORTED_EXECUTION_CONTRACT_RANGES.validationPolicyVersions.includes(policyVersions.validationPolicyVersion)) {
+    unsupportedFields.push(`validationPolicyVersion=${policyVersions.validationPolicyVersion}`);
+  }
+  if (!SUPPORTED_EXECUTION_CONTRACT_RANGES.governancePolicyVersions.includes(policyVersions.governancePolicyVersion)) {
+    unsupportedFields.push(`governancePolicyVersion=${policyVersions.governancePolicyVersion}`);
+  }
+  if (!SUPPORTED_EXECUTION_CONTRACT_RANGES.randomnessSeeds.includes(executionContractRandomnessSeed(material))) {
+    unsupportedFields.push(`randomnessSeed=${executionContractRandomnessSeed(material)}`);
   }
 
   if (!unsupportedFields.length) {

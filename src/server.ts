@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { validateEnvironment } from "./lib/env-config.js";
 import cors from "cors";
 import express from "express";
 import type { Server as HttpServer } from "node:http";
@@ -7,11 +8,13 @@ import net from "node:net";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { randomUUID, timingSafeEqual, createHash } from "node:crypto";
 import { ZodError, z } from "zod";
 import { FileSession } from "./agent/fs/file-session.js";
 import { buildTree, ensureDir, pathExists, readTextFile, safeResolvePath } from "./lib/fs-utils.js";
 import { AppStore } from "./lib/project-store.js";
+import { GraphStore } from "./lib/graph-store.js";
+import { enforceRuntimeCompatibility } from "./lib/runtime-compatibility.js";
 import { ProviderRegistry } from "./lib/providers.js";
 import { workspacePath } from "./lib/workspace.js";
 import { AgentKernel } from "./agent/kernel.js";
@@ -123,7 +126,7 @@ const validateAgentRunSchema = z.object({
 
 const governanceDecisionRequestSchema = z.object({
   runId: z.string().uuid(),
-  strictV1Ready: z.boolean().default(false)
+  strictV1Ready: z.boolean().optional()
 });
 
 const createAgentStateRunSchema = z.object({
@@ -153,10 +156,13 @@ const createDeploymentSchema = z.object({
   containerPort: z.number().int().min(1).max(65535).optional()
 });
 
+import { createGovernanceRoutes } from './governance-routes.js';
+
 const app = express();
 app.disable("x-powered-by");
 
 const store = new AppStore();
+const graphStore = new GraphStore(store.pool);
 const providers = new ProviderRegistry();
 const agentKernel = new AgentKernel({ store, providers });
 const agentRunService = new AgentRunService(store);
@@ -395,12 +401,25 @@ function buildValidationResultPayload(input: {
   targetPath: string;
   validation: ValidationSummaryLike;
   v1Ready?: V1ReadinessReport | null;
+  strictV1Ready?: boolean;
 }): Record<string, unknown> {
   return {
     targetPath: input.targetPath,
     validation: input.validation,
+    governance: {
+      strictV1Ready: input.strictV1Ready === true
+    },
     ...(input.v1Ready ? { v1Ready: input.v1Ready } : {})
   };
+}
+
+function readPersistedStrictV1Ready(value: unknown): boolean {
+  const record = value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+  const governance =
+    record?.governance && typeof record.governance === "object" && !Array.isArray(record.governance)
+      ? (record.governance as Record<string, unknown>)
+      : null;
+  return governance?.strictV1Ready === true;
 }
 
 interface ValidationCheckResult {
@@ -715,6 +734,8 @@ app.use((req, res, next) => {
   res.setHeader("Connection", "close");
   res.status(503).json({ error: "Server is shutting down." });
 });
+
+app.use('/api', createGovernanceRoutes(store, agentRunService));
 
 app.use(express.static(publicDir));
 
@@ -1135,7 +1156,8 @@ async function runBootstrapCertification(input: {
     );
     const validationResultPayload = buildValidationResultPayload({
       targetPath: validated.targetPath,
-      validation: validated.validation
+      validation: validated.validation,
+      strictV1Ready: readPersistedStrictV1Ready(validated.run.validationResult)
     });
     await store.updateAgentRun(validated.run.id, {
       validationStatus: validated.validation.ok ? "passed" : "failed",
@@ -1206,7 +1228,8 @@ async function runBootstrapCertification(input: {
                   }
                 }
               ]
-            }
+            },
+            strictV1Ready: false
           }),
           validatedAt
         });
@@ -2856,7 +2879,8 @@ app.post("/api/projects/:projectId/agent/runs/:runId/validate", authRequired, as
     const validationResultPayload = buildValidationResultPayload({
       targetPath: result.targetPath,
       validation: result.validation,
-      v1Ready
+      v1Ready,
+      strictV1Ready: parsed.strictV1Ready || readPersistedStrictV1Ready(result.run.validationResult)
     });
 
     const persistedRun =
@@ -2914,10 +2938,31 @@ app.post("/api/projects/:projectId/agent/state-runs", authRequired, async (req, 
     const project = await requireProjectAccess(auth.user.id, req.params.projectId);
     const parsed = createAgentStateRunSchema.parse(req.body ?? {});
 
+    const runId = randomUUID();
+    const executionIdentityHash = createHash("sha256")
+      .update(JSON.stringify({
+        provider: "state-machine",
+        goal: parsed.goal,
+        maxSteps: parsed.maxSteps || 20,
+        maxCorrections: parsed.maxCorrections || 2,
+        maxOptimizations: parsed.maxOptimizations || 2
+      }))
+      .digest("hex");
+
+    const graph = await graphStore.createSingleNodeGraph({
+      projectId: project.id,
+      orgId: project.orgId,
+      workspaceId: project.workspaceId,
+      createdByUserId: auth.user.id,
+      runId,
+      executionIdentityHash
+    });
+
     const run = await agentRunService.createRun({
       project,
       createdByUserId: auth.user.id,
       goal: parsed.goal,
+      graphId: graph.id,
       maxSteps: parsed.maxSteps,
       maxCorrections: parsed.maxCorrections,
       maxOptimizations: parsed.maxOptimizations,
@@ -3049,12 +3094,15 @@ app.post("/api/projects/:projectId/governance/decision", authRequired, async (re
       throw new HttpError(404, "Agent run not found.");
     }
 
-    res.json(
-      buildGovernanceDecision({
-        detail,
-        strictV1Ready: parsed.strictV1Ready
-      })
-    );
+    const persistedStrictV1Ready = readPersistedStrictV1Ready(detail.run.validationResult);
+    if (typeof parsed.strictV1Ready === "boolean" && parsed.strictV1Ready !== persistedStrictV1Ready) {
+      throw new HttpError(
+        409,
+        `Governance mode mismatch. Persisted strictV1Ready=${String(persistedStrictV1Ready)} for run ${detail.run.id}.`
+      );
+    }
+
+    res.json(buildGovernanceDecision({ detail }));
   } catch (error) {
     next(error);
   }
@@ -3481,9 +3529,27 @@ app.use((error: unknown, req: express.Request, res: express.Response, _next: exp
 });
 
 async function main(): Promise<void> {
-  await store.initialize();
+  // Validate environment configuration (fail fast)
+  const config = validateEnvironment();
+  
+  logInfo("server.config_validated", {
+    nodeEnv: config.nodeEnv,
+    port: config.port,
+    corsOrigins: config.corsAllowedOrigins.length,
+    providersConfigured: [
+      config.providers.openaiApiKey ? 'openai' : null,
+      config.providers.anthropicApiKey ? 'anthropic' : null,
+    ].filter(Boolean),
+    metricsEnabled: config.metrics.enabled,
+  });
 
-  const port = Number(process.env.PORT || 3000);
+  await store.initialize();
+  await graphStore.initializeSchema();
+  
+  // Validate runtime compatibility BEFORE starting HTTP server
+  await enforceRuntimeCompatibility(store.pool);
+
+  const port = config.port;
   httpServer = await new Promise<HttpServer>((resolve, reject) => {
     const server = app.listen(port, () => resolve(server));
     server.once("error", reject);
@@ -3493,8 +3559,8 @@ async function main(): Promise<void> {
 
   logInfo("server.started", {
     port,
-    origins: corsAllowedOrigins,
-    trustProxy
+    origins: config.corsAllowedOrigins,
+    trustProxy: config.trustProxy
   });
   console.log(`deeprun running at http://localhost:${port}`);
 }

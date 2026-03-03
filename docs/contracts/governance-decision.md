@@ -69,9 +69,19 @@ CI should prefer `reasonCodes[]` for gating and routing. The richer `reasons[]` 
 
 ## Decision Rule
 
-`PASS` means the run is externally promotable under the requested governance mode.
+`PASS` means the run is externally promotable under the persisted governance mode stored on the run.
 
 `FAIL` means the pipeline must stop based only on the decision payload.
+
+Decision projection is deterministic over persisted run state. The decision builder does not read:
+
+- request-time strictness flags
+- process environment
+- wall clock
+- worker memory
+- analytical telemetry
+
+Strict v1-ready enforcement is taken from persisted validation/governance state on the run. Contract support is taken from the persisted execution-contract support verdict on the run.
 
 The CI contract is intentionally narrow:
 
@@ -90,10 +100,13 @@ Body:
 
 ```json
 {
-  "runId": "uuid",
-  "strictV1Ready": false
+  "runId": "uuid"
 }
 ```
+
+Compatibility note:
+
+- `strictV1Ready` may still be accepted as an optional request field for drift detection, but it must match the persisted run governance mode and must not change the decision outcome.
 
 ## CLI
 
@@ -103,6 +116,7 @@ deeprun gate --project <projectId> --run <runId> [--strict-v1-ready] [--output <
 
 Behavior:
 
+- when `--strict-v1-ready` is used, the CLI first persists strict validation/governance state on the run if needed
 - emits the JSON payload to stdout
 - writes the same payload to `--output` when provided
 - always persists the authoritative content-addressed file under:

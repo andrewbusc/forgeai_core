@@ -3,10 +3,11 @@ import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 import type { AgentRunDetail } from "../agent/types.js";
-import { evaluateExecutionContractSupport } from "../agent/execution-contract.js";
+import { executionContractPolicyVersions, executionContractRandomnessSeed } from "../agent/execution-contract.js";
+import { buildControlPlaneIdentityHash } from "../agent/control-plane-identity.js";
 import { workspacePath } from "../lib/workspace.js";
 
-export const GOVERNANCE_DECISION_SCHEMA_VERSION = 2 as const;
+export const GOVERNANCE_DECISION_SCHEMA_VERSION = 3 as const;
 
 const governanceReasonSchema = z.object({
   code: z.string().min(1),
@@ -31,11 +32,14 @@ export const governanceDecisionPayloadWithoutHashSchema = z.object({
     schemaVersion: z.number().int().min(1),
     hash: z.string().min(1),
     determinismPolicyVersion: z.number().int().min(1),
+    normalizationPolicyVersion: z.number().int().min(1),
     plannerPolicyVersion: z.number().int().min(1),
     correctionRecipeVersion: z.number().int().min(1),
     validationPolicyVersion: z.number().int().min(1),
+    governancePolicyVersion: z.number().int().min(1),
     randomnessSeed: z.string().min(1)
   }),
+  controlPlaneIdentityHash: z.string().length(64),
   artifactRefs: z.array(governanceArtifactRefSchema)
 });
 
@@ -115,14 +119,15 @@ export async function persistGovernanceDecision(input: {
 
 export function buildGovernanceDecision(input: {
   detail: AgentRunDetail;
-  strictV1Ready: boolean;
 }): GovernanceDecisionPayload {
   const reasons: GovernanceDecisionPayload["reasons"] = [];
   const validationResult = toRecord(input.detail.run.validationResult);
   const validation = toRecord(validationResult?.validation);
   const v1Ready = toRecord(validationResult?.v1Ready);
   const contract = input.detail.contract;
-  const contractSupport = contract ? evaluateExecutionContractSupport(contract.material) : null;
+  const governance = toRecord(validationResult?.governance);
+  const strictV1Ready = governance?.strictV1Ready === true;
+  const contractSupport = contract?.support || null;
 
   if (!contract?.hash) {
     reasons.push({
@@ -182,7 +187,7 @@ export function buildGovernanceDecision(input: {
     });
   }
 
-  if (input.strictV1Ready) {
+  if (strictV1Ready) {
     if (typeof v1Ready?.ok !== "boolean") {
       reasons.push({
         code: "RUN_V1_READY_NOT_RUN",
@@ -233,6 +238,10 @@ export function buildGovernanceDecision(input: {
   });
 
   const reasonCodes = Array.from(new Set(reasons.map((entry) => entry.code)));
+  const policyVersions = contract ? executionContractPolicyVersions(contract.material) : null;
+  const controlPlaneIdentityHash = contract?.material
+    ? buildControlPlaneIdentityHash({ executionContractMaterial: contract.material })
+    : "0000000000000000000000000000000000000000000000000000000000000000";
 
   return finalizeGovernanceDecision({
     decisionSchemaVersion: GOVERNANCE_DECISION_SCHEMA_VERSION,
@@ -243,12 +252,15 @@ export function buildGovernanceDecision(input: {
     contract: {
       schemaVersion: contract?.schemaVersion || input.detail.executionConfigSummary?.schemaVersion || 1,
       hash: contract?.hash || "missing",
-      determinismPolicyVersion: contract?.material.determinismPolicyVersion || 1,
-      plannerPolicyVersion: contract?.material.plannerPolicyVersion || 1,
-      correctionRecipeVersion: contract?.material.correctionRecipeVersion || 1,
-      validationPolicyVersion: contract?.material.validationPolicyVersion || 1,
-      randomnessSeed: contract?.material.randomnessSeed || "missing"
+      determinismPolicyVersion: policyVersions?.determinismPolicyVersion || 1,
+      normalizationPolicyVersion: policyVersions?.normalizationPolicyVersion || 1,
+      plannerPolicyVersion: policyVersions?.plannerPolicyVersion || 1,
+      correctionRecipeVersion: policyVersions?.correctionRecipeVersion || 1,
+      validationPolicyVersion: policyVersions?.validationPolicyVersion || 1,
+      governancePolicyVersion: policyVersions?.governancePolicyVersion || 1,
+      randomnessSeed: contract ? executionContractRandomnessSeed(contract.material) : "missing"
     },
+    controlPlaneIdentityHash,
     artifactRefs
   });
 }

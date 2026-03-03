@@ -132,6 +132,7 @@ async function startServer(envOverrides: Record<string, string | undefined> = {}
       DATABASE_URL: requiredDatabaseUrl,
       PORT: String(port),
       NODE_ENV: "test",
+      JWT_SECRET: process.env.JWT_SECRET || "test-jwt-secret-for-integration-tests",
       CORS_ALLOWED_ORIGINS: process.env.CORS_ALLOWED_ORIGINS || "http://localhost",
       RATE_LIMIT_LOGIN_MAX: process.env.RATE_LIMIT_LOGIN_MAX || "100",
       RATE_LIMIT_GENERATION_MAX: process.env.RATE_LIMIT_GENERATION_MAX || "100",

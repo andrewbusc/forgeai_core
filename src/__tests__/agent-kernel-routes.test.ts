@@ -1306,6 +1306,9 @@ test("governance decision endpoint returns FAIL payload with strict machine-read
             summary: "all checks passed",
             checks: []
           },
+          governance: {
+            strictV1Ready: true
+          },
           v1Ready: {
             ok: false,
             verdict: "NO",
@@ -1345,6 +1348,93 @@ test("governance decision endpoint returns FAIL payload with strict machine-read
     assert.equal(decision.body.decision, "FAIL");
     assert.equal(decision.body.reasonCodes.includes("RUN_V1_READY_FAILED"), true);
     assert.equal(decision.body.reasons.some((entry) => entry.code === "RUN_V1_READY_FAILED"), true);
+  } finally {
+    await server.stop();
+  }
+});
+
+test("governance decision endpoint rejects request-time strict mode drift from persisted run state", async () => {
+  const server = await startServer();
+  const jar = new CookieJar();
+  const suffix = randomUUID().slice(0, 8);
+  const store = new AppStore();
+
+  try {
+    const identity = await registerUser({
+      baseUrl: server.baseUrl,
+      jar,
+      suffix
+    });
+    const project = await createProject({
+      baseUrl: server.baseUrl,
+      jar,
+      workspaceId: identity.workspaceId,
+      suffix
+    });
+    const storedProject = await store.getProject(project.id);
+    assert.ok(storedProject);
+    const executionConfig = governanceExecutionConfig("ci");
+    const contract = buildExecutionContract(executionConfig);
+    const commitHash = project.initialCommitHash as string;
+    const seededRun = await store.createAgentRun({
+      projectId: project.id,
+      orgId: project.orgId,
+      workspaceId: project.workspaceId,
+      createdByUserId: identity.userId,
+      goal: "Governance mode mismatch candidate",
+      providerId: "mock",
+      model: "mock-v1",
+      status: "complete",
+      currentStepIndex: 0,
+      plan: {
+        goal: "Governance mode mismatch candidate",
+        steps: []
+      },
+      baseCommitHash: commitHash,
+      currentCommitHash: commitHash,
+      lastValidCommitHash: commitHash,
+      metadata: {
+        executionConfig,
+        executionContractSchemaVersion: contract.schemaVersion,
+        executionContractHash: contract.hash,
+        executionContractMaterial: contract.material,
+        effectiveExecutionConfig: contract.effectiveConfig,
+        executionContractFallbackUsed: false,
+        executionContractFallbackFields: []
+      }
+    });
+    const run =
+      (await store.updateAgentRun(seededRun.id, {
+        validationStatus: "passed",
+        validationResult: {
+          targetPath: store.getProjectWorkspacePath(storedProject),
+          validation: {
+            ok: true,
+            blockingCount: 0,
+            warningCount: 0,
+            summary: "all checks passed",
+            checks: []
+          },
+          governance: {
+            strictV1Ready: false
+          }
+        },
+        validatedAt: new Date().toISOString()
+      })) || seededRun;
+
+    const decision = await requestJson<{ error: string }>({
+      baseUrl: server.baseUrl,
+      jar,
+      method: "POST",
+      path: `/api/projects/${project.id}/governance/decision`,
+      body: {
+        runId: run.id,
+        strictV1Ready: true
+      }
+    });
+
+    assert.equal(decision.status, 409);
+    assert.match(decision.body.error, /Governance mode mismatch/);
   } finally {
     await server.stop();
   }
@@ -1420,6 +1510,108 @@ test("governance decision endpoint returns FAIL with UNSUPPORTED_CONTRACT for fu
     assert.equal(decision.body.decisionHash.length, 64);
     assert.equal(decision.body.reasonCodes.includes("UNSUPPORTED_CONTRACT"), true);
     assert.equal(decision.body.reasons.some((entry) => entry.code === "UNSUPPORTED_CONTRACT"), true);
+  } finally {
+    await server.stop();
+  }
+});
+
+test("governance decision endpoint uses persisted contract-support verdict instead of live recomputation", async () => {
+  const server = await startServer();
+  const jar = new CookieJar();
+  const suffix = randomUUID().slice(0, 8);
+  const store = new AppStore();
+
+  try {
+    const identity = await registerUser({
+      baseUrl: server.baseUrl,
+      jar,
+      suffix
+    });
+    const project = await createProject({
+      baseUrl: server.baseUrl,
+      jar,
+      workspaceId: identity.workspaceId,
+      suffix
+    });
+    const storedProject = await store.getProject(project.id);
+    assert.ok(storedProject);
+    const executionConfig = governanceExecutionConfig("ci");
+    const contract = buildExecutionContract(executionConfig);
+    const commitHash = project.initialCommitHash as string;
+    const seededRun = await store.createAgentRun({
+      projectId: project.id,
+      orgId: project.orgId,
+      workspaceId: project.workspaceId,
+      createdByUserId: identity.userId,
+      goal: "Persisted contract support candidate",
+      providerId: "mock",
+      model: "mock-v1",
+      status: "complete",
+      currentStepIndex: 0,
+      plan: {
+        goal: "Persisted contract support candidate",
+        steps: []
+      },
+      baseCommitHash: commitHash,
+      currentCommitHash: commitHash,
+      lastValidCommitHash: commitHash,
+      metadata: {
+        executionConfig,
+        executionContractSchemaVersion: contract.schemaVersion,
+        executionContractHash: contract.hash,
+        executionContractMaterial: contract.material,
+        effectiveExecutionConfig: contract.effectiveConfig,
+        executionContractFallbackUsed: false,
+        executionContractFallbackFields: [],
+        executionContractSupport: {
+          supported: false,
+          code: "UNSUPPORTED_CONTRACT",
+          message: "persisted unsupported verdict"
+        }
+      }
+    });
+    const run =
+      (await store.updateAgentRun(seededRun.id, {
+        validationStatus: "passed",
+        validationResult: {
+          targetPath: store.getProjectWorkspacePath(storedProject),
+          validation: {
+            ok: true,
+            blockingCount: 0,
+            warningCount: 0,
+            summary: "all checks passed",
+            checks: []
+          },
+          governance: {
+            strictV1Ready: false
+          }
+        },
+        validatedAt: new Date().toISOString()
+      })) || seededRun;
+
+    const decision = await requestJson<{
+      decision: string;
+      reasonCodes: string[];
+      reasons: Array<{ code: string; message?: string }>;
+    }>({
+      baseUrl: server.baseUrl,
+      jar,
+      method: "POST",
+      path: `/api/projects/${project.id}/governance/decision`,
+      body: {
+        runId: run.id
+      }
+    });
+
+    assert.equal(decision.status, 200);
+    assert.equal(decision.body.decision, "FAIL");
+    assert.equal(decision.body.reasonCodes.includes("UNSUPPORTED_CONTRACT"), true);
+    assert.equal(
+      decision.body.reasons.some(
+        (entry) => entry.code === "UNSUPPORTED_CONTRACT" && entry.message === "persisted unsupported verdict"
+      ),
+      true
+    );
   } finally {
     await server.stop();
   }

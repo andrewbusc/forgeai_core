@@ -290,10 +290,7 @@ async function persistDecisionForRun(input: {
     throw new Error(`Run detail not found: ${input.runId}`);
   }
 
-  const decision = buildGovernanceDecision({
-    detail,
-    strictV1Ready: false
-  });
+  const decision = buildGovernanceDecision({ detail });
   await persistGovernanceDecision({
     decision,
     rootDir: input.caseRoot

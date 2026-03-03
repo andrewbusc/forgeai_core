@@ -27,6 +27,7 @@ export interface CreateStateRunInput {
   project: Project;
   createdByUserId: string;
   goal: string;
+  graphId: string;
   maxSteps?: number;
   maxCorrections?: number;
   maxOptimizations?: number;
@@ -160,6 +161,7 @@ export class AgentRunService {
       orgId: input.project.orgId,
       workspaceId: input.project.workspaceId,
       createdByUserId: input.createdByUserId,
+      graphId: input.graphId,
       goal: input.goal,
       phase: "goal",
       status: "queued",
@@ -176,6 +178,7 @@ export class AgentRunService {
       requestId: input.requestId,
       runId: run.id,
       projectId: run.projectId,
+      graphId: input.graphId,
       phase: run.phase,
       status: run.status,
       maxSteps: run.maxSteps,
