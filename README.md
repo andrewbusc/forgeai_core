@@ -43,17 +43,23 @@ npm run build
 
 ### Setup
 
-1. Start the server:
+1. Create `.env` file:
+```bash
+cp .env.example .env
+# Edit .env and set AUTH_TOKEN_SECRET, DATABASE_URL, and at least one AI provider key
+```
+
+2. Start the server:
 ```bash
 npm run dev
 ```
 
-2. In a new terminal, initialize CLI session:
+3. In a new terminal, initialize CLI session:
 ```bash
 npm run deeprun -- init --api http://127.0.0.1:3000 --email user@example.com --password password
 ```
 
-3. Generate a backend:
+4. Generate a backend:
 ```bash
 npm run deeprun -- bootstrap "Build SaaS backend with auth"
 npm run deeprun -- validate --strict-v1-ready
