@@ -43,23 +43,44 @@ npm run build
 
 ### Setup
 
-1. Create `.env` file:
+1. **Install PostgreSQL** (if not already installed):
 ```bash
-cp .env.example .env
-# Edit .env and set AUTH_TOKEN_SECRET, DATABASE_URL, and at least one AI provider key
+# Option 1: Using Docker (recommended)
+sudo docker run -d \
+  --name deeprun-postgres \
+  -e POSTGRES_USER=deeprun \
+  -e POSTGRES_PASSWORD=deeprun \
+  -e POSTGRES_DB=deeprun \
+  -p 5432:5432 \
+  postgres:16
+
+# Option 2: Using existing PostgreSQL
+sudo -u postgres psql -c "CREATE USER deeprun WITH PASSWORD 'deeprun';"
+sudo -u postgres psql -c "CREATE DATABASE deeprun OWNER deeprun;"
 ```
 
-2. Start the server:
+2. **Create `.env` file**:
+```bash
+cat > .env << 'EOF'
+AUTH_TOKEN_SECRET=dev_secret_at_least_32_characters_long_for_local_testing_only
+JWT_SECRET=dev_jwt_secret_at_least_32_characters_long_for_local_testing_only
+DATABASE_URL=postgresql://deeprun:deeprun@localhost:5432/deeprun
+CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
+OPENAI_API_KEY=your-openai-key-here
+EOF
+```
+
+3. **Start the server**:
 ```bash
 npm run dev
 ```
 
-3. In a new terminal, initialize CLI session:
+4. **In a new terminal, initialize CLI session**:
 ```bash
 npm run deeprun -- init --api http://127.0.0.1:3000 --email user@example.com --password password
 ```
 
-4. Generate a backend:
+5. **Generate a backend**:
 ```bash
 npm run deeprun -- bootstrap "Build SaaS backend with auth"
 npm run deeprun -- validate --strict-v1-ready
