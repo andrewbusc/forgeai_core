@@ -105,6 +105,7 @@ async function runCommand(input: {
         ...process.env,
         ...input.env
       },
+      shell: process.platform === "win32",
       stdio: ["ignore", "pipe", "pipe"]
     });
 
@@ -230,6 +231,7 @@ async function runBootCheck(input: {
   env?: NodeJS.ProcessEnv;
 }): Promise<HeavyValidationCheck> {
   const port = await acquireFreePort();
+  const isWindows = process.platform === "win32";
   const child = spawn(input.npmBin, ["run", "start"], {
     cwd: input.cwd,
     env: {
@@ -238,7 +240,8 @@ async function runBootCheck(input: {
       NODE_ENV: "production",
       PORT: String(port)
     },
-    detached: true,
+    detached: !isWindows,
+    shell: isWindows,
     stdio: ["ignore", "pipe", "pipe"]
   });
 
@@ -290,6 +293,11 @@ async function runBootCheck(input: {
           child.kill("SIGKILL");
         }
       }, 1_000).unref();
+      return;
+    }
+
+    if (process.platform === "win32") {
+      if (!child.killed) child.kill();
       return;
     }
 
@@ -514,11 +522,15 @@ export async function runHeavyProjectValidation(input: HeavyValidationInput): Pr
       if (shouldInstallDeps) {
         const hasNodeModules = await pathExists(path.join(isolatedRoot, "node_modules"));
         if (!hasNodeModules) {
+          const hasLockfile = await pathExists(path.join(isolatedRoot, "package-lock.json")) ||
+            await pathExists(path.join(isolatedRoot, "npm-shrinkwrap.json"));
+          const installArgs = hasLockfile
+            ? ["ci", "--include=dev", "--no-audit", "--no-fund"]
+            : ["install", "--include=dev", "--no-audit", "--no-fund"];
           const install = await runCommand({
             cwd: isolatedRoot,
             command: npmBin,
-            // Validation is CI-like and must include devDependencies (tsx, vitest, etc.).
-            args: ["ci", "--include=dev", "--no-audit", "--no-fund"],
+            args: installArgs,
             timeoutMs: Number(process.env.AGENT_HEAVY_INSTALL_TIMEOUT_MS || 300_000),
             allowFailure: true,
             env: {
@@ -567,9 +579,30 @@ export async function runHeavyProjectValidation(input: HeavyValidationInput): Pr
 
       const prismaSchemaPath = path.join(isolatedRoot, "prisma", "schema.prisma");
       const hasPrismaSchema = await pathExists(prismaSchemaPath);
+      const generateScript = resolveScript(scripts, ["prisma:generate", "db:generate"]);
       const migrationScript = resolveScript(scripts, ["prisma:migrate", "db:migrate", "migrate:deploy", "migrate"]);
       const seedScript = resolveScript(scripts, ["prisma:seed", "db:seed", "seed"]);
       const prismaCheckRequired = hasPrismaSchema || Boolean(migrationScript) || Boolean(seedScript);
+
+      if (hasPrismaSchema && generateScript) {
+        await runCommand({
+          cwd: isolatedRoot,
+          command: npmBin,
+          args: ["run", generateScript],
+          timeoutMs: 60_000,
+          allowFailure: true,
+          env: validationCommandEnv
+        });
+      } else if (hasPrismaSchema) {
+        await runCommand({
+          cwd: isolatedRoot,
+          command: npmBin,
+          args: ["exec", "--", "prisma", "generate"],
+          timeoutMs: 60_000,
+          allowFailure: true,
+          env: validationCommandEnv
+        });
+      }
 
       if (prismaCheckRequired && !migrationScript) {
         blockingCount += 1;
@@ -817,6 +850,17 @@ export async function runHeavyProjectValidation(input: HeavyValidationInput): Pr
       }
 
       if (typeof scripts.start === "string" && scripts.start.trim()) {
+        if (typeof scripts.build === "string" && scripts.build.trim()) {
+          await runCommand({
+            cwd: isolatedRoot,
+            command: npmBin,
+            args: ["run", "build"],
+            timeoutMs: 60_000,
+            allowFailure: true,
+            env: validationCommandEnv
+          });
+        }
+
         const boot = await runBootCheck({
           cwd: isolatedRoot,
           npmBin,

@@ -1,4 +1,5 @@
 import { promises as fs } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { execFile as execFileCb } from "node:child_process";
 import { promisify } from "node:util";
@@ -94,10 +95,22 @@ export async function isWorktreeDirty(projectDir) {
     }
     return result.stdout.trim().length > 0;
 }
+const GENERATED_GITIGNORE = `node_modules/
+.env
+.env.*
+!.env.example
+dist/
+*.log
+.deeprun/
+`;
 export async function createAutoCommit(projectDir, message) {
     await ensureGitRepo(projectDir);
     if (!(await hasPendingChanges(projectDir))) {
         return null;
+    }
+    const gitignorePath = path.join(projectDir, ".gitignore");
+    if (!(await pathExists(gitignorePath))) {
+        await fs.writeFile(gitignorePath, GENERATED_GITIGNORE, "utf8");
     }
     await execGit(projectDir, ["add", "-A"]);
     await execGit(projectDir, ["commit", "-m", message, "--no-gpg-sign"]);
@@ -172,6 +185,37 @@ async function removeWorktreeIfExists(projectDir, worktreePath) {
     });
     await fs.rm(worktreePath, { recursive: true, force: true });
 }
+async function waitForCleanup(delayMs) {
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+function isRetryableCleanupError(error) {
+    const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "";
+    return ["EBUSY", "ENOTEMPTY", "EPERM"].includes(code);
+}
+async function removeDirectoryWithRetries(targetPath) {
+    let lastError;
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+        try {
+            await fs.rm(targetPath, {
+                recursive: true,
+                force: true,
+                maxRetries: 3,
+                retryDelay: 200
+            });
+            return;
+        }
+        catch (error) {
+            lastError = error;
+            if (!isRetryableCleanupError(error)) {
+                throw error;
+            }
+            await waitForCleanup(250 * (attempt + 1));
+        }
+    }
+    if (lastError) {
+        throw lastError;
+    }
+}
 export async function ensureRunWorktree(input) {
     await ensureGitRepo(input.projectDir);
     const runBranch = input.runBranch?.trim() || buildDefaultRunBranch(input.runId);
@@ -212,7 +256,7 @@ export async function resetWorktreeToCommit(projectDir, ref) {
 }
 export async function withIsolatedWorktree(input, runner) {
     await ensureGitRepo(input.projectDir);
-    const root = path.join(input.projectDir, ".deeprun", "validation");
+    const root = path.join(os.tmpdir(), "deeprun-validation");
     await ensureDir(root);
     const isolatedRoot = await fs.mkdtemp(path.join(root, `${input.prefix || "check"}-`));
     const ref = input.ref?.trim() || (await ensureHeadCommit(input.projectDir));
@@ -224,7 +268,17 @@ export async function withIsolatedWorktree(input, runner) {
         await execGit(input.projectDir, ["worktree", "remove", "--force", isolatedRoot], {
             allowFailure: true
         });
-        await fs.rm(isolatedRoot, { recursive: true, force: true });
+        await execGit(input.projectDir, ["worktree", "prune"], {
+            allowFailure: true
+        });
+        try {
+            await removeDirectoryWithRetries(isolatedRoot);
+        }
+        catch (error) {
+            if (!isRetryableCleanupError(error)) {
+                throw error;
+            }
+        }
     }
 }
 export async function listCommits(projectDir, limit = 40) {

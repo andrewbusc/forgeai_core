@@ -1,7 +1,7 @@
 # deeprun Production Dockerfile
-FROM node:20-alpine AS base
+FROM node:20-alpine AS builder
 
-# Install system dependencies
+# Install system dependencies required for build steps
 RUN apk add --no-cache \
     git \
     curl \
@@ -10,42 +10,47 @@ RUN apk add --no-cache \
 
 WORKDIR /app
 
-# Copy package files
+# Copy package files and install all deps (including dev)
 COPY package*.json ./
+COPY package-lock.json ./
+RUN npm ci
+
+# Copy sources and build
 COPY tsconfig.json ./
-
-# Install dependencies
-RUN npm ci --only=production && npm cache clean --force
-
-# Copy source code
+COPY prisma ./prisma
 COPY src/ ./src/
 COPY public/ ./public/
-
-# Build application
+RUN npm run prisma:generate || true
 RUN npm run build
 
-# Remove dev dependencies and source
-RUN rm -rf src/ node_modules/ && npm ci --only=production
+FROM node:20-alpine AS runner
+WORKDIR /app
 
-# Create non-root user
+ENV NODE_ENV=production
+
+# Install only production deps
+COPY package*.json ./
+RUN npm ci --omit=dev --no-audit --no-fund
+
+# Copy built artifacts from builder
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/node_modules/.prisma ./node_modules/.prisma
+COPY --from=builder /app/node_modules/@prisma/client ./node_modules/@prisma/client
+
+# Create non-root user and data directories
 RUN addgroup -g 1001 -S deeprun && \
-    adduser -S deeprun -u 1001 -G deeprun
-
-# Create data directories
-RUN mkdir -p /app/.data /app/.deeprun /app/.workspace && \
+    adduser -S deeprun -u 1001 -G deeprun && \
+    mkdir -p /app/.data /app/.deeprun /app/.workspace && \
     chown -R deeprun:deeprun /app
 
 USER deeprun
 
-# Environment defaults
-ENV NODE_ENV=production
 ENV PORT=3000
 ENV CORS_ALLOWED_ORIGINS=http://localhost:3000
 
-# Health check
+EXPOSE 3000
+
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:$PORT/api/health || exit 1
-
-EXPOSE 3000
 
 CMD ["node", "dist/server.js"]
