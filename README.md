@@ -66,6 +66,7 @@ AUTH_TOKEN_SECRET=dev_secret_at_least_32_characters_long_for_local_testing_only
 JWT_SECRET=dev_jwt_secret_at_least_32_characters_long_for_local_testing_only
 DATABASE_URL=postgresql://deeprun:deeprun@localhost:5432/deeprun
 CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
+# Optional, but required for real generation with the OpenAI provider
 OPENAI_API_KEY=your-openai-key-here
 EOF
 ```
@@ -89,11 +90,11 @@ npm run deeprun -- validate --strict-v1-ready
 ### Add to CI
 
 ```yaml
-- name: deeprun Governance Gate
+- name: deeprun Canonical V1 Ready Check
   run: |
     npm install
     npm run build
-    npm run deeprun -- gate --strict-v1-ready
+    npm run test:v1-ready
 ```
 
 ### Example Output
@@ -147,7 +148,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: npm install && npm run build
-      - run: npm run deeprun -- gate --strict-v1-ready
+      - run: npm run test:v1-ready
 ```
 
 **3. Reliability Benchmarking**
@@ -195,11 +196,12 @@ See [docs/contracts/](docs/contracts/) for detailed specifications.
 npm run deeprun -- init                    # Initialize session
 npm run deeprun -- bootstrap <prompt>      # Generate backend + start run
 npm run deeprun -- status                  # Check run status
-npm run deeprun -- validate                # Run validation gates
-npm run deeprun -- promote                 # Deploy to production
+npm run deeprun -- validate --project <projectId> --run <runId> [--strict-v1-ready]
+npm run deeprun -- gate --project <projectId> --run <runId> [--strict-v1-ready]
+npm run deeprun -- promote --project <projectId> --run <runId>
 ```
 
-Full CLI reference: [docs/cli.md](docs/cli.md)
+Full CLI reference: `npm run deeprun -- help`
 
 ## CI Integration
 
@@ -243,8 +245,8 @@ Runtime compatibility is validated before the HTTP server starts.
 ## Development
 
 ```bash
-git clone https://github.com/yourusername/deeprun.git
-cd deeprun
+git clone https://github.com/andrewbusc/_deeprun.git
+cd _deeprun
 npm install
 npm run dev
 ```
